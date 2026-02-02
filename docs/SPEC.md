@@ -1,6 +1,6 @@
 # DotClaw Specification
 
-A personal Claude assistant accessible via Telegram, with persistent memory per conversation, scheduled tasks, and email integration.
+A personal OpenRouter-based assistant accessible via Telegram, with persistent memory per conversation, scheduled tasks, and email integration.
 
 ---
 
@@ -54,13 +54,13 @@ A personal Claude assistant accessible via Telegram, with persistent memory per 
 │  │  Volume mounts:                                                │   │
 │  │    • groups/{name}/ → /workspace/group                         │   │
 │  │    • groups/global/ → /workspace/global/ (non-main only)        │   │
-│  │    • data/sessions/{group}/.claude/ → /home/node/.claude/      │   │
+│  │    • data/sessions/{group}/openrouter/ → /workspace/session    │   │
 │  │    • Additional dirs → /workspace/extra/*                      │   │
 │  │                                                                │   │
 │  │  Tools (all groups):                                           │   │
 │  │    • Bash (safe - sandboxed in container!)                     │   │
 │  │    • Read, Write, Edit, Glob, Grep (file operations)           │   │
-│  │    • WebSearch, WebFetch (internet access)                     │   │
+│  │    • WebSearch (Brave), WebFetch (internet access)             │   │
 │  │    • agent-browser (browser automation)                        │   │
 │  │    • mcp__dotclaw__* (scheduler tools via IPC)                │   │
 │  │                                                                │   │
@@ -76,7 +76,7 @@ A personal Claude assistant accessible via Telegram, with persistent memory per 
 | Telegram Connection | Node.js (telegraf) | Connect to Telegram Bot API, send/receive messages |
 | Message Storage | SQLite (better-sqlite3) | Store messages for context |
 | Container Runtime | Docker | Isolated containers for agent execution |
-| Agent | @anthropic-ai/claude-agent-sdk (0.2.29) | Run Claude with tools and MCP servers |
+| Agent | @openrouter/sdk | Run OpenRouter models with tool execution |
 | Browser Automation | agent-browser + Chromium | Web interaction and screenshots |
 | Runtime | Node.js 20+ | Host process for routing and scheduling |
 
@@ -86,7 +86,7 @@ A personal Claude assistant accessible via Telegram, with persistent memory per 
 
 ```
 dotclaw/
-├── CLAUDE.md                      # Project context for Claude Code
+├── CLAUDE.md                      # Project context for the assistant
 ├── docs/
 │   ├── SPEC.md                    # This specification document
 │   ├── REQUIREMENTS.md            # Architecture decisions
@@ -107,20 +107,20 @@ dotclaw/
 │   └── container-runner.ts        # Spawns agents in Docker containers
 │
 ├── container/
-│   ├── Dockerfile                 # Container image (runs as 'node' user, includes Claude Code CLI)
+│   ├── Dockerfile                 # Container image (runs as 'node' user, OpenRouter runtime)
 │   ├── build.sh                   # Build script for container image
 │   ├── agent-runner/              # Code that runs inside the container
 │   │   ├── package.json
 │   │   ├── tsconfig.json
 │   │   └── src/
 │   │       ├── index.ts           # Entry point (reads JSON, runs agent)
-│   │       └── ipc-mcp.ts         # MCP server for host communication
+│   │       └── ipc.ts             # IPC utilities for host communication
 │   └── skills/
 │       └── agent-browser.md       # Browser automation skill
 │
 ├── dist/                          # Compiled JavaScript (gitignored)
 │
-├── .claude/
+├── .claude/                       # Legacy Claude Code skills (optional)
 │   └── skills/
 │       ├── setup/
 │       │   └── SKILL.md           # /setup skill
@@ -144,6 +144,7 @@ dotclaw/
 │
 ├── data/                          # Application state (gitignored)
 │   ├── sessions.json              # Active session IDs per group
+│   ├── sessions/{group}/openrouter/ # Session history + summary per group
 │   ├── registered_groups.json     # Chat ID → folder mapping
 │   ├── router_state.json          # Last agent timestamps
 │   ├── env/env                    # Copy of .env for container mounting
@@ -216,22 +217,47 @@ Additional mounts appear at `/workspace/extra/{containerPath}` inside the contai
 
 **Docker mount syntax:** Both read-write (`-v host:container`) and readonly (`-v host:container:ro`) mounts use the `-v` flag.
 
-### Claude Authentication
+### OpenRouter Authentication
 
-Configure authentication in a `.env` file in the project root. Two options:
+Configure authentication in a `.env` file in the project root:
 
-**Option 1: Claude Subscription (OAuth token)**
 ```bash
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-```
-The token can be extracted from `~/.claude/.credentials.json` if you're logged in to Claude Code.
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_MODEL=moonshotai/kimi-k2.5
 
-**Option 2: Pay-per-use API Key**
+# Optional attribution headers (recommended by OpenRouter)
+OPENROUTER_SITE_URL=https://your-domain.example
+OPENROUTER_SITE_NAME=DotClaw
+
+# Brave Search (for WebSearch tool)
+BRAVE_SEARCH_API_KEY=your_brave_search_api_key
+```
+
+Only the OpenRouter/Brave-related variables (and `DOTCLAW_*` tuning) are extracted from `.env` and mounted into the container at `/workspace/env-dir/env`, then sourced by the entrypoint script.
+
+### Memory Tuning
+
 ```bash
-ANTHROPIC_API_KEY=sk-ant-api03-...
+DOTCLAW_MAX_CONTEXT_TOKENS=200000
+DOTCLAW_RECENT_CONTEXT_TOKENS=80000
+DOTCLAW_MAX_OUTPUT_TOKENS=4096
+DOTCLAW_SUMMARY_UPDATE_EVERY_MESSAGES=12
+DOTCLAW_SUMMARY_MAX_OUTPUT_TOKENS=1200
+DOTCLAW_SUMMARY_MODEL=moonshotai/kimi-k2.5
 ```
 
-Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`) are extracted from `.env` and mounted into the container at `/workspace/env-dir/env`, then sourced by the entrypoint script.
+### Model Configuration
+
+The active model is stored in `data/model.json`:
+```json
+{
+  "model": "moonshotai/kimi-k2.5",
+  "allowlist": ["moonshotai/kimi-k2.5", "openai/gpt-4.1-mini"],
+  "updated_at": "2026-02-02T00:00:00.000Z"
+}
+```
+
+If `allowlist` is empty, any model is permitted. If set, only models in the allowlist can be selected (including via chat-time switching).
 
 ### Telegram Bot Token
 
@@ -252,6 +278,28 @@ ASSISTANT_NAME=Bot npm start
 
 Or edit the default in `src/config.ts`. This changes the trigger pattern (messages must start with `@YourName` in groups).
 
+### Optional Safety Controls
+
+Tool toggles:
+```bash
+DOTCLAW_ENABLE_BASH=true
+DOTCLAW_ENABLE_WEBSEARCH=true
+DOTCLAW_ENABLE_WEBFETCH=true
+DOTCLAW_WEBFETCH_ALLOWLIST=example.com,developer.mozilla.org
+DOTCLAW_WEBFETCH_BLOCKLIST=localhost,127.0.0.1
+```
+
+Container hardening:
+```bash
+CONTAINER_PIDS_LIMIT=256
+CONTAINER_MEMORY=2g
+CONTAINER_CPUS=2
+CONTAINER_READONLY_ROOT=true
+CONTAINER_TMPFS_SIZE=64m
+CONTAINER_RUN_UID=1000
+CONTAINER_RUN_GID=1000
+```
+
 ### Placeholder Values in launchd
 
 Files with `{{PLACEHOLDER}}` values need to be configured:
@@ -263,7 +311,7 @@ Files with `{{PLACEHOLDER}}` values need to be configured:
 
 ## Memory System
 
-DotClaw uses a hierarchical memory system based on CLAUDE.md files.
+DotClaw uses a hierarchical memory system based on CLAUDE.md files plus a session memory store.
 
 ### Memory Hierarchy
 
@@ -277,9 +325,11 @@ DotClaw uses a hierarchical memory system based on CLAUDE.md files.
 
 1. **Agent Context Loading**
    - Agent runs with `cwd` set to `groups/{group-name}/`
-   - Claude Agent SDK with `settingSources: ['project']` automatically loads:
+   - Agent runner reads:
      - `../CLAUDE.md` (parent directory = global memory)
      - `./CLAUDE.md` (current directory = group memory)
+   - Session memory (history + summary + facts) is stored in `data/sessions/{group}/openrouter/` and injected into the system prompt.
+   - Older history is compacted into summary/facts; relevant past context is retrieved per prompt.
 
 2. **Writing Memory**
    - When user says "remember this", agent writes to `./CLAUDE.md`
@@ -296,13 +346,13 @@ DotClaw uses a hierarchical memory system based on CLAUDE.md files.
 
 ## Session Management
 
-Sessions enable conversation continuity - Claude remembers what you talked about.
+Sessions enable conversation continuity with a DotClaw-managed history, summary, and compaction loop.
 
 ### How Sessions Work
 
 1. Each group has a session ID stored in `data/sessions.json`
-2. Session ID is passed to Claude Agent SDK's `resume` option
-3. Claude continues the conversation with full context
+2. Session history + summaries are stored in `data/sessions/{group}/openrouter/{sessionId}/`
+3. The agent rebuilds context from recent history + summary + memory recall each run
 
 **data/sessions.json:**
 ```json
@@ -342,14 +392,14 @@ Sessions enable conversation continuity - Claude remembers what you talked about
    └── Build prompt with full conversation context
    │
    ▼
-7. Router invokes Claude Agent SDK:
+7. Router invokes OpenRouter agent runner:
    ├── cwd: groups/{group-name}/
    ├── prompt: conversation history + current message
-   ├── resume: session_id (for continuity)
-   └── mcpServers: dotclaw (scheduler)
+   ├── session_id: DotClaw-managed session store
+   └── IPC tools: dotclaw (scheduler)
    │
    ▼
-8. Claude processes message:
+8. Agent processes message:
    ├── Reads CLAUDE.md files for context
    └── Uses tools as needed (search, etc.)
    │
@@ -363,7 +413,7 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 ### Trigger Word Matching
 
 In groups, messages must start with the trigger pattern (default: `@Rain`):
-- `@Rain what's the weather?` → ✅ Triggers Claude
+- `@Rain what's the weather?` → ✅ Triggers assistant
 - `@andy help me` → ✅ Triggers (case insensitive)
 - `Hey @Rain` → ❌ Ignored (trigger not at start)
 - `What's up?` → ❌ Ignored (no trigger)
@@ -390,7 +440,7 @@ This allows the agent to understand the conversation context even if it wasn't m
 
 | Command | Example | Effect |
 |---------|---------|--------|
-| `@Assistant [message]` | `@Rain what's the weather?` | Talk to Claude |
+| `@Assistant [message]` | `@Rain what's the weather?` | Talk to the assistant |
 
 ### Commands Available in Main Channel Only
 
@@ -400,6 +450,7 @@ This allows the agent to understand the conversation context even if it wasn't m
 | `@Assistant remove group [name]` | `@Rain remove group "work-team"` | Unregister a group |
 | `@Assistant list groups` | `@Rain list groups` | Show registered groups |
 | `@Assistant remember [fact]` | `@Rain remember I prefer dark mode` | Add to global memory |
+| `@Assistant set model [model_id]` | `@Rain set model moonshotai/kimi-k2.5` | Switch OpenRouter model (main only) |
 
 ---
 
@@ -420,21 +471,21 @@ DotClaw has a built-in scheduler that runs tasks as full agents in their group's
 |------|--------------|---------|
 | `cron` | Cron expression | `0 9 * * 1` (Mondays at 9am) |
 | `interval` | Milliseconds | `3600000` (every hour) |
-| `once` | ISO timestamp | `2024-12-25T09:00:00Z` |
+| `once` | ISO timestamp (local, no Z) | `2026-02-02T09:00:00` |
 
 ### Creating a Task
 
 ```
 User: @Rain remind me every Monday at 9am to review the weekly metrics
 
-Claude: [calls mcp__dotclaw__schedule_task]
+Assistant: [calls mcp__dotclaw__schedule_task]
         {
           "prompt": "Send a reminder to review weekly metrics. Be encouraging!",
           "schedule_type": "cron",
           "schedule_value": "0 9 * * 1"
         }
 
-Claude: Done! I'll remind you every Monday at 9am.
+Assistant: Done! I'll remind you every Monday at 9am.
 ```
 
 ### One-Time Tasks
@@ -442,7 +493,7 @@ Claude: Done! I'll remind you every Monday at 9am.
 ```
 User: @Rain at 5pm today, send me a summary of today's emails
 
-Claude: [calls mcp__dotclaw__schedule_task]
+Assistant: [calls mcp__dotclaw__schedule_task]
         {
           "prompt": "Search for today's emails, summarize the important ones, and send the summary to the group.",
           "schedule_type": "once",
@@ -572,7 +623,7 @@ All agents run inside Docker containers, providing:
 
 ### Prompt Injection Risk
 
-Telegram messages could contain malicious instructions attempting to manipulate Claude's behavior.
+Telegram messages could contain malicious instructions attempting to manipulate the assistant's behavior.
 
 **Mitigations:**
 - Container isolation limits blast radius
@@ -580,7 +631,7 @@ Telegram messages could contain malicious instructions attempting to manipulate 
 - Trigger word required in groups (reduces accidental processing)
 - Agents can only access their group's mounted directories
 - Main can configure additional directories per group
-- Claude's built-in safety training
+- Model's built-in safety training
 
 **Recommendations:**
 - Only register trusted chats
@@ -592,7 +643,7 @@ Telegram messages could contain malicious instructions attempting to manipulate 
 
 | Credential | Storage Location | Notes |
 |------------|------------------|-------|
-| Claude CLI Auth | data/sessions/{group}/.claude/ | Per-group isolation, mounted to /home/node/.claude/ |
+| OpenRouter Session Store | data/sessions/{group}/openrouter/ | Per-group isolation, mounted to /workspace/session |
 | Telegram Bot Token | .env | Not mounted into containers |
 
 ### File Permissions
@@ -612,10 +663,10 @@ chmod 700 groups/
 |-------|-------|----------|
 | No response to messages | Service not running | Check `launchctl list | grep dotclaw` |
 | No response to messages | Chat not registered | Add chat ID to registered_groups.json |
-| "Claude Code process exited with code 1" | Docker not running | Check Docker Desktop is running (macOS) or `sudo systemctl start docker` (Linux) |
-| "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/root/.claude/` |
+| "Container exited with code 1" | Docker not running | Check Docker Desktop is running (macOS) or `sudo systemctl start docker` (Linux) |
+| "Container exited with code 1" | Session mount path wrong | Ensure mount is to `/workspace/session` |
 | Session not continuing | Session ID not saved | Check `data/sessions.json` |
-| Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
+| Session not continuing | Mount path mismatch | Sessions must be at `/workspace/session` |
 | "Unauthorized" Telegram error | Bot token invalid | Check TELEGRAM_BOT_TOKEN in .env |
 
 ### Log Location

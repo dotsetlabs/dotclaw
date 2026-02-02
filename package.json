@@ -1,7 +1,7 @@
 {
   "name": "dotclaw",
   "version": "1.0.0",
-  "description": "Personal Claude assistant. Lightweight, secure, customizable.",
+  "description": "Personal OpenRouter-based assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -10,6 +10,8 @@
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "init": "node scripts/init.js",
+    "bootstrap": "node scripts/bootstrap.js",
+    "configure": "node scripts/configure.js",
     "doctor": "node scripts/doctor.js"
   },
   "dependencies": {

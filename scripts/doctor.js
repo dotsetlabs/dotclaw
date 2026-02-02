@@ -48,6 +48,12 @@ function diskSpace(dir) {
 }
 
 log('Node', process.version);
+if (typeof process.getuid === 'function') {
+  log('UID', String(process.getuid()));
+}
+if (typeof process.getgid === 'function') {
+  log('GID', String(process.getgid()));
+}
 checkDocker();
 log('Project Root', PROJECT_ROOT);
 checkPathAccess('data/', DATA_DIR);
@@ -59,3 +65,28 @@ log('Disk space (store/)', diskSpace(STORE_DIR));
 
 const envPath = path.join(PROJECT_ROOT, '.env');
 log('.env', fs.existsSync(envPath) ? 'present' : 'missing');
+
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, 'utf-8');
+  const hasOpenRouter = envContent.includes('OPENROUTER_API_KEY=');
+  const hasBrave = envContent.includes('BRAVE_SEARCH_API_KEY=');
+  log('OPENROUTER_API_KEY', hasOpenRouter ? 'set' : 'missing');
+  log('BRAVE_SEARCH_API_KEY', hasBrave ? 'set (optional, enables WebSearch)' : 'missing');
+}
+
+if (typeof process.getuid === 'function' && process.getuid() === 0) {
+  log('Warning', 'Running as root. For best security, run as a non-root user.');
+}
+
+const modelConfigPath = path.join(DATA_DIR, 'model.json');
+if (fs.existsSync(modelConfigPath)) {
+  try {
+    const modelConfig = JSON.parse(fs.readFileSync(modelConfigPath, 'utf-8'));
+    log('Model', modelConfig.model || 'missing');
+    log('Model allowlist', Array.isArray(modelConfig.allowlist) && modelConfig.allowlist.length > 0 ? modelConfig.allowlist.join(', ') : 'none (allow all)');
+  } catch (err) {
+    log('Model config', `error (${err instanceof Error ? err.message : String(err)})`);
+  }
+} else {
+  log('Model config', 'missing');
+}

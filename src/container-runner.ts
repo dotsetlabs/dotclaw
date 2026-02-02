@@ -5,18 +5,26 @@
 
 import { spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import pino from 'pino';
 import {
   CONTAINER_IMAGE,
   CONTAINER_TIMEOUT,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_PIDS_LIMIT,
+  CONTAINER_MEMORY,
+  CONTAINER_CPUS,
+  CONTAINER_READONLY_ROOT,
+  CONTAINER_TMPFS_SIZE,
+  CONTAINER_RUN_UID,
+  CONTAINER_RUN_GID,
   GROUPS_DIR,
-  DATA_DIR
+  DATA_DIR,
+  MODEL_CONFIG_PATH
 } from './config.js';
 import { RegisteredGroup } from './types.js';
 import { validateAdditionalMounts } from './mount-security.js';
+import { loadModelConfig } from './utils.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -27,13 +35,6 @@ const logger = pino({
 const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
 
-function getHomeDir(): string {
-  const home = process.env.HOME || os.homedir();
-  if (!home) {
-    throw new Error('Unable to determine home directory: HOME environment variable is not set and os.homedir() returned empty');
-  }
-  return home;
-}
 
 export interface ContainerInput {
   prompt: string;
@@ -59,7 +60,6 @@ interface VolumeMount {
 
 function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount[] {
   const mounts: VolumeMount[] = [];
-  const homeDir = getHomeDir();
   const projectRoot = process.cwd();
 
   if (isMain) {
@@ -112,13 +112,18 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  // Per-group OpenRouter sessions directory (isolated from other groups)
+  // Each group gets their own session store to prevent cross-group access
+  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, 'openrouter');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  try {
+    fs.chmodSync(groupSessionsDir, 0o700);
+  } catch {
+    logger.warn({ path: groupSessionsDir }, 'Could not chmod sessions directory');
+  }
   mounts.push({
     hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
+    containerPath: '/workspace/session',
     readonly: false
   });
 
@@ -129,14 +134,14 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   const tasksDir = path.join(groupIpcDir, 'tasks');
   fs.mkdirSync(messagesDir, { recursive: true });
   fs.mkdirSync(tasksDir, { recursive: true });
-  // Ensure container's node user (UID 1000) can write to IPC directories on Linux
+  // Ensure container user can write to IPC directories on Linux
   // On macOS/Docker Desktop this is handled by file sharing, but on native Linux
   // the container user needs explicit write permission to the mounted volume
   // Use try/catch in case directories are owned by a different user (e.g., root)
   try {
-    fs.chmodSync(groupIpcDir, 0o777);
-    fs.chmodSync(messagesDir, 0o777);
-    fs.chmodSync(tasksDir, 0o777);
+    fs.chmodSync(groupIpcDir, 0o770);
+    fs.chmodSync(messagesDir, 0o770);
+    fs.chmodSync(tasksDir, 0o770);
   } catch {
     // Permissions may already be correct, or user needs to fix ownership manually
     logger.warn({ path: groupIpcDir }, 'Could not chmod IPC directories - run: sudo chown -R $USER data/');
@@ -148,23 +153,60 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   });
 
   // Environment file directory (keeps credentials out of process listings)
-  // Only expose specific auth variables needed by Claude Code, not the entire .env
+  // Only expose specific auth/config variables needed by the agent, not the entire .env
   const envDir = path.join(DATA_DIR, 'env');
   fs.mkdirSync(envDir, { recursive: true });
+  try {
+    fs.chmodSync(envDir, 0o700);
+  } catch {
+    logger.warn({ path: envDir }, 'Could not chmod env directory');
+  }
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+    const allowedVars = [
+      'OPENROUTER_API_KEY',
+      'OPENROUTER_MODEL',
+      'OPENROUTER_SITE_URL',
+      'OPENROUTER_SITE_NAME',
+      'BRAVE_SEARCH_API_KEY',
+      'ASSISTANT_NAME'
+    ];
+    const allowedPrefixes = ['DOTCLAW_'];
     const filteredLines = envContent
       .split('\n')
       .filter(line => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith('#')) return false;
-        return allowedVars.some(v => trimmed.startsWith(`${v}=`));
+        if (allowedVars.some(v => trimmed.startsWith(`${v}=`))) return true;
+        return allowedPrefixes.some(prefix => trimmed.startsWith(prefix));
       });
 
-    if (filteredLines.length > 0) {
-      fs.writeFileSync(path.join(envDir, 'env'), filteredLines.join('\n') + '\n');
+    const envLines = new Map<string, string>();
+    for (const line of filteredLines) {
+      const idx = line.indexOf('=');
+      if (idx === -1) continue;
+      const key = line.slice(0, idx).trim();
+      envLines.set(key, line);
+    }
+
+    const modelConfig = loadModelConfig(
+      MODEL_CONFIG_PATH,
+      process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5'
+    );
+    if (modelConfig.model) {
+      envLines.set('OPENROUTER_MODEL', `OPENROUTER_MODEL=${modelConfig.model}`);
+    }
+
+    if (envLines.size > 0) {
+      const mergedLines = Array.from(envLines.values());
+      const envOutPath = path.join(envDir, 'env');
+      fs.writeFileSync(envOutPath, mergedLines.join('\n') + '\n');
+      try {
+        fs.chmodSync(envOutPath, 0o600);
+      } catch {
+        logger.warn({ path: envOutPath }, 'Could not chmod env file');
+      }
       mounts.push({
         hostPath: envDir,
         containerPath: '/workspace/env-dir',
@@ -188,6 +230,33 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
 
 function buildContainerArgs(mounts: VolumeMount[]): string[] {
   const args: string[] = ['run', '-i', '--rm'];
+
+  // Security hardening
+  args.push('--cap-drop=ALL');
+  args.push('--security-opt=no-new-privileges');
+  args.push(`--pids-limit=${CONTAINER_PIDS_LIMIT}`);
+
+  const runUid = CONTAINER_RUN_UID ? CONTAINER_RUN_UID.trim() : '';
+  const runGid = CONTAINER_RUN_GID ? CONTAINER_RUN_GID.trim() : '';
+  if (runUid) {
+    args.push('--user', runGid ? `${runUid}:${runGid}` : runUid);
+  }
+  args.push('--env', 'HOME=/tmp');
+
+  if (CONTAINER_MEMORY) {
+    args.push(`--memory=${CONTAINER_MEMORY}`);
+  }
+  if (CONTAINER_CPUS) {
+    args.push(`--cpus=${CONTAINER_CPUS}`);
+  }
+  if (CONTAINER_READONLY_ROOT) {
+    args.push('--read-only');
+    const tmpfsOptions = ['rw', 'noexec', 'nosuid', `size=${CONTAINER_TMPFS_SIZE}`];
+    if (runUid) tmpfsOptions.push(`uid=${runUid}`);
+    if (runGid) tmpfsOptions.push(`gid=${runGid}`);
+    args.push('--tmpfs', `/tmp:${tmpfsOptions.join(',')}`);
+    args.push('--tmpfs', `/home/node:${tmpfsOptions.join(',')}`);
+  }
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {

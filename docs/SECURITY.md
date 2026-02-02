@@ -18,6 +18,12 @@ Agents execute in Docker containers, providing:
 - **Filesystem isolation** - Only explicitly mounted directories are visible
 - **Non-root execution** - Runs as unprivileged `node` user (uid 1000)
 - **Ephemeral containers** - Fresh environment per invocation (`--rm`)
+- **Runtime hardening** - Drops Linux caps, enables no-new-privileges, and sets PID limits
+
+### UID/GID Alignment (Linux)
+
+On Linux/VPS, containers run with the host UID/GID by default to avoid permission errors on mounted volumes.  
+You can override with `CONTAINER_RUN_UID` and `CONTAINER_RUN_GID` if needed.
 
 This is the primary security boundary. Rather than relying on application-level permission checks, the attack surface is limited by what's mounted.
 
@@ -42,9 +48,9 @@ private_key, .secret
 
 ### 3. Session Isolation
 
-Each group has isolated Claude sessions at `data/sessions/{group}/.claude/`:
+Each group has isolated OpenRouter sessions at `data/sessions/{group}/openrouter/`:
 - Groups cannot see other groups' conversation history
-- Session data includes full message history and file contents read
+- Session data includes full message history and memory summaries
 - Prevents cross-group information disclosure
 
 ### 4. IPC Authorization
@@ -59,11 +65,13 @@ Messages and task operations are verified against group identity:
 | Schedule task for others | ✓ | ✗ |
 | View all tasks | ✓ | Own only |
 | Manage other groups | ✓ | ✗ |
+| Set model | ✓ | ✗ |
 
 ### 5. Credential Handling
 
 **Mounted Credentials:**
-- Claude auth tokens (filtered from `.env`, read-only)
+- OpenRouter API key and model config (filtered from `.env`, read-only)
+- Brave Search API key (optional, for WebSearch)
 
 **NOT Mounted:**
 - Telegram session (`store/auth/`) - host only
@@ -73,10 +81,18 @@ Messages and task operations are verified against group identity:
 **Credential Filtering:**
 Only these environment variables are exposed to containers:
 ```typescript
-const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+const allowedVars = [
+  'OPENROUTER_API_KEY',
+  'OPENROUTER_MODEL',
+  'OPENROUTER_SITE_URL',
+  'OPENROUTER_SITE_NAME',
+  'BRAVE_SEARCH_API_KEY',
+  'ASSISTANT_NAME'
+];
+const allowedPrefixes = ['DOTCLAW_'];
 ```
 
-> **Note:** Anthropic credentials are mounted so that Claude Code can authenticate when the agent runs. However, this means the agent itself can discover these credentials via Bash or file operations. Ideally, Claude Code would authenticate without exposing credentials to the agent's execution environment, but I couldn't figure this out. **PRs welcome** if you have ideas for credential isolation.
+> **Note:** OpenRouter and Brave credentials are mounted so the agent can authenticate. This means the agent can discover these credentials via Bash or file operations. Further isolation would require external secret management.
 
 ## Privilege Comparison
 

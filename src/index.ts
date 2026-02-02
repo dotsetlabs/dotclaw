@@ -8,6 +8,7 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  MODEL_CONFIG_PATH,
   TRIGGER_PATTERN,
   MAIN_GROUP_FOLDER,
   GROUPS_DIR,
@@ -18,7 +19,7 @@ import { RegisteredGroup, Session } from './types.js';
 import { initDatabase, storeMessage, storeChatMetadata, getMessagesSince, getAllTasks, createTask, updateTask, deleteTask, getTaskById } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
-import { loadJson, saveJson, isSafeGroupFolder } from './utils.js';
+import { loadJson, saveJson, isSafeGroupFolder, loadModelConfig, saveModelConfig, isModelAllowed } from './utils.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -404,6 +405,7 @@ async function processTaskIpc(
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    model?: string;
   },
   sourceGroup: string,
   isMain: boolean
@@ -532,6 +534,32 @@ async function processTaskIpc(
       }
       break;
 
+    case 'set_model':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized set_model attempt blocked');
+        break;
+      }
+      if (!data.model || typeof data.model !== 'string') {
+        logger.warn({ data }, 'Invalid set_model request - missing model');
+        break;
+      }
+      {
+        const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+        const config = loadModelConfig(MODEL_CONFIG_PATH, defaultModel);
+        const nextModel = data.model.trim();
+        if (!isModelAllowed(config, nextModel)) {
+          logger.warn({ model: nextModel }, 'Model not in allowlist; refusing set_model');
+          break;
+        }
+        saveModelConfig(MODEL_CONFIG_PATH, {
+          ...config,
+          model: nextModel,
+          updated_at: new Date().toISOString()
+        });
+        logger.info({ model: nextModel }, 'Model updated via IPC');
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -609,7 +637,7 @@ async function main(): Promise<void> {
   try {
     const envStat = fs.existsSync(envPath) ? fs.statSync(envPath) : null;
     if (!envStat || envStat.size === 0) {
-      logger.warn({ envPath }, '.env is missing or empty; set TELEGRAM_BOT_TOKEN and Claude auth');
+      logger.warn({ envPath }, '.env is missing or empty; set TELEGRAM_BOT_TOKEN and OpenRouter auth');
     }
   } catch (err) {
     logger.warn({ envPath, err }, 'Failed to check .env file');

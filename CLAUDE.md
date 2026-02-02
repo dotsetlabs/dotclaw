@@ -1,10 +1,10 @@
 # DotClaw
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+Personal OpenRouter-based assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
 
 ## Quick Context
 
-Single Node.js process that connects to Telegram, routes messages to Claude Agent SDK running in Docker containers. Each group has isolated filesystem and memory.
+Single Node.js process that connects to Telegram, routes messages to an OpenRouter agent runtime running in Docker containers. Each group has isolated filesystem and memory.
 
 ## Key Files
 

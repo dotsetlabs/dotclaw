@@ -22,6 +22,8 @@ The entire codebase should be something you can read and understand. One Node.js
 
 Instead of application-level permission systems trying to prevent agents from accessing things, agents run in Docker containers. The isolation is at the OS level. Agents can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
 
+On Linux/VPS, containers run with the host UID/GID by default so file permissions work out-of-the-box while keeping isolation intact.
+
 ### Built for One User
 
 This isn't a framework or a platform. It's working software for my specific needs. I use Telegram, so it supports Telegram. I add the integrations I actually want, not every possible integration.
@@ -32,9 +34,9 @@ No configuration sprawl. If you want different behavior, modify the code. The co
 
 ### AI-Native Development
 
-I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
+I don't need an installation wizard - the assistant guides the setup. I don't need a monitoring dashboard - I ask the assistant what's happening. I don't need elaborate logging UIs - I ask the assistant to read the logs. I don't need debugging tools - I describe the problem and the assistant fixes it.
 
-The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
+The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because the assistant is always there.
 
 ### Skills Over Features
 
@@ -63,19 +65,19 @@ The project uses Docker for cross-platform support (macOS and Linux).
 
 ## Vision
 
-A personal Claude assistant accessible via Telegram, with minimal custom code.
+A personal OpenRouter-based assistant accessible via Telegram, with minimal custom code.
 
 **Core components:**
-- **Claude Agent SDK** as the core agent
+- **OpenRouter SDK** as the core agent with model switching
 - **Docker** for isolated agent execution
 - **Telegram** as the primary I/O channel
 - **Persistent memory** per conversation and globally
-- **Scheduled tasks** that run Claude and can message back
+- **Scheduled tasks** that run the agent and can message back
 - **Web access** for search and browsing
 - **Browser automation** via agent-browser
 
 **Implementation approach:**
-- Use existing tools (Telegram bot API, Claude Agent SDK, MCP servers)
+- Use existing tools (Telegram bot API, OpenRouter SDK, IPC tools)
 - Minimal glue code
 - File-based systems where possible (CLAUDE.md for memory, folders for groups)
 
@@ -96,7 +98,7 @@ A personal Claude assistant accessible via Telegram, with minimal custom code.
 - Agent runs in the group's folder, automatically inherits both CLAUDE.md files
 
 ### Session Management
-- Each group maintains a conversation session (via Claude Agent SDK)
+- Each group maintains a conversation session (DotClaw-managed)
 - Sessions auto-compact when context gets too long, preserving critical information
 
 ### Container Isolation
@@ -107,7 +109,7 @@ A personal Claude assistant accessible via Telegram, with minimal custom code.
 - Browser automation via agent-browser with Chromium in the container
 
 ### Scheduled Tasks
-- Users can ask Claude to schedule recurring or one-time tasks from any group
+- Users can ask the assistant to schedule recurring or one-time tasks from any group
 - Tasks run as full agents in the context of the group that created them
 - Tasks have access to all tools including Bash (safe in container)
 - Tasks can optionally send messages to their group via `send_message` tool, or complete silently
@@ -144,11 +146,11 @@ A personal Claude assistant accessible via Telegram, with minimal custom code.
 - Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
 - Tasks stored in SQLite with run history
 - Scheduler loop checks for due tasks every minute
-- Tasks execute Claude Agent SDK in containerized group context
+- Tasks execute the OpenRouter agent runtime in containerized group context
 
 ### Web Access
 - Built-in WebSearch and WebFetch tools
-- Standard Claude Agent SDK capabilities
+- Standard agent capabilities (tools, web access, browser automation)
 
 ### Browser Automation
 - agent-browser CLI with Chromium in container
@@ -162,8 +164,8 @@ A personal Claude assistant accessible via Telegram, with minimal custom code.
 
 ### Philosophy
 - Minimal configuration files
-- Setup and customization done via Claude Code
-- Users clone the repo and run Claude Code to configure
+- Setup and customization done via the assistant
+- Users clone the repo and run the assistant to configure
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
@@ -182,7 +184,7 @@ These are the creator's settings, stored here for reference:
 
 - **Trigger**: `@Rain` (case insensitive)
 - **Response prefix**: None (Telegram bots send as themselves)
-- **Persona**: Default Claude (no custom personality)
+- **Persona**: Default assistant (no custom personality)
 - **Main channel**: Personal Telegram chat with the bot
 
 ---

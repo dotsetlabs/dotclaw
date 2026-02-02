@@ -1,12 +1,28 @@
 /**
- * DotClaw Agent Runner
+ * DotClaw Agent Runner (OpenRouter)
  * Runs inside a container, receives config via stdin, outputs result to stdout
  */
 
 import fs from 'fs';
 import path from 'path';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
-import { createIpcMcp } from './ipc-mcp.js';
+import { OpenRouter } from '@openrouter/sdk';
+import { createTools } from './tools.js';
+import {
+  createSessionContext,
+  appendHistory,
+  loadHistory,
+  splitRecentHistory,
+  shouldCompact,
+  archiveConversation,
+  buildSummaryPrompt,
+  parseSummaryResponse,
+  retrieveRelevantMemories,
+  estimateTokens,
+  saveMemoryState,
+  writeHistory,
+  MemoryConfig,
+  Message
+} from './memory.js';
 
 interface ContainerInput {
   prompt: string;
@@ -24,15 +40,75 @@ interface ContainerOutput {
   error?: string;
 }
 
-interface SessionEntry {
-  sessionId: string;
-  fullPath: string;
-  summary: string;
-  firstPrompt: string;
+const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
+const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
+
+const SESSION_ROOT = '/workspace/session';
+const GROUP_DIR = '/workspace/group';
+const IPC_DIR = '/workspace/ipc';
+
+function log(message: string): void {
+  console.error(`[agent-runner] ${message}`);
 }
 
-interface SessionsIndex {
-  entries: SessionEntry[];
+function writeOutput(output: ContainerOutput): void {
+  console.log(OUTPUT_START_MARKER);
+  console.log(JSON.stringify(output));
+  console.log(OUTPUT_END_MARKER);
+}
+
+async function runSelfCheck(params: {
+  openrouter: OpenRouter;
+  model: string;
+}) {
+  const details: string[] = [];
+
+  if (!process.env.OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY is not set');
+  }
+
+  fs.mkdirSync(GROUP_DIR, { recursive: true });
+  fs.mkdirSync(SESSION_ROOT, { recursive: true });
+  fs.mkdirSync(IPC_DIR, { recursive: true });
+  fs.mkdirSync(path.join(IPC_DIR, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(IPC_DIR, 'tasks'), { recursive: true });
+
+  const filePath = path.join(GROUP_DIR, '.dotclaw-selfcheck');
+  fs.writeFileSync(filePath, `self-check-${Date.now()}`);
+  const readBack = fs.readFileSync(filePath, 'utf-8');
+  if (!readBack.startsWith('self-check-')) {
+    throw new Error('Failed to read back self-check file');
+  }
+  fs.unlinkSync(filePath);
+  details.push('group directory writable');
+
+  const sessionPath = path.join(SESSION_ROOT, 'self-check');
+  fs.mkdirSync(sessionPath, { recursive: true });
+  const sessionFile = path.join(sessionPath, 'probe.txt');
+  fs.writeFileSync(sessionFile, 'ok');
+  fs.readFileSync(sessionFile, 'utf-8');
+  fs.unlinkSync(sessionFile);
+  details.push('session directory writable');
+
+  const ipcFile = path.join(IPC_DIR, 'messages', `self-check-${Date.now()}.json`);
+  fs.writeFileSync(ipcFile, JSON.stringify({ ok: true }, null, 2));
+  fs.unlinkSync(ipcFile);
+  details.push('ipc directory writable');
+
+  const response = await params.openrouter.callModel({
+    model: params.model,
+    instructions: 'Return exactly the string "OK".',
+    input: 'Self check',
+    maxOutputTokens: 8,
+    temperature: 0
+  });
+  const text = (await response.getText()).trim();
+  if (!text) {
+    throw new Error('OpenRouter call returned empty response');
+  }
+  details.push('openrouter call ok');
+
+  return details;
 }
 
 async function readStdin(): Promise<string> {
@@ -45,160 +121,116 @@ async function readStdin(): Promise<string> {
   });
 }
 
-const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
-
-function writeOutput(output: ContainerOutput): void {
-  console.log(OUTPUT_START_MARKER);
-  console.log(JSON.stringify(output));
-  console.log(OUTPUT_END_MARKER);
-}
-
-function log(message: string): void {
-  console.error(`[agent-runner] ${message}`);
-}
-
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
-  // sessions-index.json is in the same directory as the transcript
-  const projectDir = path.dirname(transcriptPath);
-  const indexPath = path.join(projectDir, 'sessions-index.json');
-
-  if (!fs.existsSync(indexPath)) {
-    log(`Sessions index not found at ${indexPath}`);
-    return null;
-  }
-
-  try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
-    if (entry?.summary) {
-      return entry.summary;
-    }
-  } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  return null;
-}
-
-/**
- * Archive the full transcript to conversations/ before compaction.
- */
-function createPreCompactHook(): HookCallback {
-  return async (input, _toolUseId, _context) => {
-    const preCompact = input as PreCompactHookInput;
-    const transcriptPath = preCompact.transcript_path;
-    const sessionId = preCompact.session_id;
-
-    if (!transcriptPath || !fs.existsSync(transcriptPath)) {
-      log('No transcript found for archiving');
-      return {};
-    }
-
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
-
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
-      }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      let name = summary ? sanitizeFilename(summary) : '';
-      if (!name) name = generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(messages, summary);
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    return {};
+function getConfig(): MemoryConfig & {
+  maxOutputTokens: number;
+  summaryMaxOutputTokens: number;
+  maxToolRounds: number;
+  temperature: number;
+} {
+  return {
+    maxContextTokens: parseInt(process.env.DOTCLAW_MAX_CONTEXT_TOKENS || '200000', 10),
+    compactionTriggerTokens: parseInt(process.env.DOTCLAW_COMPACTION_TRIGGER_TOKENS || '180000', 10),
+    recentContextTokens: parseInt(process.env.DOTCLAW_RECENT_CONTEXT_TOKENS || '80000', 10),
+    summaryUpdateEveryMessages: parseInt(process.env.DOTCLAW_SUMMARY_UPDATE_EVERY_MESSAGES || '12', 10),
+    memoryMaxResults: parseInt(process.env.DOTCLAW_MEMORY_MAX_RESULTS || '6', 10),
+    memoryMaxTokens: parseInt(process.env.DOTCLAW_MEMORY_MAX_TOKENS || '2000', 10),
+    maxOutputTokens: parseInt(process.env.DOTCLAW_MAX_OUTPUT_TOKENS || '4096', 10),
+    summaryMaxOutputTokens: parseInt(process.env.DOTCLAW_SUMMARY_MAX_OUTPUT_TOKENS || '1200', 10),
+    maxToolRounds: parseInt(process.env.DOTCLAW_MAX_TOOL_ROUNDS || '8', 10),
+    temperature: parseFloat(process.env.DOTCLAW_TEMPERATURE || '0.2')
   };
 }
 
-function sanitizeFilename(summary: string): string {
-  return summary
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 50);
+function buildSystemInstructions(params: {
+  assistantName: string;
+  memorySummary: string;
+  memoryFacts: string[];
+  memoryRecall: string[];
+  isScheduledTask: boolean;
+}): string {
+  const toolsDoc = [
+    'Tools available (use with care):',
+    '- `Bash`: run shell commands in `/workspace/group`.',
+    '- `Read`, `Write`, `Edit`, `Glob`, `Grep`: filesystem operations within mounted paths.',
+    '- `WebSearch`: Brave Search API (requires `BRAVE_SEARCH_API_KEY`).',
+    '- `WebFetch`: fetch URLs (limit payload sizes).',
+    '- `mcp__dotclaw__send_message`: send Telegram messages.',
+    '- `mcp__dotclaw__schedule_task`: schedule tasks.',
+    '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
+    '- `mcp__dotclaw__register_group`: main group only.',
+    '- `mcp__dotclaw__set_model`: main group only.'
+  ].join('\n');
+
+  const memorySummary = params.memorySummary ? params.memorySummary : 'None yet.';
+  const memoryFacts = params.memoryFacts.length > 0
+    ? params.memoryFacts.map(fact => `- ${fact}`).join('\n')
+    : 'None yet.';
+  const memoryRecall = params.memoryRecall.length > 0
+    ? params.memoryRecall.map(item => `- ${item}`).join('\n')
+    : 'None.';
+
+  const scheduledNote = params.isScheduledTask
+    ? 'You are running as a scheduled task. If you need to communicate, use `mcp__dotclaw__send_message`.'
+    : '';
+
+  return [
+    `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
+    scheduledNote,
+    toolsDoc,
+    'Long-term memory summary:',
+    memorySummary,
+    'Long-term facts:',
+    memoryFacts,
+    'Relevant recalled context:',
+    memoryRecall,
+    'Respond succinctly and helpfully. If you perform tool actions, summarize the results.'
+  ].filter(Boolean).join('\n\n');
 }
 
-function generateFallbackName(): string {
-  const time = new Date();
-  return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant';
-  content: string;
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
+function extractQueryFromPrompt(prompt: string): string {
+  if (!prompt) return '';
+  const messageMatches = [...prompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
+  if (messageMatches.length > 0) {
+    const last = messageMatches[messageMatches.length - 1][1];
+    return decodeXml(last).trim();
   }
-
-  return messages;
+  return prompt.trim();
 }
 
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
-  const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
+function decodeXml(value: string): string {
+  return value
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&');
+}
+
+function messagesToOpenRouter(messages: Message[]) {
+  return messages.map(message => ({
+    role: message.role,
+    content: message.content
+  }));
+}
+
+async function updateMemorySummary(params: {
+  openrouter: OpenRouter;
+  model: string;
+  existingSummary: string;
+  existingFacts: string[];
+  newMessages: Message[];
+  maxOutputTokens: number;
+}): Promise<{ summary: string; facts: string[] } | null> {
+  if (params.newMessages.length === 0) return null;
+  const prompt = buildSummaryPrompt(params.existingSummary, params.existingFacts, params.newMessages);
+  const result = await params.openrouter.callModel({
+    model: params.model,
+    instructions: prompt.instructions,
+    input: prompt.input,
+    maxOutputTokens: params.maxOutputTokens,
+    temperature: 0.1
   });
-
-  const lines: string[] = [];
-  lines.push(`# ${title || 'Conversation'}`);
-  lines.push('');
-  lines.push(`Archived: ${formatDateTime(now)}`);
-  lines.push('');
-  lines.push('---');
-  lines.push('');
-
-  for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : 'Rain';
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
-    lines.push(`**${sender}**: ${content}`);
-    lines.push('');
-  }
-
-  return lines.join('\n');
+  const text = await result.getText();
+  return parseSummaryResponse(text);
 }
 
 async function main(): Promise<void> {
@@ -217,74 +249,183 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const ipcMcp = createIpcMcp({
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    writeOutput({
+      status: 'error',
+      result: null,
+      error: 'OPENROUTER_API_KEY is not set'
+    });
+    process.exit(1);
+  }
+
+  const model = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+  const summaryModel = process.env.DOTCLAW_SUMMARY_MODEL || model;
+  const assistantName = process.env.ASSISTANT_NAME || 'Rain';
+  const config = getConfig();
+
+  const headers: Record<string, string> = {};
+  if (process.env.OPENROUTER_SITE_URL) {
+    headers['HTTP-Referer'] = process.env.OPENROUTER_SITE_URL;
+  }
+  if (process.env.OPENROUTER_SITE_NAME) {
+    headers['X-Title'] = process.env.OPENROUTER_SITE_NAME;
+  }
+
+  const openrouter = new OpenRouter({
+    apiKey,
+    defaultHeaders: Object.keys(headers).length > 0 ? headers : undefined
+  });
+
+  const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
+  const tools = createTools({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
     isMain: input.isMain
   });
 
-  let result: string | null = null;
-  let newSessionId: string | undefined;
+  if (process.env.DOTCLAW_SELF_CHECK === '1') {
+    try {
+      const details = await runSelfCheck({ openrouter, model });
+      writeOutput({
+        status: 'success',
+        result: `Self-check passed: ${details.join(', ')}`,
+        newSessionId: isNew ? sessionCtx.sessionId : undefined
+      });
+      return;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: isNew ? sessionCtx.sessionId : undefined,
+        error: errorMessage
+      });
+      process.exit(1);
+    }
+  }
 
-  // Add context for scheduled tasks
   let prompt = input.prompt;
   if (input.isScheduledTask) {
     prompt = `[SCHEDULED TASK - You are running automatically, not in response to a user message. Use mcp__dotclaw__send_message if needed to communicate with the user.]\n\n${input.prompt}`;
   }
 
-  try {
-    log('Starting agent...');
+  appendHistory(sessionCtx, 'user', prompt);
+  let history = loadHistory(sessionCtx);
 
-    for await (const message of query({
-      prompt,
-      options: {
-        cwd: '/workspace/group',
-        resume: input.sessionId,
-        allowedTools: [
-          'Bash',
-          'Read', 'Write', 'Edit', 'Glob', 'Grep',
-          'WebSearch', 'WebFetch',
-          'mcp__dotclaw__*'
-        ],
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        settingSources: ['project'],
-        mcpServers: {
-          dotclaw: ipcMcp
-        },
-        hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook()] }]
-        }
-      }
-    })) {
-      if (message.type === 'system' && message.subtype === 'init') {
-        newSessionId = message.session_id;
-        log(`Session initialized: ${newSessionId}`);
-      }
+  const totalTokens = history.reduce((sum, message) => sum + estimateTokens(message.content), 0);
+  let { recentMessages, olderMessages } = splitRecentHistory(history, config.recentContextTokens);
 
-      if ('result' in message && message.result) {
-        result = message.result as string;
-      }
-    }
+  if (shouldCompact(totalTokens, config)) {
+    log(`Compacting history: ${totalTokens} tokens`);
+    archiveConversation(history, sessionCtx.state.summary || null, GROUP_DIR);
 
-    log('Agent completed successfully');
-    writeOutput({
-      status: 'success',
-      result,
-      newSessionId
+    const summaryUpdate = await updateMemorySummary({
+      openrouter,
+      model: summaryModel,
+      existingSummary: sessionCtx.state.summary,
+      existingFacts: sessionCtx.state.facts,
+      newMessages: olderMessages,
+      maxOutputTokens: config.summaryMaxOutputTokens
     });
 
+    if (summaryUpdate) {
+      sessionCtx.state.summary = summaryUpdate.summary;
+      sessionCtx.state.facts = summaryUpdate.facts;
+      sessionCtx.state.lastSummarySeq = olderMessages.length > 0
+        ? olderMessages[olderMessages.length - 1].seq
+        : sessionCtx.state.lastSummarySeq;
+      saveMemoryState(sessionCtx);
+    }
+
+    writeHistory(sessionCtx, recentMessages);
+    history = recentMessages;
+  }
+
+  // Recompute split after possible compaction
+  ({ recentMessages, olderMessages } = splitRecentHistory(history, config.recentContextTokens));
+
+  const query = extractQueryFromPrompt(prompt);
+  const memoryRecall = retrieveRelevantMemories({
+    query,
+    summary: sessionCtx.state.summary,
+    facts: sessionCtx.state.facts,
+    olderMessages,
+    config
+  });
+
+  const instructions = buildSystemInstructions({
+    assistantName,
+    memorySummary: sessionCtx.state.summary,
+    memoryFacts: sessionCtx.state.facts,
+    memoryRecall,
+    isScheduledTask: !!input.isScheduledTask
+  });
+
+  const instructionsTokens = estimateTokens(instructions);
+  const maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
+  const { recentMessages: contextMessages } = splitRecentHistory(recentMessages, maxContextTokens, 6);
+
+  let responseText = '';
+
+  try {
+    log('Starting OpenRouter call...');
+    const result = await openrouter.callModel({
+      model,
+      instructions,
+      input: messagesToOpenRouter(contextMessages),
+      tools,
+      maxOutputTokens: config.maxOutputTokens,
+      maxToolRounds: config.maxToolRounds,
+      temperature: config.temperature
+    });
+    responseText = await result.getText();
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
     writeOutput({
       status: 'error',
       result: null,
-      newSessionId,
+      newSessionId: isNew ? sessionCtx.sessionId : undefined,
       error: errorMessage
     });
     process.exit(1);
   }
+
+  appendHistory(sessionCtx, 'assistant', responseText || '');
+
+  history = loadHistory(sessionCtx);
+  const newMessages = history.filter(m => m.seq > sessionCtx.state.lastSummarySeq);
+  if (newMessages.length >= config.summaryUpdateEveryMessages) {
+    const summaryUpdate = await updateMemorySummary({
+      openrouter,
+      model: summaryModel,
+      existingSummary: sessionCtx.state.summary,
+      existingFacts: sessionCtx.state.facts,
+      newMessages,
+      maxOutputTokens: config.summaryMaxOutputTokens
+    });
+    if (summaryUpdate) {
+      sessionCtx.state.summary = summaryUpdate.summary;
+      sessionCtx.state.facts = summaryUpdate.facts;
+      sessionCtx.state.lastSummarySeq = newMessages[newMessages.length - 1].seq;
+      saveMemoryState(sessionCtx);
+    }
+  }
+
+  writeOutput({
+    status: 'success',
+    result: responseText || null,
+    newSessionId: isNew ? sessionCtx.sessionId : undefined
+  });
 }
 
-main();
+main().catch(err => {
+  log(`Fatal error: ${err instanceof Error ? err.message : String(err)}`);
+  writeOutput({
+    status: 'error',
+    result: null,
+    error: err instanceof Error ? err.message : String(err)
+  });
+  process.exit(1);
+});
