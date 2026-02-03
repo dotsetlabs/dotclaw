@@ -92,6 +92,7 @@ fi
 
 AUTOTUNE_DIR="${AUTOTUNE_DIR:-$PROJECT_ROOT/../autotune}"
 if [[ -d "$AUTOTUNE_DIR" ]]; then
+  AUTOTUNE_DIR="$(cd "$AUTOTUNE_DIR" && pwd)"
   log "Autotune directory found: $AUTOTUNE_DIR"
   run_as_user "cd $AUTOTUNE_DIR && npm install"
   run_as_user "cd $AUTOTUNE_DIR && npm run build"
@@ -105,7 +106,7 @@ OPENROUTER_KEY="$(grep -E '^OPENROUTER_API_KEY=' "$PROJECT_ROOT/.env" | head -n1
 OPENROUTER_SITE_URL="$(grep -E '^OPENROUTER_SITE_URL=' "$PROJECT_ROOT/.env" | head -n1 | cut -d= -f2- || true)"
 OPENROUTER_SITE_NAME="$(grep -E '^OPENROUTER_SITE_NAME=' "$PROJECT_ROOT/.env" | head -n1 | cut -d= -f2- || true)"
 
-if [[ -n "$OPENROUTER_KEY" && -d "$AUTOTUNE_DIR" ]]; then
+if [[ -d "$AUTOTUNE_DIR" ]]; then
   cat > "$AUTOTUNE_ENV" <<EOF
 OPENROUTER_API_KEY=$OPENROUTER_KEY
 OPENROUTER_SITE_URL=$OPENROUTER_SITE_URL
@@ -114,8 +115,9 @@ AUTOTUNE_OUTPUT_DIR=$PROMPTS_DIR
 AUTOTUNE_TRACE_DIR=$TRACES_DIR
 EOF
   chmod 600 "$AUTOTUNE_ENV" || true
-else
-  warn "OPENROUTER_API_KEY missing; Autotune will not evaluate or optimize"
+  if [[ -z "$OPENROUTER_KEY" ]]; then
+    warn "OPENROUTER_API_KEY missing; Autotune will not evaluate or optimize"
+  fi
 fi
 
 if ! command -v systemctl >/dev/null 2>&1; then
@@ -160,7 +162,7 @@ User=$TARGET_USER
 WorkingDirectory=$AUTOTUNE_DIR
 Environment=NODE_ENV=production
 Environment=HOME=$TARGET_HOME
-EnvironmentFile=$AUTOTUNE_ENV
+EnvironmentFile=-$AUTOTUNE_ENV
 ExecStart=$NODE_PATH $AUTOTUNE_DIR/dist/cli.js once
 
 [Install]
