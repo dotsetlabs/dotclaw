@@ -34,6 +34,7 @@ const logger = pino({
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
+const CONTAINER_ID_DIR = path.join(DATA_DIR, 'tmp');
 
 
 export interface ContainerInput {
@@ -228,13 +229,16 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[]): string[] {
+function buildContainerArgs(mounts: VolumeMount[], cidFile?: string): string[] {
   const args: string[] = ['run', '-i', '--rm'];
 
   // Security hardening
   args.push('--cap-drop=ALL');
   args.push('--security-opt=no-new-privileges');
   args.push(`--pids-limit=${CONTAINER_PIDS_LIMIT}`);
+  if (cidFile) {
+    args.push('--cidfile', cidFile);
+  }
 
   const runUid = CONTAINER_RUN_UID ? CONTAINER_RUN_UID.trim() : '';
   const runGid = CONTAINER_RUN_GID ? CONTAINER_RUN_GID.trim() : '';
@@ -272,6 +276,21 @@ function buildContainerArgs(mounts: VolumeMount[]): string[] {
   return args;
 }
 
+function readContainerId(cidFile: string): string | null {
+  try {
+    const id = fs.readFileSync(cidFile, 'utf-8').trim();
+    return id ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function removeContainerById(containerId: string, reason: string): void {
+  if (!containerId) return;
+  logger.warn({ containerId, reason }, 'Removing container');
+  spawn('docker', ['rm', '-f', containerId], { stdio: 'ignore' });
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput
@@ -282,7 +301,14 @@ export async function runContainerAgent(
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
-  const containerArgs = buildContainerArgs(mounts);
+  fs.mkdirSync(CONTAINER_ID_DIR, { recursive: true });
+  const cidFile = path.join(CONTAINER_ID_DIR, `container-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.cid`);
+  try {
+    fs.rmSync(cidFile, { force: true });
+  } catch {
+    // ignore cleanup failure
+  }
+  const containerArgs = buildContainerArgs(mounts, cidFile);
 
   logger.debug({
     group: group.name,
@@ -342,18 +368,36 @@ export async function runContainerAgent(
       }
     });
 
+    const cleanupCid = () => {
+      try {
+        fs.rmSync(cidFile, { force: true });
+      } catch {
+        // ignore cleanup failure
+      }
+    };
+
+    const stopContainer = (reason: string) => {
+      const containerId = readContainerId(cidFile);
+      if (containerId) {
+        removeContainerById(containerId, reason);
+      }
+    };
+
+    const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     const timeout = setTimeout(() => {
       logger.error({ group: group.name }, 'Container timeout, killing');
+      stopContainer('timeout');
       container.kill('SIGKILL');
       resolve({
         status: 'error',
         result: null,
-        error: `Container timed out after ${CONTAINER_TIMEOUT}ms`
+        error: `Container timed out after ${timeoutMs}ms`
       });
-    }, group.containerConfig?.timeout || CONTAINER_TIMEOUT);
+    }, timeoutMs);
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      cleanupCid();
       const duration = Date.now() - startTime;
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -470,6 +514,7 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      cleanupCid();
       logger.error({ group: group.name, error: err }, 'Container spawn error');
       resolve({
         status: 'error',

@@ -164,6 +164,42 @@ function getConfig(): MemoryConfig & {
   };
 }
 
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isEnabledEnv(name: string, defaultValue = true): boolean {
+  const value = (process.env[name] || '').toLowerCase().trim();
+  if (!value) return defaultValue;
+  return !['0', 'false', 'no', 'off'].includes(value);
+}
+
+function getOpenRouterOptions() {
+  const timeoutMs = parsePositiveInt(process.env.DOTCLAW_OPENROUTER_TIMEOUT_MS, 240_000);
+  const retryEnabled = isEnabledEnv('DOTCLAW_OPENROUTER_RETRY', true);
+  const retryConfig = retryEnabled
+    ? {
+      strategy: 'backoff' as const,
+      backoff: {
+        initialInterval: 500,
+        maxInterval: 5000,
+        exponent: 2,
+        maxElapsedTime: 20_000
+      },
+      retryConnectionErrors: true
+    }
+    : { strategy: 'none' as const };
+
+  return {
+    timeoutMs,
+    retryConfig,
+    httpReferer: process.env.OPENROUTER_SITE_URL,
+    xTitle: process.env.OPENROUTER_SITE_NAME
+  };
+}
+
 function buildSystemInstructions(params: {
   assistantName: string;
   memorySummary: string;
@@ -286,9 +322,11 @@ async function main(): Promise<void> {
   const summaryModel = process.env.DOTCLAW_SUMMARY_MODEL || model;
   const assistantName = process.env.ASSISTANT_NAME || 'Rain';
   const config = getConfig();
+  const openrouterOptions = getOpenRouterOptions();
 
   const openrouter = new OpenRouter({
-    apiKey
+    apiKey,
+    ...openrouterOptions
   });
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);

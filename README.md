@@ -156,6 +156,8 @@ If you see permission errors, ensure the host user owns `data/` and `groups/`:
 sudo chown -R $USER data/ groups/
 ```
 
+For a full Ubuntu VPS + systemd guide, see `docs/UBUNTU.md`.
+
 ### Model Switching
 
 The active model is stored in `data/model.json` and can be updated without editing `.env`.

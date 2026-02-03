@@ -13,12 +13,14 @@ import {
   MAIN_GROUP_FOLDER,
   GROUPS_DIR,
   IPC_POLL_INTERVAL,
+  CONTAINER_TIMEOUT,
   TIMEZONE
 } from './config.js';
 import { RegisteredGroup, Session } from './types.js';
 import { initDatabase, storeMessage, storeChatMetadata, getMessagesSince, getAllTasks, createTask, updateTask, deleteTask, getTaskById } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
+import type { ContainerOutput } from './container-runner.js';
 import { loadJson, saveJson, isSafeGroupFolder, loadModelConfig, saveModelConfig, isModelAllowed } from './utils.js';
 
 const logger = pino({
@@ -26,9 +28,25 @@ const logger = pino({
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
 
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const TELEGRAM_HANDLER_TIMEOUT_MS = parsePositiveInt(
+  process.env.DOTCLAW_TELEGRAM_HANDLER_TIMEOUT_MS,
+  Math.max(CONTAINER_TIMEOUT + 30_000, 120_000)
+);
+const TELEGRAM_SEND_RETRIES = parsePositiveInt(process.env.DOTCLAW_TELEGRAM_SEND_RETRIES, 3);
+const TELEGRAM_SEND_RETRY_DELAY_MS = parsePositiveInt(process.env.DOTCLAW_TELEGRAM_SEND_RETRY_DELAY_MS, 1000);
+
 // Initialize Telegram bot with extended timeout for long-running agent tasks
 const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!, {
-  handlerTimeout: 300_000 // 5 minutes (default is 90 seconds)
+  handlerTimeout: TELEGRAM_HANDLER_TIMEOUT_MS
+});
+telegrafBot.catch((err, ctx) => {
+  logger.error({ err, chatId: ctx?.chat?.id }, 'Unhandled Telegraf error');
 });
 
 let sessions: Session = {};
@@ -37,6 +55,13 @@ let lastAgentTimestamp: Record<string, string> = {};
 
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
 const TELEGRAM_SEND_DELAY_MS = 250;
+
+type QueueState = {
+  inFlight: boolean;
+  pendingMessage?: TelegramMessage;
+};
+
+const messageQueues = new Map<string, QueueState>();
 
 async function setTyping(chatId: string): Promise<void> {
   try {
@@ -51,6 +76,33 @@ function sleep(ms: number): Promise<void> {
 }
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getTelegramErrorCode(err: unknown): number | null {
+  const anyErr = err as { code?: number; response?: { error_code?: number } };
+  if (typeof anyErr?.code === 'number') return anyErr.code;
+  if (typeof anyErr?.response?.error_code === 'number') return anyErr.response.error_code;
+  return null;
+}
+
+function getTelegramRetryAfterMs(err: unknown): number | null {
+  const anyErr = err as { parameters?: { retry_after?: number | string }; response?: { parameters?: { retry_after?: number | string } } };
+  const retryAfter = anyErr?.parameters?.retry_after ?? anyErr?.response?.parameters?.retry_after;
+  if (typeof retryAfter === 'number' && Number.isFinite(retryAfter)) return retryAfter * 1000;
+  if (typeof retryAfter === 'string') {
+    const parsed = Number.parseInt(retryAfter, 10);
+    if (Number.isFinite(parsed)) return parsed * 1000;
+  }
+  return null;
+}
+
+function isRetryableTelegramError(err: unknown): boolean {
+  const code = getTelegramErrorCode(err);
+  if (code === 429) return true;
+  if (code && code >= 500 && code < 600) return true;
+  const anyErr = err as { code?: string };
+  if (!anyErr?.code) return false;
+  return ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND'].includes(anyErr.code);
 }
 
 function buildTriggerPattern(trigger: string): RegExp {
@@ -133,14 +185,36 @@ function registerGroup(chatId: string, group: RegisteredGroup): void {
 }
 
 async function sendMessage(chatId: string, text: string): Promise<void> {
+  const sendChunk = async (chunk: string): Promise<boolean> => {
+    for (let attempt = 1; attempt <= TELEGRAM_SEND_RETRIES; attempt += 1) {
+      try {
+        await telegrafBot.telegram.sendMessage(chatId, chunk);
+        return true;
+      } catch (err) {
+        const retryAfterMs = getTelegramRetryAfterMs(err);
+        const retryable = isRetryableTelegramError(err);
+        if (!retryable || attempt === TELEGRAM_SEND_RETRIES) {
+          logger.error({ chatId, attempt, err }, 'Failed to send Telegram message chunk');
+          return false;
+        }
+        const delayMs = retryAfterMs ?? (TELEGRAM_SEND_RETRY_DELAY_MS * attempt);
+        logger.warn({ chatId, attempt, delayMs }, 'Telegram send failed; retrying');
+        await sleep(delayMs);
+      }
+    }
+    return false;
+  };
+
   try {
     // Telegram bots send messages as themselves, no prefix needed
     if (text.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
-      await telegrafBot.telegram.sendMessage(chatId, text);
+      const ok = await sendChunk(text);
+      if (!ok) return;
     } else {
       for (let i = 0; i < text.length; i += TELEGRAM_MAX_MESSAGE_LENGTH) {
         const chunk = text.slice(i, i + TELEGRAM_MAX_MESSAGE_LENGTH);
-        await telegrafBot.telegram.sendMessage(chatId, chunk);
+        const ok = await sendChunk(chunk);
+        if (!ok) return;
         if (i + TELEGRAM_MAX_MESSAGE_LENGTH < text.length) {
           await sleep(TELEGRAM_SEND_DELAY_MS);
         }
@@ -161,11 +235,47 @@ interface TelegramMessage {
   isGroup: boolean;
 }
 
-async function processMessage(msg: TelegramMessage): Promise<void> {
+function enqueueMessage(msg: TelegramMessage): void {
+  const existing = messageQueues.get(msg.chatId);
+  if (existing) {
+    existing.pendingMessage = msg;
+    if (!existing.inFlight) {
+      void drainQueue(msg.chatId);
+    }
+    return;
+  }
+  messageQueues.set(msg.chatId, { inFlight: false, pendingMessage: msg });
+  void drainQueue(msg.chatId);
+}
+
+async function drainQueue(chatId: string): Promise<void> {
+  const state = messageQueues.get(chatId);
+  if (!state || state.inFlight) return;
+
+  state.inFlight = true;
+  try {
+    while (state.pendingMessage) {
+      const next = state.pendingMessage;
+      state.pendingMessage = undefined;
+      await processMessage(next);
+    }
+  } catch (err) {
+    logger.error({ chatId, err }, 'Error draining message queue');
+  } finally {
+    state.inFlight = false;
+    if (state.pendingMessage) {
+      void drainQueue(chatId);
+    } else {
+      messageQueues.delete(chatId);
+    }
+  }
+}
+
+async function processMessage(msg: TelegramMessage): Promise<boolean> {
   const group = registeredGroups[msg.chatId];
   if (!group) {
     logger.debug({ chatId: msg.chatId }, 'Message from unregistered Telegram chat');
-    return;
+    return false;
   }
 
   const content = msg.content.trim();
@@ -175,11 +285,22 @@ async function processMessage(msg: TelegramMessage): Promise<void> {
     : TRIGGER_PATTERN;
 
   // Main group responds to all messages; other groups require trigger prefix
-  if (!isMainGroup && !triggerPattern.test(content)) return;
+  if (!isMainGroup && !triggerPattern.test(content)) return false;
 
   // Get all messages since last agent interaction so the session has full context
   const sinceTimestamp = lastAgentTimestamp[msg.chatId] || '';
-  const missedMessages = getMessagesSince(msg.chatId, sinceTimestamp, ASSISTANT_NAME);
+  let missedMessages = getMessagesSince(msg.chatId, sinceTimestamp, ASSISTANT_NAME);
+  if (missedMessages.length === 0) {
+    logger.warn({ chatId: msg.chatId }, 'No missed messages found; falling back to current message');
+    missedMessages = [{
+      id: `fallback-${Date.now()}`,
+      chat_jid: msg.chatId,
+      sender: msg.senderId,
+      sender_name: msg.senderName,
+      content: msg.content,
+      timestamp: msg.timestamp
+    }];
+  }
 
   const lines = missedMessages.map(m => {
     // Escape XML special characters in content
@@ -192,27 +313,40 @@ async function processMessage(msg: TelegramMessage): Promise<void> {
   });
   const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
 
-  if (missedMessages.length === 0) return;
-
   logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
 
   await setTyping(msg.chatId);
-  let response: string | null = null;
+  let output: ContainerOutput | null = null;
   try {
-    response = await runAgent(group, prompt, msg.chatId);
-  } finally {
-    lastAgentTimestamp[msg.chatId] = msg.timestamp;
-    saveState();
+    output = await runAgent(group, prompt, msg.chatId);
+  }
+  catch (err) {
+    logger.error({ group: group.name, err }, 'Agent error');
+    await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
+    return false;
   }
 
-  if (response && response.trim()) {
-    await sendMessage(msg.chatId, response);
-  } else if (response !== null) {
+  if (!output) return false;
+
+  if (output.status === 'error') {
+    logger.error({ group: group.name, error: output.error }, 'Container agent error');
+    await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
+    return false;
+  }
+
+  lastAgentTimestamp[msg.chatId] = msg.timestamp;
+  saveState();
+
+  if (output.result && output.result.trim()) {
+    await sendMessage(msg.chatId, output.result);
+  } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
   }
+
+  return true;
 }
 
-async function runAgent(group: RegisteredGroup, prompt: string, chatId: string): Promise<string | null> {
+async function runAgent(group: RegisteredGroup, prompt: string, chatId: string): Promise<ContainerOutput> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
@@ -246,15 +380,15 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatId: string):
       saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
     }
 
-    if (output.status === 'error') {
-      logger.error({ group: group.name, error: output.error }, 'Container agent error');
-      return null;
-    }
-
-    return output.result;
+    return output;
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
-    return null;
+    return {
+      status: 'error',
+      result: null,
+      error: errorMessage
+    };
   }
 }
 
@@ -570,13 +704,8 @@ async function processTaskIpc(
 }
 
 function setupTelegramHandlers(): void {
-  // Global error handler to prevent crashes
-  telegrafBot.catch((err, ctx) => {
-    logger.error({ err, chatId: ctx?.chat?.id }, 'Unhandled Telegraf error');
-  });
-
   // Handle all text messages
-  telegrafBot.on('message', async (ctx) => {
+  telegrafBot.on('message', (ctx) => {
     if (!ctx.message || !('text' in ctx.message)) return;
 
     const chatId = String(ctx.chat.id);
@@ -588,37 +717,35 @@ function setupTelegramHandlers(): void {
 
     logger.info({ chatId, isGroup, senderName }, `Telegram message: ${content.substring(0, 50)}...`);
 
-    // Ensure chat exists in database (required for foreign key)
-    const chatName = ctx.chat.type === 'private'
-      ? (ctx.from?.first_name || ctx.from?.username || 'Private Chat')
-      : ('title' in ctx.chat ? ctx.chat.title : 'Group Chat');
-    storeChatMetadata(chatId, timestamp, chatName);
-
-    // Store message in database
-    storeMessage(
-      String(ctx.message.message_id),
-      chatId,
-      senderId,
-      senderName,
-      content,
-      timestamp,
-      false
-    );
-
-    // Process through agent
     try {
-      await processMessage({
+      // Ensure chat exists in database (required for foreign key)
+      const chatName = ctx.chat.type === 'private'
+        ? (ctx.from?.first_name || ctx.from?.username || 'Private Chat')
+        : ('title' in ctx.chat ? ctx.chat.title : 'Group Chat');
+      storeChatMetadata(chatId, timestamp, chatName);
+
+      // Store message in database
+      storeMessage(
+        String(ctx.message.message_id),
         chatId,
         senderId,
         senderName,
         content,
         timestamp,
-        isGroup
-      });
+        false
+      );
     } catch (error) {
-      logger.error({ error, chatId }, 'Error processing Telegram message');
-      await telegrafBot.telegram.sendMessage(chatId, 'Sorry, something went wrong.');
+      logger.error({ error, chatId }, 'Failed to persist Telegram message');
     }
+
+    enqueueMessage({
+      chatId,
+      senderId,
+      senderName,
+      content,
+      timestamp,
+      isGroup
+    });
   });
 }
 
