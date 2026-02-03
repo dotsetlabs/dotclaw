@@ -23,7 +23,7 @@ import {
   MemoryConfig,
   Message
 } from './memory.js';
-import { loadPromptPack, formatTaskExtractionPack, formatResponseQualityPack, PromptPack } from './prompt-packs.js';
+import { loadPromptPackWithCanary, formatTaskExtractionPack, formatResponseQualityPack, formatToolCallingPack, formatMemoryPolicyPack, PromptPack } from './prompt-packs.js';
 
 interface ContainerInput {
   prompt: string;
@@ -59,6 +59,7 @@ const PROMPTS_DIR = '/workspace/prompts';
 const PROMPT_PACKS_ENABLED = !['0', 'false', 'no', 'off'].includes((process.env.DOTCLAW_PROMPT_PACKS_ENABLED || '').toLowerCase());
 const PROMPT_PACKS_MAX_CHARS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_CHARS || '6000', 10);
 const PROMPT_PACKS_MAX_DEMOS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_DEMOS || '4', 10);
+const PROMPT_PACKS_CANARY_RATE = parseFloat(process.env.DOTCLAW_PROMPT_PACKS_CANARY_RATE || '0.1');
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
@@ -221,6 +222,8 @@ function buildSystemInstructions(params: {
   isScheduledTask: boolean;
   taskExtractionPack?: PromptPack | null;
   responseQualityPack?: PromptPack | null;
+  toolCallingPack?: PromptPack | null;
+  memoryPolicyPack?: PromptPack | null;
 }): string {
   const toolsDoc = [
     'Tools available (use with care):',
@@ -263,12 +266,30 @@ function buildSystemInstructions(params: {
     })
     : '';
 
+  const toolCallingBlock = params.toolCallingPack
+    ? formatToolCallingPack({
+      pack: params.toolCallingPack,
+      maxDemos: PROMPT_PACKS_MAX_DEMOS,
+      maxChars: PROMPT_PACKS_MAX_CHARS
+    })
+    : '';
+
+  const memoryPolicyBlock = params.memoryPolicyPack
+    ? formatMemoryPolicyPack({
+      pack: params.memoryPolicyPack,
+      maxDemos: PROMPT_PACKS_MAX_DEMOS,
+      maxChars: PROMPT_PACKS_MAX_CHARS
+    })
+    : '';
+
   return [
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
     scheduledNote,
     toolsDoc,
+    toolCallingBlock,
     taskExtractionBlock,
     responseQualityBlock,
+    memoryPolicyBlock,
     'Long-term memory summary:',
     memorySummary,
     'Long-term facts:',
@@ -445,23 +466,35 @@ async function main(): Promise<void> {
     config
   });
 
-  const extraPromptDirs = fs.existsSync(PROMPTS_DIR) ? [PROMPTS_DIR] : [];
+  const sharedPromptDir = fs.existsSync(PROMPTS_DIR) ? PROMPTS_DIR : undefined;
   const taskPackResult = PROMPT_PACKS_ENABLED
-    ? loadPromptPack({ behavior: 'task-extraction', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, extraDirs: extraPromptDirs })
+    ? loadPromptPackWithCanary({ behavior: 'task-extraction', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
     : null;
   const responseQualityResult = PROMPT_PACKS_ENABLED
-    ? loadPromptPack({ behavior: 'response-quality', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, extraDirs: extraPromptDirs })
+    ? loadPromptPackWithCanary({ behavior: 'response-quality', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
     : null;
-  if (taskPackResult) {
-    log(`Loaded prompt pack (${taskPackResult.source}): ${taskPackResult.pack.name}@${taskPackResult.pack.version}`);
-  }
-  if (responseQualityResult) {
-    log(`Loaded prompt pack (${responseQualityResult.source}): ${responseQualityResult.pack.name}@${responseQualityResult.pack.version}`);
-  }
+  const toolCallingResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPackWithCanary({ behavior: 'tool-calling', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
+    : null;
+  const memoryPolicyResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPackWithCanary({ behavior: 'memory-policy', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
+    : null;
+
+  const logPack = (label: string, result: { pack: PromptPack; source: string; isCanary?: boolean } | null) => {
+    if (!result) return;
+    const canaryNote = result.isCanary ? ' (canary)' : '';
+    log(`Loaded prompt pack (${label}${canaryNote}): ${result.pack.name}@${result.pack.version}`);
+  };
+  logPack(taskPackResult?.source || 'unknown', taskPackResult);
+  logPack(responseQualityResult?.source || 'unknown', responseQualityResult);
+  logPack(toolCallingResult?.source || 'unknown', toolCallingResult);
+  logPack(memoryPolicyResult?.source || 'unknown', memoryPolicyResult);
 
   const promptPackVersions: Record<string, string> = {};
   if (taskPackResult) promptPackVersions['task-extraction'] = taskPackResult.pack.version;
   if (responseQualityResult) promptPackVersions['response-quality'] = responseQualityResult.pack.version;
+  if (toolCallingResult) promptPackVersions['tool-calling'] = toolCallingResult.pack.version;
+  if (memoryPolicyResult) promptPackVersions['memory-policy'] = memoryPolicyResult.pack.version;
 
   const instructions = buildSystemInstructions({
     assistantName,
@@ -470,7 +503,9 @@ async function main(): Promise<void> {
     memoryRecall,
     isScheduledTask: !!input.isScheduledTask,
     taskExtractionPack: taskPackResult?.pack || null,
-    responseQualityPack: responseQualityResult?.pack || null
+    responseQualityPack: responseQualityResult?.pack || null,
+    toolCallingPack: toolCallingResult?.pack || null,
+    memoryPolicyPack: memoryPolicyResult?.pack || null
   });
 
   const instructionsTokens = estimateTokens(instructions);
