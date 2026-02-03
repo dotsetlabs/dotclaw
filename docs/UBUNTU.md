@@ -36,6 +36,7 @@ Add these to `.env` as needed:
 - `DOTCLAW_OPENROUTER_TIMEOUT_MS=240000` (OpenRouter request timeout).
 - `DOTCLAW_OPENROUTER_RETRY=true` (retry transient OpenRouter failures).
 - `DOTCLAW_TELEGRAM_SEND_RETRIES=3` (retry Telegram sends).
+- `DOTCLAW_MAX_TOOL_STEPS=12` (raise if tool-heavy requests stall).
 - `CONTAINER_MEMORY=2g` and/or `CONTAINER_CPUS=2` for resource limits.
 
 ## Permissions

@@ -22,6 +22,7 @@ import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './co
 import type { ContainerOutput } from './container-runner.js';
 import { loadJson, saveJson, isSafeGroupFolder, loadModelConfig, saveModelConfig, isModelAllowed } from './utils.js';
 import { writeTrace } from './trace-writer.js';
+import { formatTelegramMessage, TELEGRAM_PARSE_MODE } from './telegram-format.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -197,10 +198,11 @@ function registerGroup(chatId: string, group: RegisteredGroup): void {
 }
 
 async function sendMessage(chatId: string, text: string): Promise<void> {
+  const chunks = formatTelegramMessage(text, TELEGRAM_MAX_MESSAGE_LENGTH);
   const sendChunk = async (chunk: string): Promise<boolean> => {
     for (let attempt = 1; attempt <= TELEGRAM_SEND_RETRIES; attempt += 1) {
       try {
-        await telegrafBot.telegram.sendMessage(chatId, chunk);
+        await telegrafBot.telegram.sendMessage(chatId, chunk, { parse_mode: TELEGRAM_PARSE_MODE });
         return true;
       } catch (err) {
         const retryAfterMs = getTelegramRetryAfterMs(err);
@@ -219,17 +221,11 @@ async function sendMessage(chatId: string, text: string): Promise<void> {
 
   try {
     // Telegram bots send messages as themselves, no prefix needed
-    if (text.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
-      const ok = await sendChunk(text);
+    for (let i = 0; i < chunks.length; i += 1) {
+      const ok = await sendChunk(chunks[i]);
       if (!ok) return;
-    } else {
-      for (let i = 0; i < text.length; i += TELEGRAM_MAX_MESSAGE_LENGTH) {
-        const chunk = text.slice(i, i + TELEGRAM_MAX_MESSAGE_LENGTH);
-        const ok = await sendChunk(chunk);
-        if (!ok) return;
-        if (i + TELEGRAM_MAX_MESSAGE_LENGTH < text.length) {
-          await sleep(TELEGRAM_SEND_DELAY_MS);
-        }
+      if (i < chunks.length - 1) {
+        await sleep(TELEGRAM_SEND_DELAY_MS);
       }
     }
     logger.info({ chatId, length: text.length }, 'Message sent');
@@ -375,6 +371,11 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
 
   if (output.result && output.result.trim()) {
     await sendMessage(msg.chatId, output.result);
+  } else if (output.tool_calls && output.tool_calls.length > 0) {
+    await sendMessage(
+      msg.chatId,
+      'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.'
+    );
   } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
   }

@@ -5,7 +5,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { OpenRouter } from '@openrouter/sdk';
+import { OpenRouter, stepCountIs } from '@openrouter/sdk';
 import { createTools, ToolCallRecord } from './tools.js';
 import {
   createSessionContext,
@@ -377,6 +377,7 @@ async function main(): Promise<void> {
   const assistantName = process.env.ASSISTANT_NAME || 'Rain';
   const config = getConfig();
   const openrouterOptions = getOpenRouterOptions();
+  const maxToolSteps = parsePositiveInt(process.env.DOTCLAW_MAX_TOOL_STEPS, 12);
 
   const openrouter = new OpenRouter({
     apiKey,
@@ -523,6 +524,7 @@ async function main(): Promise<void> {
       instructions,
       input: messagesToOpenRouter(contextMessages),
       tools,
+      stopWhen: stepCountIs(maxToolSteps),
       maxOutputTokens: config.maxOutputTokens,
       temperature: config.temperature
     });
