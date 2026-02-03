@@ -183,7 +183,6 @@ export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'dotclaw-agent:lat
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '300000', 10);
 export const IPC_POLL_INTERVAL = 1000;
 
-export const TRIGGER_PATTERN = new RegExp(`^@${ASSISTANT_NAME}\\b`, 'i');
 ```
 
 **Note:** Paths must be absolute for Docker volume mounts to work correctly.
@@ -197,7 +196,6 @@ Groups can have additional directories mounted via `containerConfig` in `data/re
   "-987654321": {
     "name": "Dev Team",
     "folder": "dev-team",
-    "trigger": "@Rain",
     "added_at": "2026-01-31T12:00:00Z",
     "containerConfig": {
       "additionalMounts": [
@@ -276,7 +274,7 @@ Set the `ASSISTANT_NAME` environment variable:
 ASSISTANT_NAME=Bot npm start
 ```
 
-Or edit the default in `src/config.ts`. This changes the trigger pattern (messages must start with `@YourName` in groups).
+Or edit the default in `src/config.ts`. This changes how the assistant identifies itself in prompts and logs.
 
 ### Optional Safety Controls
 
@@ -410,15 +408,14 @@ Sessions enable conversation continuity with a DotClaw-managed history, summary,
 10. Router updates last agent timestamp and saves session ID
 ```
 
-### Trigger Word Matching
+### Group Mention Matching
 
-In groups, messages must start with the trigger pattern (default: `@Rain`):
-- `@Rain what's the weather?` → ✅ Triggers assistant
-- `@andy help me` → ✅ Triggers (case insensitive)
-- `Hey @Rain` → ❌ Ignored (trigger not at start)
-- `What's up?` → ❌ Ignored (no trigger)
+In groups, the bot processes messages that **mention the bot** or **reply to the bot** (Telegram privacy):
+- `@dotclaw_bot what's the weather?` → ✅ Triggers assistant
+- Replying to a bot message → ✅ Triggers assistant
+- `What's up?` → ❌ Ignored (no mention/reply)
 
-In the main channel (personal DM), all messages trigger the agent.
+In private chats (DMs), all messages trigger the agent.
 
 ### Conversation Catch-Up
 
@@ -427,7 +424,7 @@ When a triggered message arrives, the agent receives all messages since its last
 ```
 [Jan 31 2:32 PM] John: hey everyone, should we do pizza tonight?
 [Jan 31 2:33 PM] Sarah: sounds good to me
-[Jan 31 2:35 PM] John: @Rain what toppings do you recommend?
+[Jan 31 2:35 PM] John: @dotclaw_bot what toppings do you recommend?
 ```
 
 This allows the agent to understand the conversation context even if it wasn't mentioned in every message.
@@ -440,17 +437,17 @@ This allows the agent to understand the conversation context even if it wasn't m
 
 | Command | Example | Effect |
 |---------|---------|--------|
-| `@Assistant [message]` | `@Rain what's the weather?` | Talk to the assistant |
+| `@Assistant [message]` | `@dotclaw_bot what's the weather?` | Talk to the assistant |
 
 ### Commands Available in Main Channel Only
 
 | Command | Example | Effect |
 |---------|---------|--------|
-| `@Assistant add group [chat_id]` | `@Rain add group "-987654321"` | Register a new group |
-| `@Assistant remove group [name]` | `@Rain remove group "work-team"` | Unregister a group |
-| `@Assistant list groups` | `@Rain list groups` | Show registered groups |
-| `@Assistant remember [fact]` | `@Rain remember I prefer dark mode` | Add to global memory |
-| `@Assistant set model [model_id]` | `@Rain set model moonshotai/kimi-k2.5` | Switch OpenRouter model (main only) |
+| `@Assistant add group [chat_id]` | `@dotclaw_bot add group "-987654321"` | Register a new group |
+| `@Assistant remove group [name]` | `@dotclaw_bot remove group "work-team"` | Unregister a group |
+| `@Assistant list groups` | `@dotclaw_bot list groups` | Show registered groups |
+| `@Assistant remember [fact]` | `@dotclaw_bot remember I prefer dark mode` | Add to global memory |
+| `@Assistant set model [model_id]` | `@dotclaw_bot set model moonshotai/kimi-k2.5` | Switch OpenRouter model (main only) |
 
 ---
 
@@ -476,7 +473,7 @@ DotClaw has a built-in scheduler that runs tasks as full agents in their group's
 ### Creating a Task
 
 ```
-User: @Rain remind me every Monday at 9am to review the weekly metrics
+User: @dotclaw_bot remind me every Monday at 9am to review the weekly metrics
 
 Assistant: [calls mcp__dotclaw__schedule_task]
         {
@@ -491,7 +488,7 @@ Assistant: Done! I'll remind you every Monday at 9am.
 ### One-Time Tasks
 
 ```
-User: @Rain at 5pm today, send me a summary of today's emails
+User: @dotclaw_bot at 5pm today, send me a summary of today's emails
 
 Assistant: [calls mcp__dotclaw__schedule_task]
         {
@@ -504,14 +501,14 @@ Assistant: [calls mcp__dotclaw__schedule_task]
 ### Managing Tasks
 
 From any group:
-- `@Rain list my scheduled tasks` - View tasks for this group
-- `@Rain pause task [id]` - Pause a task
-- `@Rain resume task [id]` - Resume a paused task
-- `@Rain cancel task [id]` - Delete a task
+- `@dotclaw_bot list my scheduled tasks` - View tasks for this group
+- `@dotclaw_bot pause task [id]` - Pause a task
+- `@dotclaw_bot resume task [id]` - Resume a paused task
+- `@dotclaw_bot cancel task [id]` - Delete a task
 
 From main channel:
-- `@Rain list all tasks` - View tasks from all groups
-- `@Rain schedule task for "family-chat": [prompt]` - Schedule for another group
+- `@dotclaw_bot list all tasks` - View tasks from all groups
+- `@dotclaw_bot schedule task for "family-chat": [prompt]` - Schedule for another group
 
 ---
 
@@ -628,7 +625,7 @@ Telegram messages could contain malicious instructions attempting to manipulate 
 **Mitigations:**
 - Container isolation limits blast radius
 - Only registered chats are processed
-- Trigger word required in groups (reduces accidental processing)
+- In groups, only mentions or replies are processed (reduces accidental processing)
 - Agents can only access their group's mounted directories
 - Main can configure additional directories per group
 - Model's built-in safety training

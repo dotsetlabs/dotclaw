@@ -113,7 +113,7 @@ const allowedPrefixes = ['DOTCLAW_'];
 │  Telegram Messages (potentially malicious)                        │
 └────────────────────────────────┬─────────────────────────────────┘
                                  │
-                                 ▼ Trigger check, input escaping
+                                 ▼ Mention/reply check, input escaping
 ┌──────────────────────────────────────────────────────────────────┐
 │                     HOST PROCESS (TRUSTED)                        │
 │  • Message routing                                                │

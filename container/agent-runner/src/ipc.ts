@@ -143,7 +143,7 @@ export function createIpcHandlers(ctx: IpcContext) {
       return { ok: true };
     },
 
-    async registerGroup(args: { jid: string; name: string; folder: string; trigger: string }) {
+    async registerGroup(args: { jid: string; name: string; folder: string; trigger?: string }) {
       if (!isMain) {
         return { ok: false, error: 'Only the main group can register new groups.' };
       }

@@ -31,12 +31,6 @@ const DEFAULT_GID = typeof process.getgid === 'function' ? process.getgid() : un
 export const CONTAINER_RUN_UID = process.env.CONTAINER_RUN_UID || (DEFAULT_UID !== undefined ? String(DEFAULT_UID) : '');
 export const CONTAINER_RUN_GID = process.env.CONTAINER_RUN_GID || (DEFAULT_GID !== undefined ? String(DEFAULT_GID) : '');
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-export const TRIGGER_PATTERN = new RegExp(`^@${escapeRegex(ASSISTANT_NAME)}\\b`, 'i');
-
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE = process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;

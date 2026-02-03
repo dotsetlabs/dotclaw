@@ -9,7 +9,6 @@ import {
   ASSISTANT_NAME,
   DATA_DIR,
   MODEL_CONFIG_PATH,
-  TRIGGER_PATTERN,
   MAIN_GROUP_FOLDER,
   GROUPS_DIR,
   IPC_POLL_INTERVAL,
@@ -74,8 +73,31 @@ async function setTyping(chatId: string): Promise<void> {
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function isBotMentioned(
+  text: string,
+  entities: Array<{ offset: number; length: number; type: string; user?: { id: number } }> | undefined,
+  botUsername: string,
+  botId?: number
+): boolean {
+  if (!entities || entities.length === 0) return false;
+  const normalized = botUsername ? botUsername.toLowerCase() : '';
+  for (const entity of entities) {
+    const segment = text.slice(entity.offset, entity.offset + entity.length);
+    if (entity.type === 'mention') {
+      if (segment.toLowerCase() === `@${normalized}`) return true;
+    }
+    if (entity.type === 'text_mention' && botId && entity.user?.id === botId) return true;
+    if (entity.type === 'bot_command') {
+      if (segment.toLowerCase().includes(`@${normalized}`)) return true;
+    }
+  }
+  return false;
+}
+
+function isBotReplied(message: { reply_to_message?: { from?: { id?: number } } } | undefined, botId?: number): boolean {
+  if (!message?.reply_to_message?.from?.id || !botId) return false;
+  return message.reply_to_message.from.id === botId;
 }
 
 function getTelegramErrorCode(err: unknown): number | null {
@@ -105,12 +127,6 @@ function isRetryableTelegramError(err: unknown): boolean {
   return ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND'].includes(anyErr.code);
 }
 
-function buildTriggerPattern(trigger: string): RegExp {
-  const trimmed = trigger.trim();
-  const normalized = trimmed.startsWith('@') ? trimmed : `@${trimmed}`;
-  return new RegExp(`^${escapeRegex(normalized)}\\b`, 'i');
-}
-
 function loadState(): void {
   const statePath = path.join(DATA_DIR, 'router_state.json');
   const state = loadJson<{ last_agent_timestamp?: Record<string, string> }>(statePath, {});
@@ -130,11 +146,6 @@ function loadState(): void {
     }
     if (typeof group.name !== 'string' || group.name.trim() === '') {
       logger.warn({ chatId }, 'Skipping registered group with invalid name');
-      invalidCount += 1;
-      continue;
-    }
-    if (typeof group.trigger !== 'string' || group.trigger.trim() === '') {
-      logger.warn({ chatId }, 'Skipping registered group with invalid trigger');
       invalidCount += 1;
       continue;
     }
@@ -279,13 +290,6 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   }
 
   const content = msg.content.trim();
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-  const triggerPattern = group.trigger
-    ? buildTriggerPattern(group.trigger)
-    : TRIGGER_PATTERN;
-
-  // Main group responds to all messages; other groups require trigger prefix
-  if (!isMainGroup && !triggerPattern.test(content)) return false;
 
   // Get all messages since last agent interaction so the session has full context
   const sinceTimestamp = lastAgentTimestamp[msg.chatId] || '';
@@ -659,7 +663,7 @@ async function processTaskIpc(
         logger.warn({ sourceGroup }, 'Unauthorized register_group attempt blocked');
         break;
       }
-      if (data.jid && data.name && data.folder && data.trigger) {
+      if (data.jid && data.name && data.folder) {
         registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
@@ -710,6 +714,7 @@ function setupTelegramHandlers(): void {
 
     const chatId = String(ctx.chat.id);
     const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+    const isPrivate = ctx.chat.type === 'private';
     const senderId = String(ctx.from?.id || ctx.chat.id);
     const senderName = ctx.from?.first_name || ctx.from?.username || 'User';
     const content = ctx.message.text;
@@ -736,6 +741,16 @@ function setupTelegramHandlers(): void {
       );
     } catch (error) {
       logger.error({ error, chatId }, 'Failed to persist Telegram message');
+    }
+
+    const botUsername = ctx.me;
+    const botId = ctx.botInfo?.id;
+    const mentioned = isBotMentioned(content, ctx.message.entities, botUsername, botId);
+    const replied = isBotReplied(ctx.message, botId);
+    const shouldProcess = isPrivate || mentioned || replied;
+
+    if (!shouldProcess) {
+      return;
     }
 
     enqueueMessage({
@@ -819,7 +834,7 @@ async function main(): Promise<void> {
     });
     startIpcWatcher();
 
-    logger.info(`DotClaw running on Telegram (trigger: @${ASSISTANT_NAME})`);
+    logger.info('DotClaw running on Telegram (responds to DMs and group mentions/replies)');
   } catch (error) {
     logger.error({ error }, 'Failed to start Telegram bot');
     process.exit(1);

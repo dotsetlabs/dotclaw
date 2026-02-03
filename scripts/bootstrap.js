@@ -224,13 +224,10 @@ async function main() {
     console.log('Folder name must be lowercase letters, numbers, and hyphens only.');
     folder = await prompt('Folder name (lowercase, hyphens)', 'main');
   }
-  const trigger = await prompt('Trigger (e.g., @Rain)', '@Rain');
-
   const groups = loadJson(REGISTERED_GROUPS, {});
   groups[String(chatId)] = {
     name,
     folder,
-    trigger,
     added_at: new Date().toISOString()
   };
   saveJson(REGISTERED_GROUPS, groups);

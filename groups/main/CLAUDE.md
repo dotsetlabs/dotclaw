@@ -127,7 +127,6 @@ Groups are registered in `/workspace/project/data/registered_groups.json`:
   "7205165195": {
     "name": "main",
     "folder": "main",
-    "trigger": "@Rain",
     "added_at": "2026-02-02T14:30:00.000Z"
   }
 }
@@ -137,7 +136,6 @@ Fields:
 - **Key**: The Telegram chat ID (positive for personal chats, negative for groups)
 - **name**: Display name for the group
 - **folder**: Folder name under `groups/` for this group's files and memory
-- **trigger**: The trigger word (usually same as global, but could differ)
 - **added_at**: ISO timestamp when registered
 
 ### Adding a Group
@@ -168,7 +166,6 @@ Groups can have extra directories mounted. Add `containerConfig` to their entry:
   "-987654321": {
     "name": "Dev Team",
     "folder": "dev-team",
-    "trigger": "@Rain",
     "added_at": "2026-01-31T12:00:00Z",
     "containerConfig": {
       "additionalMounts": [

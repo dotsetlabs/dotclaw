@@ -30,7 +30,7 @@ This isn't a framework or a platform. It's working software for my specific need
 
 ### Customization = Code Changes
 
-No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change the code to do what you want.
+No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Minimal routing behavior relies on Telegram's mention/reply handling. Everything else - just change the code to do what you want.
 
 ### AI-Native Development
 
@@ -88,7 +88,8 @@ A personal OpenRouter-based assistant accessible via Telegram, with minimal cust
 ### Message Routing
 - A router listens to Telegram and routes messages based on configuration
 - Only messages from registered chats are processed
-- Trigger: `@Rain` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
+- In private chats, all messages are processed
+- In groups, only messages that mention the bot or reply to the bot are processed (leverages Telegram privacy)
 - Unregistered chats are silently ignored
 
 ### Memory System
@@ -182,7 +183,7 @@ A personal OpenRouter-based assistant accessible via Telegram, with minimal cust
 
 These are the creator's settings, stored here for reference:
 
-- **Trigger**: `@Rain` (case insensitive)
+- **Group activation**: Mention or reply to the bot (Telegram privacy)
 - **Response prefix**: None (Telegram bots send as themselves)
 - **Persona**: Default assistant (no custom personality)
 - **Main channel**: Personal Telegram chat with the bot

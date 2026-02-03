@@ -36,7 +36,7 @@ export interface ContainerConfig {
 export interface RegisteredGroup {
   name: string;
   folder: string;
-  trigger: string;
+  trigger?: string;
   added_at: string;
   containerConfig?: ContainerConfig;
 }

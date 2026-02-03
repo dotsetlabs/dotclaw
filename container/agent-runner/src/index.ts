@@ -23,6 +23,7 @@ import {
   MemoryConfig,
   Message
 } from './memory.js';
+import { loadPromptPack, formatTaskExtractionPack, PromptPack } from './prompt-packs.js';
 
 interface ContainerInput {
   prompt: string;
@@ -46,6 +47,11 @@ const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
 const SESSION_ROOT = '/workspace/session';
 const GROUP_DIR = '/workspace/group';
 const IPC_DIR = '/workspace/ipc';
+const GLOBAL_DIR = '/workspace/global';
+
+const PROMPT_PACKS_ENABLED = !['0', 'false', 'no', 'off'].includes((process.env.DOTCLAW_PROMPT_PACKS_ENABLED || '').toLowerCase());
+const PROMPT_PACKS_MAX_CHARS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_CHARS || '6000', 10);
+const PROMPT_PACKS_MAX_DEMOS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_DEMOS || '4', 10);
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
@@ -206,6 +212,7 @@ function buildSystemInstructions(params: {
   memoryFacts: string[];
   memoryRecall: string[];
   isScheduledTask: boolean;
+  taskExtractionPack?: PromptPack | null;
 }): string {
   const toolsDoc = [
     'Tools available (use with care):',
@@ -232,10 +239,19 @@ function buildSystemInstructions(params: {
     ? 'You are running as a scheduled task. If you need to communicate, use `mcp__dotclaw__send_message`.'
     : '';
 
+  const taskExtractionBlock = params.taskExtractionPack
+    ? formatTaskExtractionPack({
+      pack: params.taskExtractionPack,
+      maxDemos: PROMPT_PACKS_MAX_DEMOS,
+      maxChars: PROMPT_PACKS_MAX_CHARS
+    })
+    : '';
+
   return [
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
     scheduledNote,
     toolsDoc,
+    taskExtractionBlock,
     'Long-term memory summary:',
     memorySummary,
     'Long-term facts:',
@@ -407,12 +423,20 @@ async function main(): Promise<void> {
     config
   });
 
+  const promptPackResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPack({ behavior: 'task-extraction', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR })
+    : null;
+  if (promptPackResult) {
+    log(`Loaded prompt pack (${promptPackResult.source}): ${promptPackResult.pack.name}@${promptPackResult.pack.version}`);
+  }
+
   const instructions = buildSystemInstructions({
     assistantName,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
     memoryRecall,
-    isScheduledTask: !!input.isScheduledTask
+    isScheduledTask: !!input.isScheduledTask,
+    taskExtractionPack: promptPackResult?.pack || null
   });
 
   const instructionsTokens = estimateTokens(instructions);

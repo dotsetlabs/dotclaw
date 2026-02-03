@@ -688,13 +688,13 @@ export function createTools(ctx: IpcContext) {
       jid: z.string(),
       name: z.string(),
       folder: z.string(),
-      trigger: z.string()
+      trigger: z.string().optional()
     }),
     outputSchema: z.object({
       ok: z.boolean(),
       error: z.string().optional()
     }),
-    execute: async ({ jid, name, folder, trigger }: { jid: string; name: string; folder: string; trigger: string }) =>
+    execute: async ({ jid, name, folder, trigger }: { jid: string; name: string; folder: string; trigger?: string }) =>
       ipc.registerGroup({ jid, name, folder, trigger })
   });
 
