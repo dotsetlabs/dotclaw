@@ -6,7 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { OpenRouter } from '@openrouter/sdk';
-import { createTools } from './tools.js';
+import { createTools, ToolCallRecord } from './tools.js';
 import {
   createSessionContext,
   appendHistory,
@@ -23,7 +23,7 @@ import {
   MemoryConfig,
   Message
 } from './memory.js';
-import { loadPromptPack, formatTaskExtractionPack, PromptPack } from './prompt-packs.js';
+import { loadPromptPack, formatTaskExtractionPack, formatResponseQualityPack, PromptPack } from './prompt-packs.js';
 
 interface ContainerInput {
   prompt: string;
@@ -39,6 +39,12 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  model?: string;
+  prompt_pack_versions?: Record<string, string>;
+  memory_summary?: string;
+  memory_facts?: string[];
+  tool_calls?: ToolCallRecord[];
+  latency_ms?: number;
 }
 
 const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
@@ -48,6 +54,7 @@ const SESSION_ROOT = '/workspace/session';
 const GROUP_DIR = '/workspace/group';
 const IPC_DIR = '/workspace/ipc';
 const GLOBAL_DIR = '/workspace/global';
+const PROMPTS_DIR = '/workspace/prompts';
 
 const PROMPT_PACKS_ENABLED = !['0', 'false', 'no', 'off'].includes((process.env.DOTCLAW_PROMPT_PACKS_ENABLED || '').toLowerCase());
 const PROMPT_PACKS_MAX_CHARS = parseInt(process.env.DOTCLAW_PROMPT_PACKS_MAX_CHARS || '6000', 10);
@@ -213,6 +220,7 @@ function buildSystemInstructions(params: {
   memoryRecall: string[];
   isScheduledTask: boolean;
   taskExtractionPack?: PromptPack | null;
+  responseQualityPack?: PromptPack | null;
 }): string {
   const toolsDoc = [
     'Tools available (use with care):',
@@ -247,11 +255,20 @@ function buildSystemInstructions(params: {
     })
     : '';
 
+  const responseQualityBlock = params.responseQualityPack
+    ? formatResponseQualityPack({
+      pack: params.responseQualityPack,
+      maxDemos: PROMPT_PACKS_MAX_DEMOS,
+      maxChars: PROMPT_PACKS_MAX_CHARS
+    })
+    : '';
+
   return [
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
     scheduledNote,
     toolsDoc,
     taskExtractionBlock,
+    responseQualityBlock,
     'Long-term memory summary:',
     memorySummary,
     'Long-term facts:',
@@ -346,10 +363,15 @@ async function main(): Promise<void> {
   });
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
+  const toolCalls: ToolCallRecord[] = [];
   const tools = createTools({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
     isMain: input.isMain
+  }, {
+    onToolCall: (call) => {
+      toolCalls.push(call);
+    }
   });
 
   if (process.env.DOTCLAW_SELF_CHECK === '1') {
@@ -423,12 +445,23 @@ async function main(): Promise<void> {
     config
   });
 
-  const promptPackResult = PROMPT_PACKS_ENABLED
-    ? loadPromptPack({ behavior: 'task-extraction', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR })
+  const extraPromptDirs = fs.existsSync(PROMPTS_DIR) ? [PROMPTS_DIR] : [];
+  const taskPackResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPack({ behavior: 'task-extraction', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, extraDirs: extraPromptDirs })
     : null;
-  if (promptPackResult) {
-    log(`Loaded prompt pack (${promptPackResult.source}): ${promptPackResult.pack.name}@${promptPackResult.pack.version}`);
+  const responseQualityResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPack({ behavior: 'response-quality', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, extraDirs: extraPromptDirs })
+    : null;
+  if (taskPackResult) {
+    log(`Loaded prompt pack (${taskPackResult.source}): ${taskPackResult.pack.name}@${taskPackResult.pack.version}`);
   }
+  if (responseQualityResult) {
+    log(`Loaded prompt pack (${responseQualityResult.source}): ${responseQualityResult.pack.name}@${responseQualityResult.pack.version}`);
+  }
+
+  const promptPackVersions: Record<string, string> = {};
+  if (taskPackResult) promptPackVersions['task-extraction'] = taskPackResult.pack.version;
+  if (responseQualityResult) promptPackVersions['response-quality'] = responseQualityResult.pack.version;
 
   const instructions = buildSystemInstructions({
     assistantName,
@@ -436,7 +469,8 @@ async function main(): Promise<void> {
     memoryFacts: sessionCtx.state.facts,
     memoryRecall,
     isScheduledTask: !!input.isScheduledTask,
-    taskExtractionPack: promptPackResult?.pack || null
+    taskExtractionPack: taskPackResult?.pack || null,
+    responseQualityPack: responseQualityResult?.pack || null
   });
 
   const instructionsTokens = estimateTokens(instructions);
@@ -445,8 +479,10 @@ async function main(): Promise<void> {
 
   let responseText = '';
 
+  let latencyMs: number | undefined;
   try {
     log('Starting OpenRouter call...');
+    const startedAt = Date.now();
     const result = await openrouter.callModel({
       model,
       instructions,
@@ -455,16 +491,17 @@ async function main(): Promise<void> {
       maxOutputTokens: config.maxOutputTokens,
       temperature: config.temperature
     });
+    latencyMs = Date.now() - startedAt;
     // Get tool calls to see what the model did
-    const toolCalls = await result.getToolCalls();
-    if (toolCalls.length > 0) {
-      log(`Model made ${toolCalls.length} tool call(s): ${toolCalls.map(t => t.name).join(', ')}`);
+    const modelToolCalls = await result.getToolCalls();
+    if (modelToolCalls.length > 0) {
+      log(`Model made ${modelToolCalls.length} tool call(s): ${modelToolCalls.map(t => t.name).join(', ')}`);
     }
 
     responseText = await result.getText();
 
     if (!responseText || !responseText.trim()) {
-      log(`Warning: Model returned empty/whitespace response. Raw length: ${responseText?.length ?? 0}, tool calls: ${toolCalls.length}`);
+      log(`Warning: Model returned empty/whitespace response. Raw length: ${responseText?.length ?? 0}, tool calls: ${modelToolCalls.length}`);
     } else {
       log(`Model returned text response (${responseText.length} chars)`);
     }
@@ -475,7 +512,13 @@ async function main(): Promise<void> {
       status: 'error',
       result: null,
       newSessionId: isNew ? sessionCtx.sessionId : undefined,
-      error: errorMessage
+      error: errorMessage,
+      model,
+      prompt_pack_versions: Object.keys(promptPackVersions).length > 0 ? promptPackVersions : undefined,
+      memory_summary: sessionCtx.state.summary,
+      memory_facts: sessionCtx.state.facts,
+      tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+      latency_ms: latencyMs
     });
     process.exit(1);
   }
@@ -507,7 +550,13 @@ async function main(): Promise<void> {
   writeOutput({
     status: 'success',
     result: finalResult,
-    newSessionId: isNew ? sessionCtx.sessionId : undefined
+    newSessionId: isNew ? sessionCtx.sessionId : undefined,
+    model,
+    prompt_pack_versions: Object.keys(promptPackVersions).length > 0 ? promptPackVersions : undefined,
+    memory_summary: sessionCtx.state.summary,
+    memory_facts: sessionCtx.state.facts,
+    tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+    latency_ms: latencyMs
   });
 }
 

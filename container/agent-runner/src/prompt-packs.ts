@@ -27,11 +27,17 @@ export function loadPromptPack(params: {
   behavior: string;
   groupDir: string;
   globalDir?: string;
+  extraDirs?: string[];
 }): { pack: PromptPack; source: PromptPackSource } | null {
   const filenames = [`${params.behavior}.json`];
   const searchDirs: Array<{ dir: string; source: PromptPackSource }> = [
     { dir: path.join(params.groupDir, 'prompts'), source: 'group' }
   ];
+  if (params.extraDirs) {
+    for (const extraDir of params.extraDirs) {
+      searchDirs.push({ dir: extraDir, source: 'global' });
+    }
+  }
   if (params.globalDir) {
     searchDirs.push({ dir: path.join(params.globalDir, 'prompts'), source: 'global' });
   }
@@ -68,7 +74,7 @@ export function formatTaskExtractionPack(params: {
   });
 
   const block = [
-    'Task Extraction Guidelines (DSTy):',
+    'Task Extraction Guidelines (Autotune):',
     instructions,
     demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
   ].filter(Boolean).join('\n\n');
@@ -76,7 +82,42 @@ export function formatTaskExtractionPack(params: {
   if (block.length <= params.maxChars) return block;
 
   // Truncate demos if block exceeds max size
-  let trimmed = ['Task Extraction Guidelines (DSTy):', instructions].join('\n\n');
+  let trimmed = ['Task Extraction Guidelines (Autotune):', instructions].join('\n\n');
+  if (trimmed.length > params.maxChars) {
+    return trimmed.slice(0, params.maxChars);
+  }
+
+  for (const demo of demoLines) {
+    const candidate = `${trimmed}\n\nExamples:\n${demo}`;
+    if (candidate.length > params.maxChars) break;
+    trimmed = candidate;
+  }
+
+  return trimmed;
+}
+
+export function formatResponseQualityPack(params: {
+  pack: PromptPack;
+  maxDemos: number;
+  maxChars: number;
+}): string {
+  const instructions = params.pack.instructions.trim();
+  const demos = params.pack.demos.slice(0, params.maxDemos);
+
+  const demoLines = demos.map((demo) => {
+    const output = demo.output === null ? 'null' : JSON.stringify(demo.output);
+    return `Input: ${demo.input}\nOutput: ${output}`;
+  });
+
+  const block = [
+    'Response Quality Guidelines (Autotune):',
+    instructions,
+    demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
+  ].filter(Boolean).join('\n\n');
+
+  if (block.length <= params.maxChars) return block;
+
+  let trimmed = ['Response Quality Guidelines (Autotune):', instructions].join('\n\n');
   if (trimmed.length > params.maxChars) {
     return trimmed.slice(0, params.maxChars);
   }

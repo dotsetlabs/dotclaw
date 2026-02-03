@@ -20,7 +20,8 @@ import {
   CONTAINER_RUN_GID,
   GROUPS_DIR,
   DATA_DIR,
-  MODEL_CONFIG_PATH
+  MODEL_CONFIG_PATH,
+  PROMPT_PACKS_DIR
 } from './config.js';
 import { RegisteredGroup } from './types.js';
 import { validateAdditionalMounts } from './mount-security.js';
@@ -51,6 +52,18 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  model?: string;
+  prompt_pack_versions?: Record<string, string>;
+  memory_summary?: string;
+  memory_facts?: string[];
+  tool_calls?: Array<{
+    name: string;
+    args?: unknown;
+    ok: boolean;
+    duration_ms?: number;
+    error?: string;
+  }>;
+  latency_ms?: number;
 }
 
 interface VolumeMount {
@@ -93,6 +106,16 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
       containerPath: '/workspace/group',
       readonly: false
     });
+
+    // Global memory/prompts directory (read-only)
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    if (fs.existsSync(globalDir)) {
+      mounts.push({
+        hostPath: globalDir,
+        containerPath: '/workspace/global',
+        readonly: true
+      });
+    }
   } else {
     // Other groups only get their own folder
     mounts.push({
@@ -152,6 +175,15 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
     containerPath: '/workspace/ipc',
     readonly: false
   });
+
+  // Shared prompt packs directory (autotune output)
+  if (PROMPT_PACKS_DIR && fs.existsSync(PROMPT_PACKS_DIR)) {
+    mounts.push({
+      hostPath: PROMPT_PACKS_DIR,
+      containerPath: '/workspace/prompts',
+      readonly: true
+    });
+  }
 
   // Environment file directory (keeps credentials out of process listings)
   // Only expose specific auth/config variables needed by the agent, not the entire .env

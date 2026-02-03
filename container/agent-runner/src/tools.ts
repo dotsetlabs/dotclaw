@@ -16,6 +16,16 @@ const WORKSPACE_GLOBAL = '/workspace/global';
 const WORKSPACE_EXTRA = '/workspace/extra';
 const WORKSPACE_PROJECT = '/workspace/project';
 
+export type ToolCallRecord = {
+  name: string;
+  args?: unknown;
+  ok: boolean;
+  duration_ms?: number;
+  error?: string;
+};
+
+type ToolCallLogger = (record: ToolCallRecord) => void;
+
 function getAllowedRoots(isMain: boolean): string[] {
   const roots = [WORKSPACE_GROUP, WORKSPACE_GLOBAL, WORKSPACE_EXTRA];
   if (isMain) roots.push(WORKSPACE_PROJECT);
@@ -67,6 +77,29 @@ function normalizeDomain(value: string): string {
   normalized = normalized.split('/')[0];
   normalized = normalized.split(':')[0];
   return normalized;
+}
+
+function sanitizeToolArgs(name: string, args: unknown): unknown {
+  if (!args || typeof args !== 'object') return args;
+  const record = { ...(args as Record<string, unknown>) };
+
+  if ('content' in record && typeof record.content === 'string') {
+    record.content = `<redacted:${(record.content as string).length}>`;
+  }
+  if ('text' in record && typeof record.text === 'string') {
+    record.text = `<redacted:${(record.text as string).length}>`;
+  }
+  if ('old_text' in record && typeof record.old_text === 'string') {
+    record.old_text = `<redacted:${(record.old_text as string).length}>`;
+  }
+  if ('new_text' in record && typeof record.new_text === 'string') {
+    record.new_text = `<redacted:${(record.new_text as string).length}>`;
+  }
+  if ('command' in record && typeof record.command === 'string') {
+    record.command = (record.command as string).slice(0, 200);
+  }
+
+  return record;
 }
 
 function toPosixPath(inputPath: string): string {
@@ -261,9 +294,10 @@ async function readResponseWithLimit(response: Response, maxBytes: number): Prom
   return { body: Buffer.from(buffer).subarray(0, maxBytes), truncated: true };
 }
 
-export function createTools(ctx: IpcContext) {
+export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLogger }) {
   const ipc = createIpcHandlers(ctx);
   const isMain = ctx.isMain;
+  const onToolCall = options?.onToolCall;
 
   const enableBash = isEnabled('DOTCLAW_ENABLE_BASH', true);
   const enableWebSearch = isEnabled('DOTCLAW_ENABLE_WEBSEARCH', true);
@@ -730,6 +764,34 @@ export function createTools(ctx: IpcContext) {
   if (enableBash) tools.push(bashTool as ReturnType<typeof tool>);
   if (enableWebSearch) tools.push(webSearchTool as ReturnType<typeof tool>);
   if (enableWebFetch) tools.push(webFetchTool as ReturnType<typeof tool>);
+
+  if (onToolCall) {
+    for (const toolDef of tools) {
+      const originalExecute = toolDef.execute;
+      toolDef.execute = async (args: unknown) => {
+        const start = Date.now();
+        try {
+          const result = await originalExecute(args);
+          onToolCall({
+            name: toolDef.name,
+            args: sanitizeToolArgs(toolDef.name, args),
+            ok: true,
+            duration_ms: Date.now() - start
+          });
+          return result;
+        } catch (err) {
+          onToolCall({
+            name: toolDef.name,
+            args: sanitizeToolArgs(toolDef.name, args),
+            ok: false,
+            duration_ms: Date.now() - start,
+            error: err instanceof Error ? err.message : String(err)
+          });
+          throw err;
+        }
+      };
+    }
+  }
 
   return tools;
 }

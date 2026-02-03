@@ -21,6 +21,7 @@ import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
 import type { ContainerOutput } from './container-runner.js';
 import { loadJson, saveJson, isSafeGroupFolder, loadModelConfig, saveModelConfig, isModelAllowed } from './utils.js';
+import { writeTrace } from './trace-writer.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -316,6 +317,32 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
     return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
   });
   const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
+  const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const traceTimestamp = new Date().toISOString();
+  const traceBase = {
+    trace_id: traceId,
+    timestamp: traceTimestamp,
+    created_at: Date.now(),
+    chat_id: msg.chatId,
+    group_folder: group.folder,
+    user_id: msg.senderId,
+    input_text: prompt,
+    source: 'dotclaw'
+  } as const;
+
+  const recordTrace = (output: ContainerOutput | null, errorMessage?: string) => {
+    writeTrace({
+      ...traceBase,
+      output_text: output?.result ?? null,
+      model_id: output?.model || 'unknown',
+      prompt_pack_versions: output?.prompt_pack_versions,
+      memory_summary: output?.memory_summary,
+      memory_facts: output?.memory_facts,
+      tool_calls: output?.tool_calls,
+      latency_ms: output?.latency_ms,
+      error_code: errorMessage || (output?.status === 'error' ? output?.error : undefined)
+    });
+  };
 
   logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
 
@@ -326,14 +353,19 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   }
   catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
+    recordTrace(null, err instanceof Error ? err.message : String(err));
     await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
     return false;
   }
 
-  if (!output) return false;
+  if (!output) {
+    recordTrace(null, 'No output from agent');
+    return false;
+  }
 
   if (output.status === 'error') {
     logger.error({ group: group.name, error: output.error }, 'Container agent error');
+    recordTrace(output, output.error);
     await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
     return false;
   }
@@ -346,6 +378,8 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
   }
+
+  recordTrace(output);
 
   return true;
 }

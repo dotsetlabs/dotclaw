@@ -77,3 +77,11 @@ export interface TaskRunLog {
   result: string | null;
   error: string | null;
 }
+
+export interface ToolCallRecord {
+  name: string;
+  args?: unknown;
+  ok: boolean;
+  duration_ms?: number;
+  error?: string;
+}

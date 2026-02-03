@@ -15,6 +15,9 @@ export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 export const MAIN_GROUP_FOLDER = 'main';
 export const MODEL_CONFIG_PATH = path.join(DATA_DIR, 'model.json');
+export const PROMPT_PACKS_DIR = process.env.DOTCLAW_PROMPT_PACKS_DIR || path.join(HOME_DIR, '.config', 'dotclaw', 'prompts');
+export const TRACE_DIR = process.env.DOTCLAW_TRACE_DIR || path.join(HOME_DIR, '.config', 'dotclaw', 'traces');
+export const TRACE_SAMPLE_RATE = parseFloat(process.env.DOTCLAW_TRACE_SAMPLE_RATE || '1');
 
 export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'dotclaw-agent:latest';
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '300000', 10);

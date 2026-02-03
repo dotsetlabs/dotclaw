@@ -6,6 +6,7 @@ import { getDueTasks, updateTaskAfterRun, logTaskRun, getTaskById, getAllTasks, 
 import { ScheduledTask, RegisteredGroup } from './types.js';
 import { GROUPS_DIR, SCHEDULER_POLL_INTERVAL, DATA_DIR, MAIN_GROUP_FOLDER, TIMEZONE } from './config.js';
 import { runContainerAgent, writeTasksSnapshot } from './container-runner.js';
+import { writeTrace } from './trace-writer.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -61,6 +62,9 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
   const sessions = deps.getSessions();
   const sessionId = task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
+  const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const traceTimestamp = new Date().toISOString();
+
   try {
     const output = await runContainerAgent(group, {
       prompt: task.prompt,
@@ -77,10 +81,41 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
       result = output.result;
     }
 
+    writeTrace({
+      trace_id: traceId,
+      timestamp: traceTimestamp,
+      created_at: Date.now(),
+      chat_id: task.chat_jid,
+      group_folder: task.group_folder,
+      input_text: task.prompt,
+      output_text: output.result ?? null,
+      model_id: output.model || 'unknown',
+      prompt_pack_versions: output.prompt_pack_versions,
+      memory_summary: output.memory_summary,
+      memory_facts: output.memory_facts,
+      tool_calls: output.tool_calls,
+      latency_ms: output.latency_ms,
+      error_code: output.status === 'error' ? output.error : undefined,
+      source: 'dotclaw-scheduler'
+    });
+
     logger.info({ taskId: task.id, durationMs: Date.now() - startTime }, 'Task completed');
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
     logger.error({ taskId: task.id, error }, 'Task failed');
+
+    writeTrace({
+      trace_id: traceId,
+      timestamp: traceTimestamp,
+      created_at: Date.now(),
+      chat_id: task.chat_jid,
+      group_folder: task.group_folder,
+      input_text: task.prompt,
+      output_text: null,
+      model_id: 'unknown',
+      error_code: error,
+      source: 'dotclaw-scheduler'
+    });
   }
 
   const durationMs = Date.now() - startTime;
