@@ -19,7 +19,7 @@
     "test:agent-runner": "node scripts/test-agent-runner.js"
   },
   "dependencies": {
-    "@dotsetlabs/autotune": "^1.0.0",
+    "@dotsetlabs/autotune": "^1.1.0",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
     "dotenv": "^17.2.3",
