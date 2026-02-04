@@ -4,6 +4,7 @@ export default defineConfig({
   title: 'DotClaw',
   description: 'Personal OpenRouter-based assistant for Telegram with container isolation, memory, and scheduling.',
   lang: 'en-US',
+  base: '/dotclaw/',
   lastUpdated: true,
   themeConfig: {
     nav: [
