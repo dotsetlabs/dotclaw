@@ -111,7 +111,6 @@ export function initMemoryStore(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_memory_group_scope ON memory_items(group_folder, scope, subject_id);
     CREATE INDEX IF NOT EXISTS idx_memory_updated_at ON memory_items(updated_at);
-    CREATE INDEX IF NOT EXISTS idx_memory_conflict ON memory_items(group_folder, scope, subject_id, type, conflict_key);
 
     CREATE TABLE IF NOT EXISTS memory_sources (
       id TEXT PRIMARY KEY,
@@ -167,6 +166,10 @@ export function initMemoryStore(): void {
   try {
     memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN conflict_key TEXT`);
   } catch { /* already exists */ }
+
+  try {
+    memoryDb.exec(`CREATE INDEX IF NOT EXISTS idx_memory_conflict ON memory_items(group_folder, scope, subject_id, type, conflict_key)`);
+  } catch { /* column may be missing in older schemas */ }
 }
 
 function normalizeContent(content: string): string {

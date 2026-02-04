@@ -655,6 +655,34 @@ function parseMemoryExtraction(text: string): Array<Record<string, unknown>> {
   }
 }
 
+function buildPlannerTrigger(pattern: string | undefined): RegExp | null {
+  if (!pattern) return null;
+  try {
+    return new RegExp(pattern, 'i');
+  } catch {
+    return null;
+  }
+}
+
+function shouldRunPlanner(params: {
+  enabled: boolean;
+  mode: string;
+  prompt: string;
+  tokensPerChar: number;
+  minTokens: number;
+  trigger: RegExp | null;
+}): boolean {
+  if (!params.enabled) return false;
+  const mode = params.mode.toLowerCase();
+  if (mode === 'always') return true;
+  if (mode === 'off') return false;
+
+  const estimatedTokens = estimateTokensForModel(params.prompt, params.tokensPerChar);
+  if (params.minTokens > 0 && estimatedTokens >= params.minTokens) return true;
+  if (params.trigger && params.trigger.test(params.prompt)) return true;
+  return false;
+}
+
 export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutput> {
   log(`Received input for group: ${input.groupFolder}`);
 
@@ -686,11 +714,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const openrouterOptions = getOpenRouterOptions();
   const maxToolSteps = parsePositiveInt(process.env.DOTCLAW_MAX_TOOL_STEPS, 32);
   const memoryExtractionEnabled = isEnabledEnv('DOTCLAW_MEMORY_EXTRACTION_ENABLED', true);
+  const isDaemon = process.env.DOTCLAW_DAEMON === '1';
+  const memoryExtractionAsync = isEnabledEnv('DOTCLAW_MEMORY_EXTRACTION_ASYNC', isDaemon);
   const memoryExtractionMaxMessages = parsePositiveInt(process.env.DOTCLAW_MEMORY_EXTRACTION_MESSAGES, 8);
   const memoryExtractionMaxOutputTokens = parsePositiveInt(process.env.DOTCLAW_MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS, 900);
   const memoryExtractScheduled = isEnabledEnv('DOTCLAW_MEMORY_EXTRACT_SCHEDULED', false);
   const memoryArchiveSync = isEnabledEnv('DOTCLAW_MEMORY_ARCHIVE_SYNC', true);
   const plannerEnabled = isEnabledEnv('DOTCLAW_PLANNER_ENABLED', true);
+  const plannerMode = (process.env.DOTCLAW_PLANNER_MODE || 'auto').toLowerCase();
+  const plannerMinTokens = parsePositiveInt(process.env.DOTCLAW_PLANNER_MIN_TOKENS, 200);
+  const plannerTrigger = buildPlannerTrigger(process.env.DOTCLAW_PLANNER_TRIGGER_REGEX);
   const plannerModel = process.env.DOTCLAW_PLANNER_MODEL || model;
   const plannerMaxOutputTokens = parsePositiveInt(process.env.DOTCLAW_PLANNER_MAX_OUTPUT_TOKENS, 400);
   const plannerTemperature = parseFloat(process.env.DOTCLAW_PLANNER_TEMPERATURE || '0.2');
@@ -896,7 +929,14 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   let adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
   let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6);
 
-  if (plannerEnabled) {
+  if (shouldRunPlanner({
+    enabled: plannerEnabled,
+    mode: plannerMode,
+    prompt,
+    tokensPerChar: tokenEstimate.tokensPerChar,
+    minTokens: plannerMinTokens,
+    trigger: plannerTrigger
+  })) {
     try {
       const plannerPrompt = buildPlannerPrompt(contextMessages);
       const plannerResult = await openrouter.callModel({
@@ -1003,57 +1043,67 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     }
   }
 
-  if (memoryExtractionEnabled && (!input.isScheduledTask || memoryExtractScheduled)) {
-    try {
-      const extractionMessages = history.slice(-memoryExtractionMaxMessages);
-      if (extractionMessages.length > 0) {
-        const extractionPrompt = buildMemoryExtractionPrompt({
-          assistantName,
-          userId: input.userId,
-          userName: input.userName,
-          messages: extractionMessages,
-          memoryPolicyPack: memoryPolicyResult?.pack || null
-        });
-        const extractionResult = await openrouter.callModel({
-          model: memoryModel,
-          instructions: extractionPrompt.instructions,
-          input: extractionPrompt.input,
-          maxOutputTokens: memoryExtractionMaxOutputTokens,
-          temperature: 0.1
-        });
-        const extractionText = await extractionResult.getText();
-        const extractedItems = parseMemoryExtraction(extractionText);
-        if (extractedItems.length > 0) {
-          const behaviorThreshold = typeof input.behaviorConfig?.memory_importance_threshold === 'number'
-            ? Number(input.behaviorConfig?.memory_importance_threshold)
-            : null;
-          const normalizedItems = extractedItems
-            .filter((item) => {
-              if (behaviorThreshold === null) return true;
-              const importance = typeof item.importance === 'number' ? item.importance : null;
-              if (importance === null) return true;
-              return importance >= behaviorThreshold;
-            })
-            .map((item) => {
-            const scope = typeof item.scope === 'string' ? item.scope : '';
-            const subject = item.subject_id;
-            if (scope === 'user' && !subject && input.userId) {
-              return { ...item, subject_id: input.userId };
-            }
-            return item;
-          });
-          if (normalizedItems.length > 0) {
-            await ipc.memoryUpsert({
-              items: normalizedItems as unknown[],
-              source: 'agent-extraction'
-            });
-            memoryItemsExtracted += normalizedItems.length;
-            memoryItemsUpserted += normalizedItems.length;
-          }
+  const runMemoryExtraction = async () => {
+    const extractionMessages = history.slice(-memoryExtractionMaxMessages);
+    if (extractionMessages.length === 0) return;
+    const extractionPrompt = buildMemoryExtractionPrompt({
+      assistantName,
+      userId: input.userId,
+      userName: input.userName,
+      messages: extractionMessages,
+      memoryPolicyPack: memoryPolicyResult?.pack || null
+    });
+    const extractionResult = await openrouter.callModel({
+      model: memoryModel,
+      instructions: extractionPrompt.instructions,
+      input: extractionPrompt.input,
+      maxOutputTokens: memoryExtractionMaxOutputTokens,
+      temperature: 0.1
+    });
+    const extractionText = await extractionResult.getText();
+    const extractedItems = parseMemoryExtraction(extractionText);
+    if (extractedItems.length === 0) return;
+
+    const behaviorThreshold = typeof input.behaviorConfig?.memory_importance_threshold === 'number'
+      ? Number(input.behaviorConfig?.memory_importance_threshold)
+      : null;
+    const normalizedItems = extractedItems
+      .filter((item) => {
+        if (behaviorThreshold === null) return true;
+        const importance = typeof item.importance === 'number' ? item.importance : null;
+        if (importance === null) return true;
+        return importance >= behaviorThreshold;
+      })
+      .map((item) => {
+        const scope = typeof item.scope === 'string' ? item.scope : '';
+        const subject = item.subject_id;
+        if (scope === 'user' && !subject && input.userId) {
+          return { ...item, subject_id: input.userId };
         }
+        return item;
+      });
+
+    if (normalizedItems.length > 0) {
+      await ipc.memoryUpsert({
+        items: normalizedItems as unknown[],
+        source: 'agent-extraction'
+      });
+      memoryItemsExtracted += normalizedItems.length;
+      memoryItemsUpserted += normalizedItems.length;
+    }
+  };
+
+  if (memoryExtractionEnabled && (!input.isScheduledTask || memoryExtractScheduled)) {
+    if (memoryExtractionAsync && isDaemon) {
+      void runMemoryExtraction().catch(err => {
+        log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    } else {
+      try {
+        await runMemoryExtraction();
+      } catch (err) {
+        log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
       }
-    } catch (err) {
-      log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
