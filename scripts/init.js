@@ -48,7 +48,9 @@ function initFiles() {
   const registeredGroupsPath = path.join(DATA_DIR, 'registered_groups.json');
   const sessionsPath = path.join(DATA_DIR, 'sessions.json');
   const modelConfigPath = path.join(DATA_DIR, 'model.json');
-  const behaviorConfigPath = path.join(DATA_DIR, 'behavior.json');
+  const homeDir = process.env.HOME || PROJECT_ROOT;
+  const dotclawConfigDir = path.join(homeDir, '.config', 'dotclaw');
+  const behaviorConfigPath = path.join(dotclawConfigDir, 'behavior.json');
   const toolPolicyPath = path.join(DATA_DIR, 'tool-policy.json');
 
   const createdRegistered = ensureFile(registeredGroupsPath, '{}\n');
@@ -58,6 +60,7 @@ function initFiles() {
     allowlist: [],
     updated_at: new Date().toISOString()
   }, null, 2) + '\n');
+  fs.mkdirSync(dotclawConfigDir, { recursive: true });
   const createdBehaviorConfig = ensureFile(behaviorConfigPath, JSON.stringify({
     tool_calling_bias: 0.5,
     memory_importance_threshold: 0.55,
@@ -73,6 +76,8 @@ function initFiles() {
         'Edit',
         'Glob',
         'Grep',
+        'GitClone',
+        'NpmInstall',
         'WebSearch',
         'WebFetch',
         'Bash',
@@ -82,7 +87,10 @@ function initFiles() {
         'mcp__dotclaw__pause_task',
         'mcp__dotclaw__resume_task',
         'mcp__dotclaw__cancel_task',
+        'mcp__dotclaw__update_task',
         'mcp__dotclaw__register_group',
+        'mcp__dotclaw__remove_group',
+        'mcp__dotclaw__list_groups',
         'mcp__dotclaw__set_model',
         'mcp__dotclaw__memory_upsert',
         'mcp__dotclaw__memory_forget',
@@ -96,7 +104,7 @@ function initFiles() {
         WebSearch: 5,
         WebFetch: 6
       },
-      default_max_per_run: 12
+      default_max_per_run: 32
     }
   }, null, 2) + '\n');
 
@@ -130,6 +138,10 @@ function initFiles() {
     'DOTCLAW_MEMORY_EXTRACTION_MESSAGES=8',
     'DOTCLAW_MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS=900',
     'DOTCLAW_MEMORY_MODEL=moonshotai/kimi-k2.5',
+    'DOTCLAW_MEMORY_EMBEDDINGS_ENABLED=true',
+    'DOTCLAW_MEMORY_EMBEDDING_MODEL=openai/text-embedding-3-small',
+    'DOTCLAW_MEMORY_EMBEDDING_BATCH_SIZE=8',
+    'DOTCLAW_MEMORY_EMBEDDING_INTERVAL_MS=300000',
     '',
     '# Prompt packs (Autotune output)',
     'DOTCLAW_PROMPT_PACKS_ENABLED=true',
@@ -140,10 +152,30 @@ function initFiles() {
     'DOTCLAW_TRACE_DIR=~/.config/dotclaw/traces',
     'DOTCLAW_TRACE_SAMPLE_RATE=1',
     '',
+    '# Tool budgets (optional)',
+    'DOTCLAW_TOOL_BUDGETS_ENABLED=false',
+    'DOTCLAW_TOOL_BUDGETS_PATH=./data/tool-budgets.json',
+    '',
     '# Performance + observability',
-    'DOTCLAW_CONTAINER_MODE=ephemeral',
+    'DOTCLAW_CONTAINER_MODE=daemon',
     'DOTCLAW_CONTAINER_DAEMON_POLL_MS=200',
+    'CONTAINER_TIMEOUT=900000',
+    'CONTAINER_MAX_OUTPUT_SIZE=20971520',
+    'DOTCLAW_MAX_CONCURRENT_AGENTS=4',
+    'DOTCLAW_WARM_START=true',
+    'DOTCLAW_MAX_TOOL_STEPS=32',
+    'DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES=1500000',
+    'DOTCLAW_WEBFETCH_MAX_BYTES=1500000',
     'DOTCLAW_METRICS_PORT=3001',
+    'DOTCLAW_PROGRESS_ENABLED=true',
+    'DOTCLAW_PROGRESS_INITIAL_MS=30000',
+    'DOTCLAW_PROGRESS_INTERVAL_MS=60000',
+    'DOTCLAW_PROGRESS_MAX_UPDATES=3',
+    'DOTCLAW_PROGRESS_MESSAGES="Working on it.|Still working.|Almost there."',
+    '',
+    '# Personalization',
+    `DOTCLAW_BEHAVIOR_CONFIG_PATH=${behaviorConfigPath}`,
+    'DOTCLAW_PERSONALIZATION_CACHE_MS=300000',
     ''
   ].join('\n');
 
@@ -159,7 +191,7 @@ function initFiles() {
   log(`registered_groups.json: ${createdRegistered ? 'created' : 'exists'}`);
   log(`sessions.json: ${createdSessions ? 'created' : 'exists'}`);
   log(`model.json: ${createdModelConfig ? 'created' : 'exists'}`);
-  log(`behavior.json: ${createdBehaviorConfig ? 'created' : 'exists'}`);
+  log(`behavior.json: ${createdBehaviorConfig ? 'created' : 'exists'} (${behaviorConfigPath})`);
   log(`tool-policy.json: ${createdToolPolicy ? 'created' : 'exists'}`);
   log(`.env: ${createdEnv ? 'created (edit this file)' : 'exists'}`);
 }

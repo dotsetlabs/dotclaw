@@ -19,13 +19,12 @@ import {
   buildSummaryPrompt,
   parseSummaryResponse,
   retrieveRelevantMemories,
-  estimateTokens,
   saveMemoryState,
   writeHistory,
   MemoryConfig,
   Message
 } from './memory.js';
-import { loadPromptPackWithCanary, formatTaskExtractionPack, formatResponseQualityPack, formatToolCallingPack, formatMemoryPolicyPack, PromptPack } from './prompt-packs.js';
+import { loadPromptPackWithCanary, formatTaskExtractionPack, formatResponseQualityPack, formatToolCallingPack, formatToolOutcomePack, formatMemoryPolicyPack, formatMemoryRecallPack, PromptPack } from './prompt-packs.js';
 
 export interface ContainerInput {
   prompt: string;
@@ -34,6 +33,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  taskId?: string;
   userId?: string;
   userName?: string;
   memoryRecall?: string[];
@@ -44,6 +44,17 @@ export interface ContainerInput {
     group: number;
     global: number;
   };
+  tokenEstimate?: {
+    tokens_per_char: number;
+    tokens_per_message: number;
+    tokens_per_request: number;
+  };
+  toolReliability?: Array<{
+    name: string;
+    success_rate: number;
+    count: number;
+    avg_duration_ms: number | null;
+  }>;
   behaviorConfig?: Record<string, unknown>;
   toolPolicy?: ToolPolicy;
   modelOverride?: string;
@@ -61,6 +72,12 @@ export interface ContainerOutput {
   prompt_pack_versions?: Record<string, string>;
   memory_summary?: string;
   memory_facts?: string[];
+  tokens_prompt?: number;
+  tokens_completion?: number;
+  memory_recall_count?: number;
+  session_recall_count?: number;
+  memory_items_upserted?: number;
+  memory_items_extracted?: number;
   tool_calls?: ToolCallRecord[];
   latency_ms?: number;
 }
@@ -214,6 +231,62 @@ function getConfig(): MemoryConfig & {
   };
 }
 
+function buildPlannerPrompt(messages: Message[]): { instructions: string; input: string } {
+  const transcript = messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n\n');
+  const instructions = [
+    'You are a planning module for a personal assistant.',
+    'Given the conversation, produce a concise plan in JSON.',
+    'Return JSON only with keys:',
+    '- steps: array of short action steps',
+    '- tools: array of tool names you expect to use (if any)',
+    '- risks: array of potential pitfalls or missing info',
+    '- questions: array of clarifying questions (if any)',
+    'Keep each array short. Use empty arrays if not needed.'
+  ].join('\n');
+  const input = `Conversation:\n${transcript}`;
+  return { instructions, input };
+}
+
+function parsePlannerResponse(text: string): { steps: string[]; tools: string[]; risks: string[]; questions: string[] } | null {
+  const trimmed = text.trim();
+  let jsonText = trimmed;
+  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch) {
+    jsonText = fenceMatch[1].trim();
+  }
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    const steps = Array.isArray(parsed.steps) ? parsed.steps.filter(item => typeof item === 'string') : [];
+    const tools = Array.isArray(parsed.tools) ? parsed.tools.filter(item => typeof item === 'string') : [];
+    const risks = Array.isArray(parsed.risks) ? parsed.risks.filter(item => typeof item === 'string') : [];
+    const questions = Array.isArray(parsed.questions) ? parsed.questions.filter(item => typeof item === 'string') : [];
+    return { steps, tools, risks, questions };
+  } catch {
+    return null;
+  }
+}
+
+function formatPlanBlock(plan: { steps: string[]; tools: string[]; risks: string[]; questions: string[] }): string {
+  const lines: string[] = ['Planned approach (planner):'];
+  if (plan.steps.length > 0) {
+    lines.push('Steps:');
+    for (const step of plan.steps) lines.push(`- ${step}`);
+  }
+  if (plan.tools.length > 0) {
+    lines.push('Tools:');
+    for (const tool of plan.tools) lines.push(`- ${tool}`);
+  }
+  if (plan.risks.length > 0) {
+    lines.push('Risks:');
+    for (const risk of plan.risks) lines.push(`- ${risk}`);
+  }
+  if (plan.questions.length > 0) {
+    lines.push('Questions:');
+    for (const question of plan.questions) lines.push(`- ${question}`);
+  }
+  return lines.join('\n');
+}
+
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const parsed = Number.parseInt(value, 10);
@@ -250,6 +323,41 @@ function getOpenRouterOptions() {
   };
 }
 
+function resolveTokenEstimate(input: ContainerInput): { tokensPerChar: number; tokensPerMessage: number; tokensPerRequest: number } {
+  const fallbackChar = parseFloat(process.env.DOTCLAW_TOKENS_PER_CHAR || '0.25');
+  const fallbackMessage = parseFloat(process.env.DOTCLAW_TOKENS_PER_MESSAGE || '3');
+  const fallbackRequest = parseFloat(process.env.DOTCLAW_TOKENS_PER_REQUEST || '0');
+  const tokensPerChar = Number.isFinite(input.tokenEstimate?.tokens_per_char)
+    ? Number(input.tokenEstimate?.tokens_per_char)
+    : fallbackChar;
+  const tokensPerMessage = Number.isFinite(input.tokenEstimate?.tokens_per_message)
+    ? Number(input.tokenEstimate?.tokens_per_message)
+    : fallbackMessage;
+  const tokensPerRequest = Number.isFinite(input.tokenEstimate?.tokens_per_request)
+    ? Number(input.tokenEstimate?.tokens_per_request)
+    : fallbackRequest;
+  return {
+    tokensPerChar: Math.max(0, tokensPerChar),
+    tokensPerMessage: Math.max(0, tokensPerMessage),
+    tokensPerRequest: Math.max(0, tokensPerRequest)
+  };
+}
+
+function estimateTokensForModel(text: string, tokensPerChar: number): number {
+  if (!text) return 0;
+  const bytes = Buffer.byteLength(text, 'utf-8');
+  return Math.ceil(bytes * tokensPerChar);
+}
+
+function estimateMessagesTokens(messages: Message[], tokensPerChar: number, tokensPerMessage: number): number {
+  let total = 0;
+  for (const message of messages) {
+    total += estimateTokensForModel(message.content, tokensPerChar);
+    total += tokensPerMessage;
+  }
+  return total;
+}
+
 function buildSystemInstructions(params: {
   assistantName: string;
   memorySummary: string;
@@ -258,12 +366,17 @@ function buildSystemInstructions(params: {
   longTermRecall: string[];
   userProfile?: string | null;
   memoryStats?: { total: number; user: number; group: number; global: number };
+  toolReliability?: Array<{ name: string; success_rate: number; count: number; avg_duration_ms: number | null }>;
   behaviorConfig?: Record<string, unknown>;
   isScheduledTask: boolean;
+  taskId?: string;
+  planBlock?: string;
   taskExtractionPack?: PromptPack | null;
   responseQualityPack?: PromptPack | null;
   toolCallingPack?: PromptPack | null;
+  toolOutcomePack?: PromptPack | null;
   memoryPolicyPack?: PromptPack | null;
+  memoryRecallPack?: PromptPack | null;
 }): string {
   const toolsDoc = [
     'Tools available (use with care):',
@@ -271,10 +384,14 @@ function buildSystemInstructions(params: {
     '- `Read`, `Write`, `Edit`, `Glob`, `Grep`: filesystem operations within mounted paths.',
     '- `WebSearch`: Brave Search API (requires `BRAVE_SEARCH_API_KEY`).',
     '- `WebFetch`: fetch URLs (limit payload sizes).',
+    '- `GitClone`: clone git repositories into the workspace.',
+    '- `NpmInstall`: install npm dependencies in the workspace.',
     '- `mcp__dotclaw__send_message`: send Telegram messages.',
     '- `mcp__dotclaw__schedule_task`: schedule tasks.',
     '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
+    '- `mcp__dotclaw__update_task`: update a task (state, prompt, schedule, status).',
     '- `mcp__dotclaw__register_group`: main group only.',
+    '- `mcp__dotclaw__remove_group`, `mcp__dotclaw__list_groups`: main group only.',
     '- `mcp__dotclaw__set_model`: main group only.',
     '- `mcp__dotclaw__memory_upsert`: store durable memories.',
     '- `mcp__dotclaw__memory_search`, `mcp__dotclaw__memory_list`, `mcp__dotclaw__memory_forget`, `mcp__dotclaw__memory_stats`.',
@@ -300,6 +417,17 @@ function buildSystemInstructions(params: {
   const memoryStats = params.memoryStats
     ? `Total: ${params.memoryStats.total}, User: ${params.memoryStats.user}, Group: ${params.memoryStats.group}, Global: ${params.memoryStats.global}`
     : 'Unknown.';
+
+  const toolReliability = params.toolReliability && params.toolReliability.length > 0
+    ? params.toolReliability
+      .sort((a, b) => b.success_rate - a.success_rate)
+      .map(tool => {
+        const pct = `${Math.round(tool.success_rate * 100)}%`;
+        const avg = Number.isFinite(tool.avg_duration_ms) ? `${Math.round(tool.avg_duration_ms!)}ms` : 'n/a';
+        return `- ${tool.name}: success ${pct} over ${tool.count} calls (avg ${avg})`;
+      })
+      .join('\n')
+    : 'No recent tool reliability data.';
 
   const behaviorNotes: string[] = [];
   const responseStyle = typeof params.behaviorConfig?.response_style === 'string'
@@ -330,7 +458,7 @@ function buildSystemInstructions(params: {
     : '';
 
   const scheduledNote = params.isScheduledTask
-    ? 'You are running as a scheduled task. If you need to communicate, use `mcp__dotclaw__send_message`.'
+    ? `You are running as a scheduled task${params.taskId ? ` (task id: ${params.taskId})` : ''}. If you need to communicate, use \`mcp__dotclaw__send_message\`.`
     : '';
 
   const taskExtractionBlock = params.taskExtractionPack
@@ -357,9 +485,25 @@ function buildSystemInstructions(params: {
     })
     : '';
 
+  const toolOutcomeBlock = params.toolOutcomePack
+    ? formatToolOutcomePack({
+      pack: params.toolOutcomePack,
+      maxDemos: PROMPT_PACKS_MAX_DEMOS,
+      maxChars: PROMPT_PACKS_MAX_CHARS
+    })
+    : '';
+
   const memoryPolicyBlock = params.memoryPolicyPack
     ? formatMemoryPolicyPack({
       pack: params.memoryPolicyPack,
+      maxDemos: PROMPT_PACKS_MAX_DEMOS,
+      maxChars: PROMPT_PACKS_MAX_CHARS
+    })
+    : '';
+
+  const memoryRecallBlock = params.memoryRecallPack
+    ? formatMemoryRecallPack({
+      pack: params.memoryRecallPack,
       maxDemos: PROMPT_PACKS_MAX_DEMOS,
       maxChars: PROMPT_PACKS_MAX_CHARS
     })
@@ -369,10 +513,13 @@ function buildSystemInstructions(params: {
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
     scheduledNote,
     toolsDoc,
+    params.planBlock || '',
     toolCallingBlock,
+    toolOutcomeBlock,
     taskExtractionBlock,
     responseQualityBlock,
     memoryPolicyBlock,
+    memoryRecallBlock,
     'Long-term memory summary:',
     memorySummary,
     'Long-term facts:',
@@ -385,6 +532,8 @@ function buildSystemInstructions(params: {
     sessionRecall,
     'Memory stats:',
     memoryStats,
+    'Tool reliability (recent):',
+    toolReliability,
     behaviorNotes.length > 0 ? `Behavior notes:\n${behaviorNotes.join('\n')}` : '',
     behaviorConfig,
     'Respond succinctly and helpfully. If you perform tool actions, summarize the results.'
@@ -463,11 +612,17 @@ function buildMemoryExtractionPrompt(params: {
     '- scope: "user" | "group" | "global"',
     '- subject_id: user id for user scope (optional for group/global)',
     '- type: "identity" | "preference" | "fact" | "relationship" | "project" | "task" | "note"',
+    '- kind: optional "semantic" | "episodic" | "procedural" | "preference"',
+    '- conflict_key: optional string to replace older memories with same key (e.g., "favorite_color")',
     '- content: the memory string',
     '- importance: 0-1 (higher = more important)',
     '- confidence: 0-1',
     '- tags: array of short tags',
     '- ttl_days: optional number (omit for permanent memories).',
+    '- For preferences about response style, tool usage, caution, or memory strictness, use conflict_key:',
+    '  response_style, tool_calling_bias, caution_bias, memory_importance_threshold.',
+    '  Include metadata fields for these preferences where possible, e.g.',
+    '  { "metadata": { "response_style": "concise" } } or { "metadata": { "bias": 0.7 } }.',
     policyBlock
   ].filter(Boolean).join('\n');
 
@@ -529,17 +684,24 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     config.temperature = input.modelTemperature;
   }
   const openrouterOptions = getOpenRouterOptions();
-  const maxToolSteps = parsePositiveInt(process.env.DOTCLAW_MAX_TOOL_STEPS, 12);
+  const maxToolSteps = parsePositiveInt(process.env.DOTCLAW_MAX_TOOL_STEPS, 32);
   const memoryExtractionEnabled = isEnabledEnv('DOTCLAW_MEMORY_EXTRACTION_ENABLED', true);
   const memoryExtractionMaxMessages = parsePositiveInt(process.env.DOTCLAW_MEMORY_EXTRACTION_MESSAGES, 8);
   const memoryExtractionMaxOutputTokens = parsePositiveInt(process.env.DOTCLAW_MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS, 900);
   const memoryExtractScheduled = isEnabledEnv('DOTCLAW_MEMORY_EXTRACT_SCHEDULED', false);
   const memoryArchiveSync = isEnabledEnv('DOTCLAW_MEMORY_ARCHIVE_SYNC', true);
+  const plannerEnabled = isEnabledEnv('DOTCLAW_PLANNER_ENABLED', true);
+  const plannerModel = process.env.DOTCLAW_PLANNER_MODEL || model;
+  const plannerMaxOutputTokens = parsePositiveInt(process.env.DOTCLAW_PLANNER_MAX_OUTPUT_TOKENS, 400);
+  const plannerTemperature = parseFloat(process.env.DOTCLAW_PLANNER_TEMPERATURE || '0.2');
 
   const openrouter = getCachedOpenRouter(apiKey, openrouterOptions);
+  const tokenEstimate = resolveTokenEstimate(input);
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
   const toolCalls: ToolCallRecord[] = [];
+  let memoryItemsUpserted = 0;
+  let memoryItemsExtracted = 0;
   const ipc = createIpcHandlers({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
@@ -584,8 +746,14 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   appendHistory(sessionCtx, 'user', prompt);
   let history = loadHistory(sessionCtx);
 
-  const totalTokens = history.reduce((sum, message) => sum + estimateTokens(message.content), 0);
-  let { recentMessages, olderMessages } = splitRecentHistory(history, config.recentContextTokens);
+  const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
+  const adjustedRecentTokens = Math.max(1000, Math.floor(config.recentContextTokens * tokenRatio));
+
+  const totalTokens = history.reduce(
+    (sum, message) => sum + estimateTokensForModel(message.content, tokenEstimate.tokensPerChar) + tokenEstimate.tokensPerMessage,
+    0
+  );
+  let { recentMessages, olderMessages } = splitRecentHistory(history, adjustedRecentTokens);
 
   if (shouldCompact(totalTokens, config)) {
     log(`Compacting history: ${totalTokens} tokens`);
@@ -634,6 +802,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
           }
           if (archiveItems.length > 0) {
             await ipc.memoryUpsert({ items: archiveItems, source: 'compaction' });
+            memoryItemsUpserted += archiveItems.length;
           }
         } catch (err) {
           log(`Memory archive sync failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -646,7 +815,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   }
 
   // Recompute split after possible compaction
-  ({ recentMessages, olderMessages } = splitRecentHistory(history, config.recentContextTokens));
+  ({ recentMessages, olderMessages } = splitRecentHistory(history, adjustedRecentTokens));
 
   const query = extractQueryFromPrompt(prompt);
   const sessionRecall = retrieveRelevantMemories({
@@ -656,6 +825,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     olderMessages,
     config
   });
+  const sessionRecallCount = sessionRecall.length;
+  const memoryRecallCount = input.memoryRecall ? input.memoryRecall.length : 0;
 
   const sharedPromptDir = fs.existsSync(PROMPTS_DIR) ? PROMPTS_DIR : undefined;
   const taskPackResult = PROMPT_PACKS_ENABLED
@@ -667,8 +838,14 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const toolCallingResult = PROMPT_PACKS_ENABLED
     ? loadPromptPackWithCanary({ behavior: 'tool-calling', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
     : null;
+  const toolOutcomeResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPackWithCanary({ behavior: 'tool-outcome', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
+    : null;
   const memoryPolicyResult = PROMPT_PACKS_ENABLED
     ? loadPromptPackWithCanary({ behavior: 'memory-policy', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
+    : null;
+  const memoryRecallResult = PROMPT_PACKS_ENABLED
+    ? loadPromptPackWithCanary({ behavior: 'memory-recall', groupDir: GROUP_DIR, globalDir: GLOBAL_DIR, sharedDir: sharedPromptDir, canaryRate: PROMPT_PACKS_CANARY_RATE })
     : null;
 
   const logPack = (label: string, result: { pack: PromptPack; source: string; isCanary?: boolean } | null) => {
@@ -679,15 +856,19 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   logPack(taskPackResult?.source || 'unknown', taskPackResult);
   logPack(responseQualityResult?.source || 'unknown', responseQualityResult);
   logPack(toolCallingResult?.source || 'unknown', toolCallingResult);
+  logPack(toolOutcomeResult?.source || 'unknown', toolOutcomeResult);
   logPack(memoryPolicyResult?.source || 'unknown', memoryPolicyResult);
+  logPack(memoryRecallResult?.source || 'unknown', memoryRecallResult);
 
   const promptPackVersions: Record<string, string> = {};
   if (taskPackResult) promptPackVersions['task-extraction'] = taskPackResult.pack.version;
   if (responseQualityResult) promptPackVersions['response-quality'] = responseQualityResult.pack.version;
   if (toolCallingResult) promptPackVersions['tool-calling'] = toolCallingResult.pack.version;
+  if (toolOutcomeResult) promptPackVersions['tool-outcome'] = toolOutcomeResult.pack.version;
   if (memoryPolicyResult) promptPackVersions['memory-policy'] = memoryPolicyResult.pack.version;
+  if (memoryRecallResult) promptPackVersions['memory-recall'] = memoryRecallResult.pack.version;
 
-  const instructions = buildSystemInstructions({
+  const buildInstructions = (planBlockValue: string) => buildSystemInstructions({
     assistantName,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
@@ -695,19 +876,60 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     longTermRecall: input.memoryRecall || [],
     userProfile: input.userProfile ?? null,
     memoryStats: input.memoryStats,
+    toolReliability: input.toolReliability,
     behaviorConfig: input.behaviorConfig,
     isScheduledTask: !!input.isScheduledTask,
+    taskId: input.taskId,
+    planBlock: planBlockValue,
     taskExtractionPack: taskPackResult?.pack || null,
     responseQualityPack: responseQualityResult?.pack || null,
     toolCallingPack: toolCallingResult?.pack || null,
-    memoryPolicyPack: memoryPolicyResult?.pack || null
+    toolOutcomePack: toolOutcomeResult?.pack || null,
+    memoryPolicyPack: memoryPolicyResult?.pack || null,
+    memoryRecallPack: memoryRecallResult?.pack || null
   });
 
-  const instructionsTokens = estimateTokens(instructions);
-  const maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
-  const { recentMessages: contextMessages } = splitRecentHistory(recentMessages, maxContextTokens, 6);
+  let planBlock = '';
+  let instructions = buildInstructions(planBlock);
+  let instructionsTokens = estimateTokensForModel(instructions, tokenEstimate.tokensPerChar);
+  let maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
+  let adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
+  let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6);
+
+  if (plannerEnabled) {
+    try {
+      const plannerPrompt = buildPlannerPrompt(contextMessages);
+      const plannerResult = await openrouter.callModel({
+        model: plannerModel,
+        instructions: plannerPrompt.instructions,
+        input: plannerPrompt.input,
+        maxOutputTokens: plannerMaxOutputTokens,
+        temperature: plannerTemperature
+      });
+      const plannerText = await plannerResult.getText();
+      const plan = parsePlannerResponse(plannerText);
+      if (plan) {
+        planBlock = formatPlanBlock(plan);
+      }
+    } catch (err) {
+      log(`Planner failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (planBlock) {
+    instructions = buildInstructions(planBlock);
+    instructionsTokens = estimateTokensForModel(instructions, tokenEstimate.tokensPerChar);
+    maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
+    adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
+    ({ recentMessages: contextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6));
+  }
+
+  const promptTokens = instructionsTokens
+    + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
+    + tokenEstimate.tokensPerRequest;
 
   let responseText = '';
+  let completionTokens = 0;
 
   let latencyMs: number | undefined;
   try {
@@ -730,6 +952,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     }
 
     responseText = await result.getText();
+    completionTokens = estimateTokensForModel(responseText || '', tokenEstimate.tokensPerChar);
 
     if (!responseText || !responseText.trim()) {
       log(`Warning: Model returned empty/whitespace response. Raw length: ${responseText?.length ?? 0}, tool calls: ${modelToolCalls.length}`);
@@ -748,6 +971,12 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       prompt_pack_versions: Object.keys(promptPackVersions).length > 0 ? promptPackVersions : undefined,
       memory_summary: sessionCtx.state.summary,
       memory_facts: sessionCtx.state.facts,
+      tokens_prompt: promptTokens,
+      tokens_completion: completionTokens,
+      memory_recall_count: memoryRecallCount,
+      session_recall_count: sessionRecallCount,
+      memory_items_upserted: memoryItemsUpserted,
+      memory_items_extracted: memoryItemsExtracted,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       latency_ms: latencyMs
     };
@@ -818,6 +1047,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
               items: normalizedItems as unknown[],
               source: 'agent-extraction'
             });
+            memoryItemsExtracted += normalizedItems.length;
+            memoryItemsUpserted += normalizedItems.length;
           }
         }
       }
@@ -837,6 +1068,12 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     prompt_pack_versions: Object.keys(promptPackVersions).length > 0 ? promptPackVersions : undefined,
     memory_summary: sessionCtx.state.summary,
     memory_facts: sessionCtx.state.facts,
+    tokens_prompt: promptTokens,
+    tokens_completion: completionTokens,
+    memory_recall_count: memoryRecallCount,
+    session_recall_count: sessionRecallCount,
+    memory_items_upserted: memoryItemsUpserted,
+    memory_items_extracted: memoryItemsExtracted,
     tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
     latency_ms: latencyMs
   };

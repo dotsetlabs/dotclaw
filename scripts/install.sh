@@ -17,8 +17,14 @@ die() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_USER="${SUDO_USER:-$USER}"
-TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
+TARGET_HOME=""
+if command -v getent >/dev/null 2>&1; then
+  TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)"
+fi
 if [[ -z "$TARGET_HOME" ]]; then
+  TARGET_HOME="$(eval echo "~$TARGET_USER" 2>/dev/null || true)"
+fi
+if [[ -z "$TARGET_HOME" || "$TARGET_HOME" == "~"* ]]; then
   TARGET_HOME="$HOME"
 fi
 
@@ -53,6 +59,21 @@ log "Node: $NODE_PATH"
 
 mkdir -p "$PROMPTS_DIR" "$TRACES_DIR" "$PROJECT_ROOT/logs"
 
+BEHAVIOR_CONFIG_PATH="$DOTCLAW_CONFIG_DIR/behavior.json"
+if [[ ! -f "$BEHAVIOR_CONFIG_PATH" ]]; then
+  mkdir -p "$DOTCLAW_CONFIG_DIR"
+  cat > "$BEHAVIOR_CONFIG_PATH" <<EOF
+{
+  "tool_calling_bias": 0.5,
+  "memory_importance_threshold": 0.55,
+  "response_style": "balanced",
+  "caution_bias": 0.5,
+  "last_updated": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+  chmod 600 "$BEHAVIOR_CONFIG_PATH" || true
+fi
+
 if [[ ! -f "$PROJECT_ROOT/.env" ]]; then
   log "Initializing .env and data directories"
   run_as_user "$NODE_PATH $PROJECT_ROOT/scripts/init.js"
@@ -69,10 +90,34 @@ update_env() {
   fi
 }
 
-update_env "DOTCLAW_PROMPT_PACKS_ENABLED" "true"
-update_env "DOTCLAW_PROMPT_PACKS_DIR" "$PROMPTS_DIR"
-update_env "DOTCLAW_PROMPT_PACKS_CANARY_RATE" "0.1"
-update_env "DOTCLAW_TRACE_DIR" "$TRACES_DIR"
+update_env_default() {
+  local key="$1"
+  local value="$2"
+  local env_path="$PROJECT_ROOT/.env"
+  if grep -q "^${key}=" "$env_path"; then
+    return
+  fi
+  echo "${key}=${value}" >> "$env_path"
+}
+
+update_env_default "DOTCLAW_PROMPT_PACKS_ENABLED" "true"
+update_env_default "DOTCLAW_PROMPT_PACKS_DIR" "$PROMPTS_DIR"
+update_env_default "DOTCLAW_PROMPT_PACKS_CANARY_RATE" "0.1"
+update_env_default "DOTCLAW_TRACE_DIR" "$TRACES_DIR"
+update_env_default "DOTCLAW_CONTAINER_MODE" "daemon"
+update_env_default "CONTAINER_TIMEOUT" "900000"
+update_env_default "CONTAINER_MAX_OUTPUT_SIZE" "20971520"
+update_env_default "DOTCLAW_MAX_CONCURRENT_AGENTS" "4"
+update_env_default "DOTCLAW_WARM_START" "true"
+update_env_default "DOTCLAW_MAX_TOOL_STEPS" "32"
+update_env_default "DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES" "1500000"
+update_env_default "DOTCLAW_WEBFETCH_MAX_BYTES" "1500000"
+update_env_default "DOTCLAW_PROGRESS_ENABLED" "true"
+update_env_default "DOTCLAW_PROGRESS_INITIAL_MS" "30000"
+update_env_default "DOTCLAW_PROGRESS_INTERVAL_MS" "60000"
+update_env_default "DOTCLAW_PROGRESS_MAX_UPDATES" "3"
+update_env_default "DOTCLAW_PERSONALIZATION_CACHE_MS" "300000"
+update_env_default "DOTCLAW_BEHAVIOR_CONFIG_PATH" "$DOTCLAW_CONFIG_DIR/behavior.json"
 
 log "Installing DotClaw dependencies"
 run_as_user "cd $PROJECT_ROOT && npm install"
@@ -130,7 +175,7 @@ OPENROUTER_SITE_NAME=${OPENROUTER_SITE_NAME:-DotClaw}
 AUTOTUNE_OUTPUT_DIR=$PROMPTS_DIR
 AUTOTUNE_TRACE_DIR=$TRACES_DIR
 AUTOTUNE_BEHAVIOR_ENABLED=1
-AUTOTUNE_BEHAVIOR_CONFIG_PATH=$PROJECT_ROOT/data/behavior.json
+AUTOTUNE_BEHAVIOR_CONFIG_PATH=$DOTCLAW_CONFIG_DIR/behavior.json
 AUTOTUNE_BEHAVIOR_REPORT_DIR=$PROJECT_ROOT/data
 EOF
   chmod 600 "$AUTOTUNE_ENV" || true

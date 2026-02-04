@@ -1,14 +1,29 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
-import { tool } from '@openrouter/sdk';
+import dns from 'dns/promises';
+import net from 'net';
+import { tool as sdkTool, type Tool } from '@openrouter/sdk';
 import { z } from 'zod';
 import { createIpcHandlers, IpcContext } from './ipc.js';
 
-const DEFAULT_TOOL_OUTPUT_LIMIT = parseInt(process.env.DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES || '1000000', 10);
+type ToolConfig = {
+  name: string;
+  description?: string;
+  inputSchema: z.ZodTypeAny;
+  outputSchema?: z.ZodTypeAny;
+  eventSchema?: z.ZodTypeAny;
+  nextTurnParams?: Record<string, unknown>;
+  requireApproval?: boolean | ((params: unknown, context: unknown) => boolean | Promise<boolean>);
+  execute: unknown;
+};
+
+const tool = sdkTool as unknown as (config: ToolConfig) => Tool;
+
+const DEFAULT_TOOL_OUTPUT_LIMIT = parseInt(process.env.DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES || '1500000', 10);
 const DEFAULT_BASH_TIMEOUT_MS = parseInt(process.env.DOTCLAW_BASH_TIMEOUT_MS || '120000', 10);
 const DEFAULT_BASH_OUTPUT_LIMIT = parseInt(process.env.DOTCLAW_BASH_OUTPUT_LIMIT_BYTES || '200000', 10);
-const DEFAULT_WEBFETCH_MAX_BYTES = parseInt(process.env.DOTCLAW_WEBFETCH_MAX_BYTES || '1000000', 10);
+const DEFAULT_WEBFETCH_MAX_BYTES = parseInt(process.env.DOTCLAW_WEBFETCH_MAX_BYTES || '1500000', 10);
 const DEFAULT_GREP_MAX_FILE_BYTES = parseInt(process.env.DOTCLAW_GREP_MAX_FILE_BYTES || '1000000', 10);
 const DEFAULT_PLUGIN_MAX_BYTES = parseInt(process.env.DOTCLAW_PLUGIN_MAX_BYTES || '800000', 10);
 
@@ -44,6 +59,8 @@ export type ToolCallRecord = {
   ok: boolean;
   duration_ms?: number;
   error?: string;
+  output_bytes?: number;
+  output_truncated?: boolean;
 };
 
 type ToolCallLogger = (record: ToolCallRecord) => void;
@@ -106,6 +123,101 @@ function normalizeDomain(value: string): string {
   normalized = normalized.split('/')[0];
   normalized = normalized.split(':')[0];
   return normalized;
+}
+
+function isLocalHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase();
+  return normalized === 'localhost'
+    || normalized === 'ip6-localhost'
+    || normalized.endsWith('.local')
+    || normalized === 'metadata.google.internal'
+    || normalized === 'metadata';
+}
+
+function isPrivateIpv4(ip: string): boolean {
+  const parts = ip.split('.').map(part => parseInt(part, 10));
+  if (parts.length !== 4 || parts.some(part => Number.isNaN(part))) return false;
+  const [a, b] = parts;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // carrier-grade NAT
+  return false;
+}
+
+function isPrivateIpv6(ip: string): boolean {
+  const normalized = ip.toLowerCase();
+  return normalized === '::1'
+    || normalized.startsWith('fc')
+    || normalized.startsWith('fd')
+    || normalized.startsWith('fe80')
+    || normalized.startsWith('::ffff:127.')
+    || normalized.startsWith('::ffff:10.')
+    || normalized.startsWith('::ffff:192.168.')
+    || normalized.startsWith('::ffff:172.');
+}
+
+function isPrivateIp(ip: string): boolean {
+  const version = net.isIP(ip);
+  if (version === 4) return isPrivateIpv4(ip);
+  if (version === 6) return isPrivateIpv6(ip);
+  return false;
+}
+
+async function resolveIps(hostname: string): Promise<string[]> {
+  try {
+    const results = await dns.lookup(hostname, { all: true });
+    return results.map(record => record.address);
+  } catch {
+    return [];
+  }
+}
+
+async function assertUrlAllowed(params: {
+  url: string;
+  allowlist: string[];
+  blocklist: string[];
+  blockPrivate: boolean;
+}) {
+  let hostname: string;
+  try {
+    hostname = new URL(params.url).hostname.toLowerCase();
+  } catch {
+    throw new Error(`Invalid URL: ${params.url}`);
+  }
+
+  const isBlocked = params.blocklist.some(domain =>
+    hostname === domain || hostname.endsWith(`.${domain}`)
+  );
+  if (isBlocked) {
+    throw new Error(`WebFetch blocked for host: ${hostname}`);
+  }
+
+  if (params.allowlist.length > 0) {
+    const isAllowed = params.allowlist.some(domain =>
+      hostname === domain || hostname.endsWith(`.${domain}`)
+    );
+    if (!isAllowed) {
+      throw new Error(`WebFetch not allowed for host: ${hostname}`);
+    }
+  }
+
+  if (params.blockPrivate) {
+    if (isLocalHostname(hostname)) {
+      throw new Error(`WebFetch blocked for local host: ${hostname}`);
+    }
+    if (isPrivateIp(hostname)) {
+      throw new Error(`WebFetch blocked for private IP: ${hostname}`);
+    }
+    const resolved = await resolveIps(hostname);
+    for (const ip of resolved) {
+      if (isPrivateIp(ip)) {
+        throw new Error(`WebFetch blocked for private IP: ${ip}`);
+      }
+    }
+  }
 }
 
 function sanitizeToolArgs(name: string, args: unknown): unknown {
@@ -185,6 +297,10 @@ function interpolateTemplate(value: string, args: Record<string, unknown>): stri
     if (replacement === undefined || replacement === null) return '';
     return String(replacement);
   });
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function buildInputSchema(config: PluginConfig) {
@@ -283,7 +399,7 @@ function walkFileTree(
   return results;
 }
 
-async function runCommand(command: string, timeoutMs: number, outputLimit: number) {
+async function runCommand(command: string, timeoutMs: number, outputLimit: number, cwd = WORKSPACE_GROUP) {
   return new Promise<{
     stdout: string;
     stderr: string;
@@ -293,7 +409,7 @@ async function runCommand(command: string, timeoutMs: number, outputLimit: numbe
   }>((resolve) => {
     const start = Date.now();
     const child = spawn('/bin/bash', ['-lc', command], {
-      cwd: WORKSPACE_GROUP,
+      cwd,
       env: process.env
     });
 
@@ -398,6 +514,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
   const enableBash = isEnabled('DOTCLAW_ENABLE_BASH', true);
   const enableWebSearch = isEnabled('DOTCLAW_ENABLE_WEBSEARCH', true);
   const enableWebFetch = isEnabled('DOTCLAW_ENABLE_WEBFETCH', true);
+  const blockPrivate = isEnabled('DOTCLAW_WEBFETCH_BLOCK_PRIVATE', true);
   const webFetchAllowlist = (process.env.DOTCLAW_WEBFETCH_ALLOWLIST || '')
     .split(',')
     .map(normalizeDomain)
@@ -426,11 +543,24 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         usageCounts.set(name, currentCount + 1);
 
         const result = await execute(args);
+        let outputBytes: number | undefined;
+        let outputTruncated: boolean | undefined;
+        try {
+          const serialized = JSON.stringify(result);
+          outputBytes = Buffer.byteLength(serialized, 'utf-8');
+        } catch {
+          // ignore serialization failure
+        }
+        if (result && typeof result === 'object' && 'truncated' in (result as Record<string, unknown>)) {
+          outputTruncated = Boolean((result as Record<string, unknown>).truncated);
+        }
         onToolCall?.({
           name,
           args: sanitizeToolArgs(name, args),
           ok: true,
-          duration_ms: Date.now() - start
+          duration_ms: Date.now() - start,
+          output_bytes: outputBytes,
+          output_truncated: outputTruncated
         });
         return result;
       } catch (err) {
@@ -462,6 +592,65 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     }),
     execute: wrapExecute('Bash', async ({ command, timeoutMs }: { command: string; timeoutMs?: number }) => {
       return runCommand(command, timeoutMs || DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT);
+    })
+  });
+
+  const gitCloneTool = tool({
+    name: 'GitClone',
+    description: 'Clone a git repository into the workspace.',
+    inputSchema: z.object({
+      repo: z.string().describe('Git repository URL'),
+      dest: z.string().optional().describe('Destination path (relative to /workspace/group)'),
+      depth: z.number().int().positive().optional().describe('Shallow clone depth'),
+      branch: z.string().optional().describe('Branch or tag to checkout')
+    }),
+    outputSchema: z.object({
+      path: z.string(),
+      stdout: z.string(),
+      stderr: z.string(),
+      exitCode: z.number().int().nullable(),
+      durationMs: z.number(),
+      truncated: z.boolean()
+    }),
+    execute: wrapExecute('GitClone', async ({ repo, dest, depth, branch }: { repo: string; dest?: string; depth?: number; branch?: string }) => {
+      const targetPath = dest
+        ? resolvePath(dest, isMain, false)
+        : resolvePath(path.basename(repo.replace(/\.git$/, '')) || 'repo', isMain, false);
+      if (fs.existsSync(targetPath)) {
+        throw new Error(`Destination already exists: ${targetPath}`);
+      }
+      const args = [
+        'git', 'clone',
+        depth ? `--depth ${Math.floor(depth)}` : '',
+        branch ? `--branch ${shellEscape(branch)}` : '',
+        shellEscape(repo),
+        shellEscape(targetPath)
+      ].filter(Boolean).join(' ');
+      return runCommand(args, DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT);
+    })
+  });
+
+  const npmInstallTool = tool({
+    name: 'NpmInstall',
+    description: 'Install npm packages in the workspace.',
+    inputSchema: z.object({
+      packages: z.array(z.string()).optional().describe('Packages to install (default: install from package.json)'),
+      dev: z.boolean().optional().describe('Install as dev dependencies'),
+      path: z.string().optional().describe('Working directory (relative to /workspace/group)')
+    }),
+    outputSchema: z.object({
+      stdout: z.string(),
+      stderr: z.string(),
+      exitCode: z.number().int().nullable(),
+      durationMs: z.number(),
+      truncated: z.boolean()
+    }),
+    execute: wrapExecute('NpmInstall', async ({ packages, dev, path: workdir }: { packages?: string[]; dev?: boolean; path?: string }) => {
+      const cwd = workdir ? resolvePath(workdir, isMain, true) : WORKSPACE_GROUP;
+      const pkgList = packages && packages.length > 0 ? packages.map(shellEscape).join(' ') : '';
+      const devFlag = dev ? '--save-dev' : '';
+      const command = `npm install ${devFlag} ${pkgList}`.trim();
+      return runCommand(command, DEFAULT_BASH_TIMEOUT_MS, DEFAULT_BASH_OUTPUT_LIMIT, cwd);
     })
   });
 
@@ -670,28 +859,12 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
       truncated: z.boolean()
     }),
     execute: wrapExecute('WebFetch', async ({ url, maxBytes }: { url: string; maxBytes?: number }) => {
-      let hostname: string;
-      try {
-        hostname = new URL(url).hostname.toLowerCase();
-      } catch {
-        throw new Error(`Invalid URL: ${url}`);
-      }
-
-      const isBlocked = webFetchBlocklist.some(domain =>
-        hostname === domain || hostname.endsWith(`.${domain}`)
-      );
-      if (isBlocked) {
-        throw new Error(`WebFetch blocked for host: ${hostname}`);
-      }
-
-      if (webFetchAllowlist.length > 0) {
-        const isAllowed = webFetchAllowlist.some(domain =>
-          hostname === domain || hostname.endsWith(`.${domain}`)
-        );
-        if (!isAllowed) {
-          throw new Error(`WebFetch not allowed for host: ${hostname}`);
-        }
-      }
+      await assertUrlAllowed({
+        url,
+        allowlist: webFetchAllowlist,
+        blocklist: webFetchBlocklist,
+        blockPrivate
+      });
 
       const response = await fetch(url, {
         headers: {
@@ -735,7 +908,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
   type WebSearchInput = z.infer<typeof webSearchInputSchema>;
   type WebSearchOutput = z.infer<typeof webSearchOutputSchema>;
 
-  const webSearchTool = tool<typeof webSearchInputSchema, typeof webSearchOutputSchema>({
+  const webSearchTool = tool({
     name: 'WebSearch',
     description: 'Search the web using Brave Search API.',
     inputSchema: webSearchInputSchema,
@@ -810,6 +983,13 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
             url += (url.includes('?') ? '&' : '?') + queryString;
           }
 
+          await assertUrlAllowed({
+            url,
+            allowlist: webFetchAllowlist,
+            blocklist: webFetchBlocklist,
+            blockPrivate
+          });
+
           const headers: Record<string, string> = {};
           if (config.headers) {
             for (const [key, value] of Object.entries(config.headers)) {
@@ -869,7 +1049,7 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     }
 
     return null;
-  }).filter(Boolean) as Array<ReturnType<typeof tool>>;
+  }).filter(Boolean) as Tool[];
 
   const sendMessageTool = tool({
     name: 'mcp__dotclaw__send_message',
@@ -950,6 +1130,26 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     execute: wrapExecute('mcp__dotclaw__cancel_task', async ({ task_id }: { task_id: string }) => ipc.cancelTask(task_id))
   });
 
+  const updateTaskTool = tool({
+    name: 'mcp__dotclaw__update_task',
+    description: 'Update a scheduled task (state, prompt, schedule, or status).',
+    inputSchema: z.object({
+      task_id: z.string(),
+      state_json: z.string().optional(),
+      prompt: z.string().optional(),
+      schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
+      schedule_value: z.string().optional(),
+      context_mode: z.enum(['group', 'isolated']).optional(),
+      status: z.enum(['active', 'paused', 'completed']).optional()
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__update_task', async (args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) =>
+      ipc.updateTask(args))
+  });
+
   const registerGroupTool = tool({
     name: 'mcp__dotclaw__register_group',
     description: 'Register a new Telegram chat (main group only).',
@@ -965,6 +1165,32 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
     }),
     execute: wrapExecute('mcp__dotclaw__register_group', async ({ jid, name, folder, trigger }: { jid: string; name: string; folder: string; trigger?: string }) =>
       ipc.registerGroup({ jid, name, folder, trigger }))
+  });
+
+  const removeGroupTool = tool({
+    name: 'mcp__dotclaw__remove_group',
+    description: 'Remove a registered Telegram chat by chat id, name, or folder (main group only).',
+    inputSchema: z.object({
+      identifier: z.string().describe('Chat id, group name, or folder')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__remove_group', async ({ identifier }: { identifier: string }) =>
+      ipc.removeGroup({ identifier }))
+  });
+
+  const listGroupsTool = tool({
+    name: 'mcp__dotclaw__list_groups',
+    description: 'List registered groups (main group only).',
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__list_groups', async () => ipc.listGroups())
   });
 
   const setModelTool = tool({
@@ -991,6 +1217,8 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
         scope: z.enum(['user', 'group', 'global']),
         subject_id: z.string().optional(),
         type: z.enum(['identity', 'preference', 'fact', 'relationship', 'project', 'task', 'note', 'archive']),
+        kind: z.enum(['semantic', 'episodic', 'procedural', 'preference']).optional(),
+        conflict_key: z.string().optional(),
         content: z.string(),
         importance: z.number().min(0).max(1).optional(),
         confidence: z.number().min(0).max(1).optional(),
@@ -1081,31 +1309,36 @@ export function createTools(ctx: IpcContext, options?: { onToolCall?: ToolCallLo
       ipc.memoryStats(args))
   });
 
-  const tools: Array<ReturnType<typeof tool>> = [
+  const tools: Tool[] = [
     readTool,
     writeTool,
     editTool,
     globTool,
     grepTool,
+    gitCloneTool,
+    npmInstallTool,
     sendMessageTool,
     scheduleTaskTool,
     listTasksTool,
     pauseTaskTool,
     resumeTaskTool,
     cancelTaskTool,
+    updateTaskTool,
     memoryUpsertTool,
     memoryForgetTool,
     memoryListTool,
     memorySearchTool,
     memoryStatsTool,
     registerGroupTool,
+    removeGroupTool,
+    listGroupsTool,
     setModelTool,
     ...pluginTools
   ];
 
-  if (enableBash) tools.push(bashTool as ReturnType<typeof tool>);
-  if (enableWebSearch) tools.push(webSearchTool as ReturnType<typeof tool>);
-  if (enableWebFetch) tools.push(webFetchTool as ReturnType<typeof tool>);
+  if (enableBash) tools.push(bashTool as Tool);
+  if (enableWebSearch) tools.push(webSearchTool as Tool);
+  if (enableWebFetch) tools.push(webFetchTool as Tool);
 
   return tools;
 }

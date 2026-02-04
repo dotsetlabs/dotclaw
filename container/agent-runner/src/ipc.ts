@@ -182,6 +182,23 @@ export function createIpcHandlers(ctx: IpcContext) {
       return { ok: true };
     },
 
+    async updateTask(args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) {
+      writeIpcFile(TASKS_DIR, {
+        type: 'update_task',
+        taskId: args.task_id,
+        state_json: args.state_json,
+        prompt: args.prompt,
+        schedule_type: args.schedule_type,
+        schedule_value: args.schedule_value,
+        context_mode: args.context_mode,
+        status: args.status,
+        groupFolder,
+        isMain,
+        timestamp: new Date().toISOString()
+      });
+      return { ok: true };
+    },
+
     async registerGroup(args: { jid: string; name: string; folder: string; trigger?: string }) {
       if (!isMain) {
         return { ok: false, error: 'Only the main group can register new groups.' };
@@ -195,6 +212,30 @@ export function createIpcHandlers(ctx: IpcContext) {
         timestamp: new Date().toISOString()
       });
       return { ok: true };
+    },
+
+    async removeGroup(args: { identifier: string }) {
+      if (!isMain) {
+        return { ok: false, error: 'Only the main group can remove groups.' };
+      }
+      if (!args.identifier || typeof args.identifier !== 'string') {
+        return { ok: false, error: 'identifier is required (chat id, name, or folder).' };
+      }
+      writeIpcFile(TASKS_DIR, {
+        type: 'remove_group',
+        identifier: args.identifier,
+        groupFolder,
+        isMain,
+        timestamp: new Date().toISOString()
+      });
+      return { ok: true };
+    },
+
+    async listGroups() {
+      if (!isMain) {
+        return { ok: false, error: 'Only the main group can list groups.' };
+      }
+      return requestResponse('list_groups', {});
     },
 
     async setModel(args: { model: string; scope?: 'global' | 'group' | 'user'; target_id?: string }) {

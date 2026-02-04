@@ -22,6 +22,8 @@ const DEFAULT_POLICY: ToolPolicy = {
     'Edit',
     'Glob',
     'Grep',
+    'GitClone',
+    'NpmInstall',
     'WebSearch',
     'WebFetch',
     'Bash',
@@ -31,7 +33,10 @@ const DEFAULT_POLICY: ToolPolicy = {
     'mcp__dotclaw__pause_task',
     'mcp__dotclaw__resume_task',
     'mcp__dotclaw__cancel_task',
+    'mcp__dotclaw__update_task',
     'mcp__dotclaw__register_group',
+    'mcp__dotclaw__remove_group',
+    'mcp__dotclaw__list_groups',
     'mcp__dotclaw__set_model',
     'mcp__dotclaw__memory_upsert',
     'mcp__dotclaw__memory_forget',
@@ -45,7 +50,7 @@ const DEFAULT_POLICY: ToolPolicy = {
     WebSearch: 5,
     WebFetch: 6
   },
-  default_max_per_run: 12
+  default_max_per_run: 32
 };
 
 const POLICY_PATH = path.join(DATA_DIR, 'tool-policy.json');

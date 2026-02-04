@@ -105,6 +105,21 @@ if (fs.existsSync(envPath)) {
   if (containerModeMatch) {
     log('Container mode', containerModeMatch[1].trim());
   }
+
+  const maxConcurrentMatch = envContent.match(/^DOTCLAW_MAX_CONCURRENT_AGENTS=(.+)$/m);
+  if (maxConcurrentMatch) {
+    log('Max concurrent agents', maxConcurrentMatch[1].trim());
+  }
+
+  const warmStartMatch = envContent.match(/^DOTCLAW_WARM_START=(.+)$/m);
+  if (warmStartMatch) {
+    log('Warm start', warmStartMatch[1].trim());
+  }
+
+  const blockPrivateMatch = envContent.match(/^DOTCLAW_WEBFETCH_BLOCK_PRIVATE=(.+)$/m);
+  if (blockPrivateMatch) {
+    log('WebFetch block private', blockPrivateMatch[1].trim());
+  }
 }
 
 checkSystemd('dotclaw.service');
@@ -125,6 +140,12 @@ if (fs.existsSync(modelConfigPath)) {
   }
 } else {
   log('Model config', 'missing');
+}
+
+const behaviorConfigPath = process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH
+  || (DOTCLAW_CONFIG_DIR ? path.join(DOTCLAW_CONFIG_DIR, 'behavior.json') : '');
+if (behaviorConfigPath) {
+  log('Behavior config', fs.existsSync(behaviorConfigPath) ? behaviorConfigPath : 'missing');
 }
 
 const memoryDbPath = path.join(STORE_DIR, 'memory.db');

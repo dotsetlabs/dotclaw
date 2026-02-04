@@ -11,7 +11,9 @@ import {
   GROUPS_DIR,
   IPC_POLL_INTERVAL,
   CONTAINER_TIMEOUT,
-  TIMEZONE
+  TIMEZONE,
+  CONTAINER_MODE,
+  WARM_START_ENABLED
 } from './config.js';
 import { RegisteredGroup, Session } from './types.js';
 import {
@@ -28,7 +30,10 @@ import {
   getTaskById,
   getAllGroupSessions,
   setGroupSession,
-  logToolCalls
+  deleteGroupSession,
+  pauseTasksForGroup,
+  logToolCalls,
+  getToolReliability
 } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
@@ -39,7 +44,6 @@ import { formatTelegramMessage, TELEGRAM_PARSE_MODE } from './telegram-format.js
 import { withGroupLock } from './locks.js';
 import {
   initMemoryStore,
-  buildMemoryRecall,
   buildUserProfile,
   getMemoryStats,
   upsertMemoryItems,
@@ -51,10 +55,19 @@ import {
   MemoryType,
   MemoryItemInput
 } from './memory-store.js';
-import { loadBehaviorConfig } from './behavior-config.js';
+import { buildHybridMemoryRecall } from './memory-recall.js';
+import { startEmbeddingWorker } from './memory-embeddings.js';
+import { loadPersonalizedBehaviorConfig } from './personalization.js';
+import { createProgressNotifier, DEFAULT_PROGRESS_MESSAGES, parseProgressMessages } from './progress.js';
+import { parseAdminCommand } from './admin-commands.js';
 import { getEffectiveToolPolicy } from './tool-policy.js';
-import { resolveModel, loadModelRegistry, saveModelRegistry } from './model-registry.js';
-import { startMetricsServer, recordMessage, recordError, recordToolCall, recordLatency } from './metrics.js';
+import { applyToolBudgets } from './tool-budgets.js';
+import { resolveModel, loadModelRegistry, saveModelRegistry, getTokenEstimateConfig, getModelPricing } from './model-registry.js';
+import { startMetricsServer, recordMessage, recordError, recordToolCall, recordLatency, recordTokenUsage, recordCost, recordMemoryRecall, recordMemoryUpsert, recordMemoryExtract } from './metrics.js';
+import { computeCostUSD } from './cost.js';
+import { runWithAgentSemaphore } from './agent-semaphore.js';
+import { startMaintenanceLoop } from './maintenance.js';
+import { warmGroupContainer } from './container-runner.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -66,6 +79,13 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+function isEnabledEnv(name: string, defaultValue = true): boolean {
+  const value = (process.env[name] || '').toLowerCase().trim();
+  if (!value) return defaultValue;
+  return !['0', 'false', 'no', 'off'].includes(value);
+}
+
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -86,6 +106,13 @@ function isMemoryType(value: unknown): value is MemoryType {
     || value === 'archive';
 }
 
+function isMemoryKind(value: unknown): value is 'semantic' | 'episodic' | 'procedural' | 'preference' {
+  return value === 'semantic'
+    || value === 'episodic'
+    || value === 'procedural'
+    || value === 'preference';
+}
+
 function coerceMemoryItems(input: unknown): MemoryItemInput[] {
   if (!Array.isArray(input)) return [];
   const items: MemoryItemInput[] = [];
@@ -94,6 +121,7 @@ function coerceMemoryItems(input: unknown): MemoryItemInput[] {
     if (!isRecord(raw)) continue;
     const scope = raw.scope;
     const type = raw.type;
+    const kind = raw.kind;
     const content = raw.content;
     if (!isMemoryScope(scope) || !isMemoryType(type) || typeof content !== 'string' || !content.trim()) {
       continue;
@@ -102,6 +130,8 @@ function coerceMemoryItems(input: unknown): MemoryItemInput[] {
     items.push({
       scope,
       type,
+      kind: isMemoryKind(kind) ? kind : undefined,
+      conflict_key: typeof raw.conflict_key === 'string' ? raw.conflict_key : undefined,
       content: content.trim(),
       subject_id: typeof raw.subject_id === 'string' ? raw.subject_id : null,
       importance: typeof raw.importance === 'number' ? raw.importance : undefined,
@@ -124,6 +154,14 @@ const TELEGRAM_SEND_RETRIES = parsePositiveInt(process.env.DOTCLAW_TELEGRAM_SEND
 const TELEGRAM_SEND_RETRY_DELAY_MS = parsePositiveInt(process.env.DOTCLAW_TELEGRAM_SEND_RETRY_DELAY_MS, 1000);
 const MEMORY_RECALL_MAX_RESULTS = parsePositiveInt(process.env.DOTCLAW_MEMORY_RECALL_MAX_RESULTS, 8);
 const MEMORY_RECALL_MAX_TOKENS = parsePositiveInt(process.env.DOTCLAW_MEMORY_RECALL_MAX_TOKENS, 1200);
+const PROGRESS_ENABLED = isEnabledEnv('DOTCLAW_PROGRESS_ENABLED', true);
+const PROGRESS_INITIAL_MS = parsePositiveInt(process.env.DOTCLAW_PROGRESS_INITIAL_MS, 30000);
+const PROGRESS_INTERVAL_MS = parsePositiveInt(process.env.DOTCLAW_PROGRESS_INTERVAL_MS, 60000);
+const PROGRESS_MAX_UPDATES = parsePositiveInt(process.env.DOTCLAW_PROGRESS_MAX_UPDATES, 3);
+const PROGRESS_MESSAGES = parseProgressMessages(process.env.DOTCLAW_PROGRESS_MESSAGES, DEFAULT_PROGRESS_MESSAGES);
+const HEARTBEAT_ENABLED = isEnabledEnv('DOTCLAW_HEARTBEAT_ENABLED', true);
+const HEARTBEAT_INTERVAL_MS = parsePositiveInt(process.env.DOTCLAW_HEARTBEAT_INTERVAL_MS, 900000);
+const HEARTBEAT_GROUP_FOLDER = (process.env.DOTCLAW_HEARTBEAT_GROUP || MAIN_GROUP_FOLDER).trim() || MAIN_GROUP_FOLDER;
 
 // Initialize Telegram bot with extended timeout for long-running agent tasks
 const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!, {
@@ -289,6 +327,62 @@ function registerGroup(chatId: string, group: RegisteredGroup): void {
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   logger.info({ chatId, name: group.name, folder: group.folder }, 'Group registered');
+
+  if (CONTAINER_MODE === 'daemon' && WARM_START_ENABLED) {
+    try {
+      warmGroupContainer(group, group.folder === MAIN_GROUP_FOLDER);
+      logger.info({ group: group.folder }, 'Warmed daemon container for new group');
+    } catch (err) {
+      logger.warn({ group: group.folder, err }, 'Failed to warm container for new group');
+    }
+  }
+}
+
+function listRegisteredGroups(): Array<{ chat_id: string; name: string; folder: string; trigger?: string; added_at: string }> {
+  return Object.entries(registeredGroups).map(([chatId, group]) => ({
+    chat_id: chatId,
+    name: group.name,
+    folder: group.folder,
+    trigger: group.trigger,
+    added_at: group.added_at
+  }));
+}
+
+function resolveGroupIdentifier(identifier: string): string | null {
+  const trimmed = identifier.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.toLowerCase();
+  for (const [chatId, group] of Object.entries(registeredGroups)) {
+    if (chatId === trimmed) return chatId;
+    if (group.name.toLowerCase() === normalized) return chatId;
+    if (group.folder.toLowerCase() === normalized) return chatId;
+  }
+  return null;
+}
+
+function unregisterGroup(identifier: string): { ok: boolean; error?: string; group?: RegisteredGroup & { chat_id: string } } {
+  const chatId = resolveGroupIdentifier(identifier);
+  if (!chatId) {
+    return { ok: false, error: 'Group not found' };
+  }
+  const group = registeredGroups[chatId];
+  if (!group) {
+    return { ok: false, error: 'Group not found' };
+  }
+  if (group.folder === MAIN_GROUP_FOLDER) {
+    return { ok: false, error: 'Cannot remove main group' };
+  }
+
+  delete registeredGroups[chatId];
+  saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
+
+  delete sessions[group.folder];
+  deleteGroupSession(group.folder);
+  pauseTasksForGroup(group.folder);
+
+  logger.info({ chatId, name: group.name, folder: group.folder }, 'Group removed');
+
+  return { ok: true, group: { ...group, chat_id: chatId } };
 }
 
 async function sendMessage(chatId: string, text: string): Promise<void> {
@@ -425,6 +519,8 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   } as const;
 
   const recordTrace = (output: ContainerOutput | null, errorMessage?: string) => {
+    const pricing = output?.model ? getModelPricing(modelRegistry, output.model) : modelPricing;
+    const cost = computeCostUSD(output?.tokens_prompt, output?.tokens_completion, pricing);
     writeTrace({
       ...traceBase,
       output_text: output?.result ?? null,
@@ -432,8 +528,18 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
       prompt_pack_versions: output?.prompt_pack_versions,
       memory_summary: output?.memory_summary,
       memory_facts: output?.memory_facts,
+      memory_recall: memoryRecall,
       tool_calls: output?.tool_calls,
       latency_ms: output?.latency_ms,
+      tokens_prompt: output?.tokens_prompt,
+      tokens_completion: output?.tokens_completion,
+      cost_prompt_usd: cost?.prompt,
+      cost_completion_usd: cost?.completion,
+      cost_total_usd: cost?.total,
+      memory_recall_count: output?.memory_recall_count,
+      session_recall_count: output?.session_recall_count,
+      memory_items_upserted: output?.memory_items_upserted,
+      memory_items_extracted: output?.memory_items_extracted,
       error_code: errorMessage || (output?.status === 'error' ? output?.error : undefined)
     });
   };
@@ -442,7 +548,7 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
 
   await setTyping(msg.chatId);
   const recallQuery = missedMessages.map(m => m.content).join('\n');
-  const memoryRecall = buildMemoryRecall({
+  const memoryRecall = await buildHybridMemoryRecall({
     groupFolder: group.folder,
     userId: msg.senderId,
     query: recallQuery || msg.content,
@@ -457,19 +563,47 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
     groupFolder: group.folder,
     userId: msg.senderId
   });
-  const behaviorConfig = loadBehaviorConfig();
-  const toolPolicy = getEffectiveToolPolicy({
+  const behaviorConfig = loadPersonalizedBehaviorConfig({
     groupFolder: group.folder,
     userId: msg.senderId
   });
+  const baseToolPolicy = getEffectiveToolPolicy({
+    groupFolder: group.folder,
+    userId: msg.senderId
+  });
+  const toolPolicy = applyToolBudgets({
+    groupFolder: group.folder,
+    userId: msg.senderId,
+    toolPolicy: baseToolPolicy
+  });
+  const toolReliability = getToolReliability({ groupFolder: group.folder, limit: 200 })
+    .map(row => ({
+      name: row.tool_name,
+      success_rate: row.total > 0 ? row.ok_count / row.total : 0,
+      count: row.total,
+      avg_duration_ms: row.avg_duration_ms
+    }));
   const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+  const modelRegistry = loadModelRegistry(defaultModel);
   const resolvedModel = resolveModel({
     groupFolder: group.folder,
     userId: msg.senderId,
     defaultModel
   });
+  const tokenEstimate = getTokenEstimateConfig(resolvedModel.override);
+  const modelPricing = getModelPricing(modelRegistry, resolvedModel.model);
 
   let output: ContainerOutput | null = null;
+  const progressNotifier = createProgressNotifier({
+    enabled: PROGRESS_ENABLED,
+    initialDelayMs: PROGRESS_INITIAL_MS,
+    intervalMs: PROGRESS_INTERVAL_MS,
+    maxUpdates: PROGRESS_MAX_UPDATES,
+    messages: PROGRESS_MESSAGES,
+    send: (text) => sendMessage(msg.chatId, text),
+    onError: (err) => logger.debug({ chatId: msg.chatId, err }, 'Failed to send progress update')
+  });
+  progressNotifier.start();
   try {
     output = await runAgent(group, prompt, msg.chatId, {
       userId: msg.senderId,
@@ -477,6 +611,8 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
       memoryRecall,
       userProfile,
       memoryStats,
+      tokenEstimate,
+      toolReliability,
       behaviorConfig: behaviorConfig as unknown as Record<string, unknown>,
       toolPolicy: toolPolicy as Record<string, unknown>,
       modelOverride: resolvedModel.model,
@@ -484,13 +620,14 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
       modelMaxOutputTokens: resolvedModel.override?.max_output_tokens,
       modelTemperature: resolvedModel.override?.temperature
     });
-  }
-  catch (err) {
+  } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
     recordError('agent');
     recordTrace(null, err instanceof Error ? err.message : String(err));
     await sendMessage(msg.chatId, 'Sorry, I ran into an error while processing that.');
     return false;
+  } finally {
+    progressNotifier.stop();
   }
 
   if (!output) {
@@ -527,11 +664,29 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   if (output.latency_ms) {
     recordLatency(output.latency_ms);
   }
+  if (Number.isFinite(output.tokens_prompt) || Number.isFinite(output.tokens_completion)) {
+    recordTokenUsage(output.model || resolvedModel.model, 'telegram', output.tokens_prompt || 0, output.tokens_completion || 0);
+    const pricing = getModelPricing(modelRegistry, output.model || resolvedModel.model);
+    const cost = computeCostUSD(output.tokens_prompt, output.tokens_completion, pricing);
+    if (cost) {
+      recordCost(output.model || resolvedModel.model, 'telegram', cost.total);
+    }
+  }
+  if (Number.isFinite(output.memory_recall_count)) {
+    recordMemoryRecall('telegram', output.memory_recall_count || 0);
+  }
+  if (Number.isFinite(output.memory_items_upserted)) {
+    recordMemoryUpsert('telegram', output.memory_items_upserted || 0);
+  }
+  if (Number.isFinite(output.memory_items_extracted)) {
+    recordMemoryExtract('telegram', output.memory_items_extracted || 0);
+  }
   if (output.tool_calls && output.tool_calls.length > 0) {
     logToolCalls({
       traceId,
       chatJid: msg.chatId,
       groupFolder: group.folder,
+      userId: msg.senderId,
       toolCalls: output.tool_calls,
       source: 'message'
     });
@@ -553,6 +708,8 @@ async function runAgent(
     memoryRecall?: string[];
     userProfile?: string | null;
     memoryStats?: { total: number; user: number; group: number; global: number };
+    tokenEstimate?: { tokens_per_char: number; tokens_per_message: number; tokens_per_request: number };
+    toolReliability?: Array<{ name: string; success_rate: number; count: number; avg_duration_ms: number | null }>;
     behaviorConfig?: Record<string, unknown>;
     toolPolicy?: Record<string, unknown>;
     modelOverride?: string;
@@ -573,33 +730,46 @@ async function runAgent(
     schedule_type: t.schedule_type,
     schedule_value: t.schedule_value,
     status: t.status,
-    next_run: t.next_run
+    next_run: t.next_run,
+    state_json: t.state_json ?? null,
+    retry_count: t.retry_count ?? 0,
+    last_error: t.last_error ?? null
   })));
 
   // For Telegram, we don't have dynamic group discovery like WhatsApp
-  // Just pass the registered groups
-  writeGroupsSnapshot(group.folder, isMain, []);
+  // Pass registered groups for main (admin) context
+  const availableGroups = Object.entries(registeredGroups).map(([jid, info]) => ({
+    jid,
+    name: info.name,
+    lastActivity: getChatState(jid)?.last_agent_timestamp || info.added_at,
+    isRegistered: true
+  }));
+  writeGroupsSnapshot(group.folder, isMain, availableGroups);
 
   try {
-    const output = await withGroupLock(group.folder, () =>
-      runContainerAgent(group, {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid: chatId,
-        isMain,
-        userId: options?.userId,
-        userName: options?.userName,
-        memoryRecall: options?.memoryRecall,
+    const output = await runWithAgentSemaphore(() =>
+      withGroupLock(group.folder, () =>
+        runContainerAgent(group, {
+          prompt,
+          sessionId,
+          groupFolder: group.folder,
+          chatJid: chatId,
+          isMain,
+          userId: options?.userId,
+          userName: options?.userName,
+          memoryRecall: options?.memoryRecall,
         userProfile: options?.userProfile ?? null,
         memoryStats: options?.memoryStats,
+        tokenEstimate: options?.tokenEstimate,
+        toolReliability: options?.toolReliability,
         behaviorConfig: options?.behaviorConfig,
-        toolPolicy: options?.toolPolicy,
-        modelOverride: options?.modelOverride,
-        modelContextTokens: options?.modelContextTokens,
-        modelMaxOutputTokens: options?.modelMaxOutputTokens,
-        modelTemperature: options?.modelTemperature
-      })
+          toolPolicy: options?.toolPolicy,
+          modelOverride: options?.modelOverride,
+          modelContextTokens: options?.modelContextTokens,
+          modelMaxOutputTokens: options?.modelMaxOutputTokens,
+          modelTemperature: options?.modelTemperature
+        })
+      )
     );
 
     if (output.newSessionId) {
@@ -784,6 +954,155 @@ function startIpcWatcher(): void {
   }
 }
 
+async function runHeartbeatOnce(): Promise<void> {
+  const entry = Object.entries(registeredGroups).find(([, group]) => group.folder === HEARTBEAT_GROUP_FOLDER);
+  if (!entry) {
+    logger.warn({ group: HEARTBEAT_GROUP_FOLDER }, 'Heartbeat group not registered');
+    return;
+  }
+  const [chatId, group] = entry;
+  const isMain = group.folder === MAIN_GROUP_FOLDER;
+  const prompt = [
+    '[HEARTBEAT]',
+    'You are running automatically. Review scheduled tasks, pending reminders, and long-running work.',
+    'If you need to communicate, use mcp__dotclaw__send_message. Otherwise, take no user-visible action.'
+  ].join(' ');
+
+  const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const traceTimestamp = new Date().toISOString();
+
+  const memoryRecall = await buildHybridMemoryRecall({
+    groupFolder: group.folder,
+    userId: null,
+    query: prompt,
+    maxResults: Math.max(4, MEMORY_RECALL_MAX_RESULTS - 2),
+    maxTokens: Math.max(600, MEMORY_RECALL_MAX_TOKENS - 200)
+  });
+  const memoryStats = getMemoryStats({
+    groupFolder: group.folder,
+    userId: null
+  });
+  const behaviorConfig = loadPersonalizedBehaviorConfig({
+    groupFolder: group.folder,
+    userId: null
+  });
+  const baseToolPolicy = getEffectiveToolPolicy({
+    groupFolder: group.folder,
+    userId: null
+  });
+  const toolPolicy = applyToolBudgets({
+    groupFolder: group.folder,
+    userId: null,
+    toolPolicy: baseToolPolicy
+  });
+  const toolReliability = getToolReliability({ groupFolder: group.folder, limit: 200 })
+    .map(row => ({
+      name: row.tool_name,
+      success_rate: row.total > 0 ? row.ok_count / row.total : 0,
+      count: row.total,
+      avg_duration_ms: row.avg_duration_ms
+    }));
+  const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+  const modelRegistry = loadModelRegistry(defaultModel);
+  const resolvedModel = resolveModel({
+    groupFolder: group.folder,
+    userId: null,
+    defaultModel
+  });
+  const tokenEstimate = getTokenEstimateConfig(resolvedModel.override);
+
+  const sessionId = sessions[group.folder];
+  const output = await runWithAgentSemaphore(() =>
+    withGroupLock(group.folder, () =>
+      runContainerAgent(group, {
+        prompt,
+        sessionId,
+        groupFolder: group.folder,
+        chatJid: chatId,
+        isMain,
+        isScheduledTask: true,
+        memoryRecall,
+        userProfile: null,
+        memoryStats,
+        tokenEstimate,
+        toolReliability,
+        behaviorConfig: behaviorConfig as unknown as Record<string, unknown>,
+        toolPolicy: toolPolicy as Record<string, unknown>,
+        modelOverride: resolvedModel.model,
+        modelContextTokens: resolvedModel.override?.context_window,
+        modelMaxOutputTokens: resolvedModel.override?.max_output_tokens,
+        modelTemperature: resolvedModel.override?.temperature
+      })
+    )
+  );
+
+  if (output?.newSessionId) {
+    sessions[group.folder] = output.newSessionId;
+    setGroupSession(group.folder, output.newSessionId);
+    saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+  }
+
+  const cost = computeCostUSD(
+    output?.tokens_prompt,
+    output?.tokens_completion,
+    getModelPricing(modelRegistry, output?.model || resolvedModel.model)
+  );
+
+  writeTrace({
+    trace_id: traceId,
+    timestamp: traceTimestamp,
+    created_at: Date.now(),
+    chat_id: chatId,
+    group_folder: group.folder,
+    input_text: prompt,
+    output_text: output?.result ?? null,
+    model_id: output?.model || 'unknown',
+    prompt_pack_versions: output?.prompt_pack_versions,
+    memory_summary: output?.memory_summary,
+    memory_facts: output?.memory_facts,
+    tool_calls: output?.tool_calls,
+    latency_ms: output?.latency_ms,
+    tokens_prompt: output?.tokens_prompt,
+    tokens_completion: output?.tokens_completion,
+    cost_prompt_usd: cost?.prompt,
+    cost_completion_usd: cost?.completion,
+    cost_total_usd: cost?.total,
+    memory_recall_count: output?.memory_recall_count,
+    session_recall_count: output?.session_recall_count,
+    memory_items_upserted: output?.memory_items_upserted,
+    memory_items_extracted: output?.memory_items_extracted,
+    error_code: output?.status === 'error' ? output?.error : undefined,
+    source: 'dotclaw-heartbeat'
+  });
+
+  if (output?.tool_calls && output.tool_calls.length > 0) {
+    logToolCalls({
+      traceId,
+      chatJid: chatId,
+      groupFolder: group.folder,
+      userId: null,
+      toolCalls: output.tool_calls,
+      source: 'heartbeat'
+    });
+    for (const call of output.tool_calls) {
+      recordToolCall(call.name, call.ok);
+    }
+  }
+}
+
+function startHeartbeatLoop(): void {
+  if (!HEARTBEAT_ENABLED) return;
+  const loop = async () => {
+    try {
+      await runHeartbeatOnce();
+    } catch (err) {
+      logger.error({ err }, 'Heartbeat run failed');
+    }
+    setTimeout(loop, HEARTBEAT_INTERVAL_MS);
+  };
+  loop();
+}
+
 async function processTaskIpc(
   data: {
     type: string;
@@ -794,6 +1113,9 @@ async function processTaskIpc(
     context_mode?: string;
     groupFolder?: string;
     chatJid?: string;
+    state_json?: string;
+    status?: string;
+    identifier?: string;
     // For register_group
     jid?: string;
     name?: string;
@@ -912,6 +1234,53 @@ async function processTaskIpc(
       }
       break;
 
+    case 'update_task':
+      if (data.taskId) {
+        const task = getTaskById(data.taskId);
+        if (!task || (!isMain && task.group_folder !== sourceGroup)) {
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task update attempt');
+          break;
+        }
+
+        const updates: Partial<Pick<typeof task, 'prompt' | 'schedule_type' | 'schedule_value' | 'status' | 'context_mode' | 'state_json' | 'next_run'>> = {};
+        if (typeof data.prompt === 'string') updates.prompt = data.prompt;
+        if (typeof data.context_mode === 'string') updates.context_mode = data.context_mode as typeof task.context_mode;
+        if (typeof data.status === 'string') updates.status = data.status as typeof task.status;
+        if (typeof data.state_json === 'string') updates.state_json = data.state_json;
+
+        if (typeof data.schedule_type === 'string' && typeof data.schedule_value === 'string') {
+          updates.schedule_type = data.schedule_type as typeof task.schedule_type;
+          updates.schedule_value = data.schedule_value;
+
+          let nextRun: string | null = null;
+          if (updates.schedule_type === 'cron') {
+            try {
+              const interval = CronExpressionParser.parse(updates.schedule_value, { tz: TIMEZONE });
+              nextRun = interval.next().toISOString();
+            } catch {
+              logger.warn({ scheduleValue: updates.schedule_value }, 'Invalid cron expression for update_task');
+            }
+          } else if (updates.schedule_type === 'interval') {
+            const ms = parseInt(updates.schedule_value, 10);
+            if (!isNaN(ms) && ms > 0) {
+              nextRun = new Date(Date.now() + ms).toISOString();
+            }
+          } else if (updates.schedule_type === 'once') {
+            const scheduled = new Date(updates.schedule_value);
+            if (!isNaN(scheduled.getTime())) {
+              nextRun = scheduled.toISOString();
+            }
+          }
+          if (nextRun) {
+            updates.next_run = nextRun;
+          }
+        }
+
+        updateTask(data.taskId, updates);
+        logger.info({ taskId: data.taskId, sourceGroup }, 'Task updated via IPC');
+      }
+      break;
+
     case 'register_group':
       // Only main group can register new groups
       if (!isMain) {
@@ -928,6 +1297,23 @@ async function processTaskIpc(
         });
       } else {
         logger.warn({ data }, 'Invalid register_group request - missing required fields');
+      }
+      break;
+
+    case 'remove_group':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized remove_group attempt blocked');
+        break;
+      }
+      if (!data.identifier || typeof data.identifier !== 'string') {
+        logger.warn({ data }, 'Invalid remove_group request - missing identifier');
+        break;
+      }
+      {
+        const result = unregisterGroup(data.identifier);
+        if (!result.ok) {
+          logger.warn({ identifier: data.identifier, error: result.error }, 'Failed to remove group');
+        }
       }
       break;
 
@@ -1055,6 +1441,13 @@ async function processRequestIpc(
         const stats = getMemoryStats({ groupFolder, userId });
         return { id: requestId, ok: true, result: { stats } };
       }
+      case 'list_groups': {
+        if (!isMain) {
+          return { id: requestId, ok: false, error: 'Only the main group can list groups.' };
+        }
+        const groups = listRegisteredGroups();
+        return { id: requestId, ok: true, result: { groups } };
+      }
       default:
         return { id: requestId, ok: false, error: `Unknown request type: ${data.type}` };
     }
@@ -1063,9 +1456,274 @@ async function processRequestIpc(
   }
 }
 
+function formatGroups(groups: Array<{ chat_id: string; name: string; folder: string; trigger?: string; added_at: string }>): string {
+  if (groups.length === 0) return 'No registered groups.';
+  const lines = groups.map(group => {
+    const trigger = group.trigger ? ` (trigger: ${group.trigger})` : '';
+    return `- ${group.name} [${group.folder}] chat=${group.chat_id}${trigger}`;
+  });
+  return ['Registered groups:', ...lines].join('\n');
+}
+
+function applyModelOverride(params: { model: string; scope: 'global' | 'group' | 'user'; targetId?: string }): { ok: boolean; error?: string } {
+  const defaultModel = process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5';
+  const config = loadModelRegistry(defaultModel);
+  const nextModel = params.model.trim();
+  if (config.allowlist && config.allowlist.length > 0 && !config.allowlist.includes(nextModel)) {
+    return { ok: false, error: 'Model not in allowlist' };
+  }
+  const scope = params.scope || 'global';
+  const targetId = params.targetId;
+  if (scope === 'user' && !targetId) {
+    return { ok: false, error: 'Missing target_id for user scope' };
+  }
+  if (scope === 'group' && !targetId) {
+    return { ok: false, error: 'Missing target_id for group scope' };
+  }
+  const nextConfig = { ...config };
+  if (scope === 'global') {
+    nextConfig.model = nextModel;
+  } else if (scope === 'group') {
+    nextConfig.per_group = nextConfig.per_group || {};
+    nextConfig.per_group[targetId!] = { model: nextModel };
+  } else if (scope === 'user') {
+    nextConfig.per_user = nextConfig.per_user || {};
+    nextConfig.per_user[targetId!] = { model: nextModel };
+  }
+  nextConfig.updated_at = new Date().toISOString();
+  saveModelRegistry(nextConfig);
+  return { ok: true };
+}
+
+async function handleAdminCommand(params: {
+  chatId: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  botUsername?: string;
+}): Promise<boolean> {
+  const parsed = parseAdminCommand(params.content, params.botUsername);
+  if (!parsed) return false;
+
+  const group = registeredGroups[params.chatId];
+  if (!group) {
+    await sendMessage(params.chatId, 'This chat is not registered with DotClaw.');
+    return true;
+  }
+
+  const isMain = group.folder === MAIN_GROUP_FOLDER;
+  const command = parsed.command;
+  const args = parsed.args;
+
+  const requireMain = (name: string): boolean => {
+    if (isMain) return false;
+    sendMessage(params.chatId, `${name} is only available in the main group.`).catch(() => undefined);
+    return true;
+  };
+
+  if (command === 'help') {
+    await sendMessage(params.chatId, [
+      'DotClaw admin commands:',
+      '- `/dotclaw help`',
+      '- `/dotclaw groups` (main only)',
+      '- `/dotclaw add-group <chat_id> <name> [folder]` (main only)',
+      '- `/dotclaw remove-group <chat_id|name|folder>` (main only)',
+      '- `/dotclaw set-model <model> [global|group|user] [target_id]` (main only)',
+      '- `/dotclaw remember <fact>` (main only)',
+      '- `/dotclaw style <concise|balanced|detailed>`',
+      '- `/dotclaw tools <conservative|balanced|proactive>`',
+      '- `/dotclaw caution <low|balanced|high>`',
+      '- `/dotclaw memory <strict|balanced|loose>`'
+    ].join('\n'));
+    return true;
+  }
+
+  if (command === 'groups') {
+    if (requireMain('Listing groups')) return true;
+    await sendMessage(params.chatId, formatGroups(listRegisteredGroups()));
+    return true;
+  }
+
+  if (command === 'add-group') {
+    if (requireMain('Adding groups')) return true;
+    if (args.length < 1) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw add-group <chat_id> <name> [folder]');
+      return true;
+    }
+    const jid = args[0];
+    if (registeredGroups[jid]) {
+      await sendMessage(params.chatId, 'That chat id is already registered.');
+      return true;
+    }
+    const name = args[1] || `group-${jid}`;
+    const folder = args[2] || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!isSafeGroupFolder(folder, GROUPS_DIR)) {
+      await sendMessage(params.chatId, 'Invalid folder name. Use lowercase letters, numbers, and dashes only.');
+      return true;
+    }
+    registerGroup(jid, {
+      name,
+      folder: folder || `group-${jid}`,
+      added_at: new Date().toISOString()
+    });
+    await sendMessage(params.chatId, `Registered group "${name}" with folder "${folder}".`);
+    return true;
+  }
+
+  if (command === 'remove-group') {
+    if (requireMain('Removing groups')) return true;
+    if (args.length < 1) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw remove-group <chat_id|name|folder>');
+      return true;
+    }
+    const result = unregisterGroup(args.join(' '));
+    if (!result.ok) {
+      await sendMessage(params.chatId, `Failed to remove group: ${result.error || 'unknown error'}`);
+      return true;
+    }
+    await sendMessage(params.chatId, `Removed group "${result.group?.name}" (${result.group?.folder}).`);
+    return true;
+  }
+
+  if (command === 'set-model') {
+    if (requireMain('Setting models')) return true;
+    if (args.length < 1) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw set-model <model> [global|group|user] [target_id]');
+      return true;
+    }
+    const model = args[0];
+    const scopeCandidate = (args[1] || '').toLowerCase();
+    const scope = (scopeCandidate === 'global' || scopeCandidate === 'group' || scopeCandidate === 'user')
+      ? (scopeCandidate as 'global' | 'group' | 'user')
+      : 'global';
+    const targetId = args[2] || (scope === 'group' ? group.folder : scope === 'user' ? params.senderId : undefined);
+    const result = applyModelOverride({ model, scope, targetId });
+    if (!result.ok) {
+      await sendMessage(params.chatId, `Failed to set model: ${result.error || 'unknown error'}`);
+      return true;
+    }
+    await sendMessage(params.chatId, `Model set to ${model} (${scope}${targetId ? `:${targetId}` : ''}).`);
+    return true;
+  }
+
+  if (command === 'remember') {
+    if (requireMain('Remembering facts')) return true;
+    const fact = args.join(' ').trim();
+    if (!fact) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw remember <fact>');
+      return true;
+    }
+    const items: MemoryItemInput[] = [{
+      scope: 'global',
+      type: 'fact',
+      content: fact,
+      importance: 0.7,
+      confidence: 0.8,
+      tags: ['manual']
+    }];
+    upsertMemoryItems('global', items, 'admin-command');
+    await sendMessage(params.chatId, 'Saved to global memory.');
+    return true;
+  }
+
+  if (command === 'style') {
+    const style = (args[0] || '').toLowerCase();
+    if (!['concise', 'balanced', 'detailed'].includes(style)) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw style <concise|balanced|detailed>');
+      return true;
+    }
+    const items: MemoryItemInput[] = [{
+      scope: 'user',
+      subject_id: params.senderId,
+      type: 'preference',
+      conflict_key: 'response_style',
+      content: `Prefers ${style} responses.`,
+      importance: 0.7,
+      confidence: 0.85,
+      tags: [`response_style:${style}`],
+      metadata: { response_style: style }
+    }];
+    upsertMemoryItems(group.folder, items, 'admin-command');
+    await sendMessage(params.chatId, `Response style set to ${style}.`);
+    return true;
+  }
+
+  if (command === 'tools') {
+    const level = (args[0] || '').toLowerCase();
+    const bias = level === 'proactive' ? 0.7 : level === 'balanced' ? 0.5 : level === 'conservative' ? 0.3 : null;
+    if (bias === null) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw tools <conservative|balanced|proactive>');
+      return true;
+    }
+    const items: MemoryItemInput[] = [{
+      scope: 'user',
+      subject_id: params.senderId,
+      type: 'preference',
+      conflict_key: 'tool_calling_bias',
+      content: `Prefers ${level} tool usage.`,
+      importance: 0.65,
+      confidence: 0.8,
+      tags: [`tool_calling_bias:${bias}`],
+      metadata: { tool_calling_bias: bias, bias }
+    }];
+    upsertMemoryItems(group.folder, items, 'admin-command');
+    await sendMessage(params.chatId, `Tool usage bias set to ${level}.`);
+    return true;
+  }
+
+  if (command === 'caution') {
+    const level = (args[0] || '').toLowerCase();
+    const bias = level === 'high' ? 0.7 : level === 'balanced' ? 0.5 : level === 'low' ? 0.35 : null;
+    if (bias === null) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw caution <low|balanced|high>');
+      return true;
+    }
+    const items: MemoryItemInput[] = [{
+      scope: 'user',
+      subject_id: params.senderId,
+      type: 'preference',
+      conflict_key: 'caution_bias',
+      content: `Prefers ${level} caution in responses.`,
+      importance: 0.65,
+      confidence: 0.8,
+      tags: [`caution_bias:${bias}`],
+      metadata: { caution_bias: bias, bias }
+    }];
+    upsertMemoryItems(group.folder, items, 'admin-command');
+    await sendMessage(params.chatId, `Caution bias set to ${level}.`);
+    return true;
+  }
+
+  if (command === 'memory') {
+    const level = (args[0] || '').toLowerCase();
+    const threshold = level === 'strict' ? 0.7 : level === 'balanced' ? 0.55 : level === 'loose' ? 0.45 : null;
+    if (threshold === null) {
+      await sendMessage(params.chatId, 'Usage: /dotclaw memory <strict|balanced|loose>');
+      return true;
+    }
+    const items: MemoryItemInput[] = [{
+      scope: 'user',
+      subject_id: params.senderId,
+      type: 'preference',
+      conflict_key: 'memory_importance_threshold',
+      content: `Prefers memory strictness ${level}.`,
+      importance: 0.6,
+      confidence: 0.8,
+      tags: [`memory_importance_threshold:${threshold}`],
+      metadata: { memory_importance_threshold: threshold, threshold }
+    }];
+    upsertMemoryItems(group.folder, items, 'admin-command');
+    await sendMessage(params.chatId, `Memory strictness set to ${level}.`);
+    return true;
+  }
+
+  await sendMessage(params.chatId, 'Unknown command. Use `/dotclaw help` for options.');
+  return true;
+}
+
 function setupTelegramHandlers(): void {
   // Handle all text messages
-  telegrafBot.on('message', (ctx) => {
+  telegrafBot.on('message', async (ctx) => {
     if (!ctx.message || !('text' in ctx.message)) return;
 
     const chatId = String(ctx.chat.id);
@@ -1102,6 +1760,17 @@ function setupTelegramHandlers(): void {
 
     const botUsername = ctx.me;
     const botId = ctx.botInfo?.id;
+    const adminHandled = await handleAdminCommand({
+      chatId,
+      senderId,
+      senderName,
+      content,
+      botUsername
+    });
+    if (adminHandled) {
+      return;
+    }
+
     const mentioned = isBotMentioned(content, ctx.message.entities, botUsername, botId);
     const replied = isBotReplied(ctx.message, botId);
     const shouldProcess = isPrivate || mentioned || replied;
@@ -1164,6 +1833,7 @@ async function main(): Promise<void> {
   ensureDockerRunning();
   initDatabase();
   initMemoryStore();
+  startEmbeddingWorker();
   const expiredMemories = cleanupExpiredMemories();
   if (expiredMemories > 0) {
     logger.info({ expiredMemories }, 'Expired memories cleaned up');
@@ -1171,6 +1841,18 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   startMetricsServer();
   loadState();
+
+  if (CONTAINER_MODE === 'daemon' && WARM_START_ENABLED) {
+    const groups = Object.values(registeredGroups);
+    for (const group of groups) {
+      try {
+        warmGroupContainer(group, group.folder === MAIN_GROUP_FOLDER);
+        logger.info({ group: group.folder }, 'Warmed daemon container');
+      } catch (err) {
+        logger.warn({ group: group.folder, err }, 'Failed to warm daemon container');
+      }
+    }
+  }
 
   // Set up Telegram message handlers
   setupTelegramHandlers();
@@ -1202,6 +1884,8 @@ async function main(): Promise<void> {
       }
     });
     startIpcWatcher();
+    startMaintenanceLoop();
+    startHeartbeatLoop();
 
     logger.info('DotClaw running on Telegram (responds to DMs and group mentions/replies)');
   } catch (error) {

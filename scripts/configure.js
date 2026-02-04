@@ -72,6 +72,8 @@ async function main() {
   const envContent = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf-8') : '';
   const envMap = parseEnv(envContent);
 
+  const nonInteractive = ['1', 'true', 'yes'].includes((process.env.DOTCLAW_CONFIGURE_NONINTERACTIVE || process.env.DOTCLAW_BOOTSTRAP_NONINTERACTIVE || '').toLowerCase());
+
   let modelConfig = {
     model: 'moonshotai/kimi-k2.5',
     allowlist: [],
@@ -85,22 +87,49 @@ async function main() {
     }
   }
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  let telegramToken = envMap.get('TELEGRAM_BOT_TOKEN') || '';
+  let openrouterKey = envMap.get('OPENROUTER_API_KEY') || '';
+  let openrouterModel = envMap.get('OPENROUTER_MODEL') || modelConfig.model;
+  let openrouterSiteUrl = envMap.get('OPENROUTER_SITE_URL') || '';
+  let openrouterSiteName = envMap.get('OPENROUTER_SITE_NAME') || '';
+  let braveKey = envMap.get('BRAVE_SEARCH_API_KEY') || '';
+  let allowlistInput = '';
 
-  const telegramToken = await promptForValue(rl, 'TELEGRAM_BOT_TOKEN', envMap.get('TELEGRAM_BOT_TOKEN'));
-  const openrouterKey = await promptForValue(rl, 'OPENROUTER_API_KEY', envMap.get('OPENROUTER_API_KEY'));
-  const openrouterModel = await promptForValue(rl, 'OPENROUTER_MODEL', envMap.get('OPENROUTER_MODEL') || modelConfig.model);
-  const openrouterSiteUrl = await promptForValue(rl, 'OPENROUTER_SITE_URL', envMap.get('OPENROUTER_SITE_URL'), true);
-  const openrouterSiteName = await promptForValue(rl, 'OPENROUTER_SITE_NAME', envMap.get('OPENROUTER_SITE_NAME'), true);
-  const braveKey = await promptForValue(rl, 'BRAVE_SEARCH_API_KEY', envMap.get('BRAVE_SEARCH_API_KEY'), true);
+  if (nonInteractive) {
+    telegramToken = process.env.TELEGRAM_BOT_TOKEN || telegramToken;
+    openrouterKey = process.env.OPENROUTER_API_KEY || openrouterKey;
+    openrouterModel = process.env.OPENROUTER_MODEL || openrouterModel;
+    openrouterSiteUrl = process.env.OPENROUTER_SITE_URL || openrouterSiteUrl;
+    openrouterSiteName = process.env.OPENROUTER_SITE_NAME || openrouterSiteName;
+    braveKey = process.env.BRAVE_SEARCH_API_KEY || braveKey;
+    allowlistInput = process.env.DOTCLAW_MODEL_ALLOWLIST || '';
 
-  const allowlistInput = await new Promise(resolve => {
-    rl.question('Model allowlist (comma-separated, blank = allow all): ', answer => {
-      resolve(answer.trim());
+    if (!telegramToken) {
+      console.error('TELEGRAM_BOT_TOKEN is required for non-interactive configuration.');
+      process.exit(1);
+    }
+    if (!openrouterKey) {
+      console.error('OPENROUTER_API_KEY is required for non-interactive configuration.');
+      process.exit(1);
+    }
+  } else {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    telegramToken = await promptForValue(rl, 'TELEGRAM_BOT_TOKEN', telegramToken);
+    openrouterKey = await promptForValue(rl, 'OPENROUTER_API_KEY', openrouterKey);
+    openrouterModel = await promptForValue(rl, 'OPENROUTER_MODEL', openrouterModel);
+    openrouterSiteUrl = await promptForValue(rl, 'OPENROUTER_SITE_URL', openrouterSiteUrl, true);
+    openrouterSiteName = await promptForValue(rl, 'OPENROUTER_SITE_NAME', openrouterSiteName, true);
+    braveKey = await promptForValue(rl, 'BRAVE_SEARCH_API_KEY', braveKey, true);
+
+    allowlistInput = await new Promise(resolve => {
+      rl.question('Model allowlist (comma-separated, blank = allow all): ', answer => {
+        resolve(answer.trim());
+      });
     });
-  });
 
-  rl.close();
+    rl.close();
+  }
 
   const updates = {
     TELEGRAM_BOT_TOKEN: telegramToken,

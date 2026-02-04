@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import { DATA_DIR } from './config.js';
 import { loadJson, saveJson } from './utils.js';
@@ -21,10 +22,20 @@ const DEFAULT_CONFIG: BehaviorConfig = {
   last_updated: new Date(0).toISOString()
 };
 
-const CONFIG_PATH = path.join(DATA_DIR, 'behavior.json');
+const HOME_DIR = process.env.HOME || '/Users/user';
+const LEGACY_CONFIG_PATH = path.join(DATA_DIR, 'behavior.json');
+const DEFAULT_CONFIG_PATH = path.join(HOME_DIR, '.config', 'dotclaw', 'behavior.json');
+
+export function getBehaviorConfigPath(): string {
+  const override = process.env.DOTCLAW_BEHAVIOR_CONFIG_PATH;
+  if (override && override.trim()) return override.trim();
+  if (fs.existsSync(LEGACY_CONFIG_PATH)) return LEGACY_CONFIG_PATH;
+  return DEFAULT_CONFIG_PATH;
+}
 
 export function loadBehaviorConfig(): BehaviorConfig {
-  const raw = loadJson<Partial<BehaviorConfig>>(CONFIG_PATH, {});
+  const configPath = getBehaviorConfigPath();
+  const raw = loadJson<Partial<BehaviorConfig>>(configPath, {});
   const merged: BehaviorConfig = {
     ...DEFAULT_CONFIG,
     ...raw,
@@ -38,7 +49,7 @@ export function loadBehaviorConfig(): BehaviorConfig {
 }
 
 export function saveBehaviorConfig(config: BehaviorConfig): void {
-  saveJson(CONFIG_PATH, config);
+  saveJson(getBehaviorConfigPath(), config);
 }
 
 function clamp(value: number): number {

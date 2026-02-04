@@ -191,10 +191,30 @@ async function prompt(question, defaultValue = '') {
   });
 }
 
+function parseBoolEnv(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const normalized = String(value).toLowerCase().trim();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    console.error(`Missing required env var: ${name}`);
+    process.exit(1);
+  }
+  return value;
+}
+
 async function main() {
   console.log('DotClaw bootstrap starting...\n');
 
   runScript('scripts/init.js');
+
+  const nonInteractive = parseBoolEnv(process.env.DOTCLAW_BOOTSTRAP_NONINTERACTIVE, false);
+  if (nonInteractive) {
+    process.env.DOTCLAW_CONFIGURE_NONINTERACTIVE = '1';
+  }
   runScript('scripts/configure.js');
 
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
@@ -212,17 +232,30 @@ async function main() {
   console.log('\nNow register your main chat.');
   console.log('If you do not know your Telegram chat ID, use @userinfobot or @get_id_bot in Telegram.\n');
 
-  const chatId = await prompt('Telegram chat ID');
-  if (!chatId) {
-    console.error('Chat ID is required to register the main group.');
-    process.exit(1);
-  }
+  let chatId = '';
+  let name = 'main';
+  let folder = 'main';
 
-  const name = await prompt('Group name', 'main');
-  let folder = await prompt('Folder name (lowercase, hyphens)', 'main');
-  while (!isSafeFolder(folder)) {
-    console.log('Folder name must be lowercase letters, numbers, and hyphens only.');
+  if (nonInteractive) {
+    chatId = requireEnv('DOTCLAW_BOOTSTRAP_CHAT_ID');
+    name = process.env.DOTCLAW_BOOTSTRAP_GROUP_NAME || 'main';
+    folder = process.env.DOTCLAW_BOOTSTRAP_GROUP_FOLDER || 'main';
+    if (!isSafeFolder(folder)) {
+      console.error('DOTCLAW_BOOTSTRAP_GROUP_FOLDER must be lowercase letters, numbers, and hyphens only.');
+      process.exit(1);
+    }
+  } else {
+    chatId = await prompt('Telegram chat ID');
+    if (!chatId) {
+      console.error('Chat ID is required to register the main group.');
+      process.exit(1);
+    }
+    name = await prompt('Group name', 'main');
     folder = await prompt('Folder name (lowercase, hyphens)', 'main');
+    while (!isSafeFolder(folder)) {
+      console.log('Folder name must be lowercase letters, numbers, and hyphens only.');
+      folder = await prompt('Folder name (lowercase, hyphens)', 'main');
+    }
   }
   const groups = loadJson(REGISTERED_GROUPS, {});
   groups[String(chatId)] = {
@@ -233,7 +266,12 @@ async function main() {
   saveJson(REGISTERED_GROUPS, groups);
 
   console.log('\nMain group registered.');
-  const buildNow = await prompt('Build the container now? (yes/no)', 'yes');
+  let buildNow = 'yes';
+  if (nonInteractive) {
+    buildNow = parseBoolEnv(process.env.DOTCLAW_BOOTSTRAP_BUILD, true) ? 'yes' : 'no';
+  } else {
+    buildNow = await prompt('Build the container now? (yes/no)', 'yes');
+  }
   if (buildNow.toLowerCase().startsWith('y')) {
     const result = spawnSync('./container/build.sh', { stdio: 'inherit', shell: true });
     if (result.status !== 0) {
@@ -255,7 +293,12 @@ async function main() {
   if (!filteredEnv.get('OPENROUTER_API_KEY')) {
     console.log('Self-check skipped: OPENROUTER_API_KEY is not set in .env.');
   } else {
-    const runCheck = await prompt('Run container self-check now? (yes/no)', 'yes');
+    let runCheck = 'yes';
+    if (nonInteractive) {
+      runCheck = parseBoolEnv(process.env.DOTCLAW_BOOTSTRAP_SELF_CHECK, true) ? 'yes' : 'no';
+    } else {
+      runCheck = await prompt('Run container self-check now? (yes/no)', 'yes');
+    }
     if (runCheck.toLowerCase().startsWith('y')) {
       const ok = runSelfCheck({
         image,

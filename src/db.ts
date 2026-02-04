@@ -5,12 +5,15 @@ import { NewMessage, ScheduledTask, TaskRunLog } from './types.js';
 import { STORE_DIR } from './config.js';
 
 let db: Database.Database;
+let dbInitialized = false;
 
 export function initDatabase(): void {
+  if (dbInitialized) return;
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  dbInitialized = true;
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -40,6 +43,9 @@ export function initDatabase(): void {
       next_run TEXT,
       last_run TEXT,
       last_result TEXT,
+      state_json TEXT,
+      retry_count INTEGER DEFAULT 0,
+      last_error TEXT,
       status TEXT DEFAULT 'active',
       created_at TEXT NOT NULL
     );
@@ -75,6 +81,7 @@ export function initDatabase(): void {
       trace_id TEXT,
       chat_jid TEXT,
       group_folder TEXT,
+      user_id TEXT,
       tool_name TEXT NOT NULL,
       ok INTEGER NOT NULL,
       duration_ms INTEGER,
@@ -94,6 +101,21 @@ export function initDatabase(): void {
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
     db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`);
+  } catch { /* column already exists */ }
+
+  try {
+    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN state_json TEXT`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
+  } catch { /* column already exists */ }
+  try {
+    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
+  } catch { /* column already exists */ }
+
+  // Add user_id column to tool_audit if it doesn't exist
+  try {
+    db.exec(`ALTER TABLE tool_audit ADD COLUMN user_id TEXT`);
   } catch { /* column already exists */ }
 }
 
@@ -295,10 +317,26 @@ export function setGroupSession(groupFolder: string, sessionId: string): void {
   `).run(groupFolder, sessionId, now);
 }
 
+export function deleteGroupSession(groupFolder: string): void {
+  db.prepare(`DELETE FROM group_sessions WHERE group_folder = ?`).run(groupFolder);
+}
+
+export function pauseTasksForGroup(groupFolder: string): number {
+  const info = db.prepare(`
+    UPDATE scheduled_tasks
+    SET status = 'paused'
+    WHERE group_folder = ? AND status != 'completed'
+  `).run(groupFolder);
+  return info.changes;
+}
+
 export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>): void {
   db.prepare(`
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (
+      id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode,
+      next_run, status, created_at, state_json, retry_count, last_error
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     task.id,
     task.group_folder,
@@ -309,7 +347,10 @@ export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>
     task.context_mode || 'isolated',
     task.next_run,
     task.status,
-    task.created_at
+    task.created_at,
+    task.state_json ?? null,
+    task.retry_count ?? 0,
+    task.last_error ?? null
   );
 }
 
@@ -325,7 +366,7 @@ export function getAllTasks(): ScheduledTask[] {
   return db.prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC').all() as ScheduledTask[];
 }
 
-export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status'>>): void {
+export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status' | 'state_json' | 'retry_count' | 'last_error' | 'context_mode'>>): void {
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -334,6 +375,10 @@ export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'pro
   if (updates.schedule_value !== undefined) { fields.push('schedule_value = ?'); values.push(updates.schedule_value); }
   if (updates.next_run !== undefined) { fields.push('next_run = ?'); values.push(updates.next_run); }
   if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
+  if (updates.context_mode !== undefined) { fields.push('context_mode = ?'); values.push(updates.context_mode); }
+  if (updates.state_json !== undefined) { fields.push('state_json = ?'); values.push(updates.state_json); }
+  if (updates.retry_count !== undefined) { fields.push('retry_count = ?'); values.push(updates.retry_count); }
+  if (updates.last_error !== undefined) { fields.push('last_error = ?'); values.push(updates.last_error); }
 
   if (fields.length === 0) return;
 
@@ -356,13 +401,20 @@ export function getDueTasks(): ScheduledTask[] {
   `).all(now) as ScheduledTask[];
 }
 
-export function updateTaskAfterRun(id: string, nextRun: string | null, lastResult: string): void {
+export function updateTaskAfterRun(
+  id: string,
+  nextRun: string | null,
+  lastResult: string,
+  lastError: string | null,
+  retryCount: number
+): void {
   const now = new Date().toISOString();
   db.prepare(`
     UPDATE scheduled_tasks
-    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+    SET next_run = ?, last_run = ?, last_result = ?, last_error = ?, retry_count = ?,
+        status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
     WHERE id = ?
-  `).run(nextRun, now, lastResult, nextRun, id);
+  `).run(nextRun, now, lastResult, lastError, retryCount, nextRun, id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -386,14 +438,18 @@ export function logToolCalls(params: {
   traceId: string;
   chatJid: string;
   groupFolder: string;
-  toolCalls: Array<{ name: string; ok: boolean; duration_ms?: number; error?: string }>;
+  userId?: string | null;
+  toolCalls: Array<{ name: string; ok: boolean; duration_ms?: number; error?: string; output_bytes?: number; output_truncated?: boolean }>;
   source: string;
 }): void {
   if (!params.toolCalls || params.toolCalls.length === 0) return;
+  if (!dbInitialized) {
+    initDatabase();
+  }
   const now = new Date().toISOString();
   const stmt = db.prepare(`
-    INSERT INTO tool_audit (trace_id, chat_jid, group_folder, tool_name, ok, duration_ms, error, created_at, source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tool_audit (trace_id, chat_jid, group_folder, user_id, tool_name, ok, duration_ms, error, created_at, source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const transaction = db.transaction((calls: typeof params.toolCalls) => {
     for (const call of calls) {
@@ -401,6 +457,7 @@ export function logToolCalls(params: {
         params.traceId,
         params.chatJid,
         params.groupFolder,
+        params.userId || null,
         call.name,
         call.ok ? 1 : 0,
         call.duration_ms ?? null,
@@ -411,4 +468,49 @@ export function logToolCalls(params: {
     }
   });
   transaction(params.toolCalls);
+}
+
+export function getToolUsageCounts(params: {
+  groupFolder: string;
+  userId?: string | null;
+  since: string;
+}): Array<{ tool_name: string; count: number }> {
+  if (!dbInitialized) {
+    initDatabase();
+  }
+  const clauses = ['group_folder = ?', 'created_at >= ?'];
+  const values: unknown[] = [params.groupFolder, params.since];
+  if (params.userId) {
+    clauses.push('user_id = ?');
+    values.push(params.userId);
+  }
+  const rows = db.prepare(`
+    SELECT tool_name, COUNT(*) as count
+    FROM tool_audit
+    WHERE ${clauses.join(' AND ')}
+    GROUP BY tool_name
+  `).all(...values) as Array<{ tool_name: string; count: number }>;
+  return rows;
+}
+
+export function getToolReliability(params: {
+  groupFolder: string;
+  limit?: number;
+}): Array<{ tool_name: string; total: number; ok_count: number; avg_duration_ms: number | null }> {
+  const limit = params.limit && params.limit > 0 ? params.limit : 200;
+  const rows = db.prepare(`
+    SELECT tool_name,
+           COUNT(*) as total,
+           SUM(ok) as ok_count,
+           AVG(duration_ms) as avg_duration_ms
+    FROM (
+      SELECT tool_name, ok, duration_ms
+      FROM tool_audit
+      WHERE group_folder = ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    )
+    GROUP BY tool_name
+  `).all(params.groupFolder, limit) as Array<{ tool_name: string; total: number; ok_count: number; avg_duration_ms: number | null }>;
+  return rows;
 }

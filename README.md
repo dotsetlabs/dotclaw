@@ -40,6 +40,28 @@ Recommended (guided setup):
 npm run bootstrap
 ```
 
+One-click install (Linux/systemd):
+```bash
+./scripts/install.sh
+```
+
+Non-interactive bootstrap (one-click):
+```bash
+DOTCLAW_BOOTSTRAP_NONINTERACTIVE=1 \
+TELEGRAM_BOT_TOKEN=your_bot_token_here \
+OPENROUTER_API_KEY=your_openrouter_api_key \
+DOTCLAW_BOOTSTRAP_CHAT_ID=123456789 \
+OPENROUTER_MODEL=moonshotai/kimi-k2.5 \
+npm run bootstrap
+```
+
+Optional non-interactive settings:
+- `DOTCLAW_BOOTSTRAP_GROUP_NAME` (default `main`)
+- `DOTCLAW_BOOTSTRAP_GROUP_FOLDER` (default `main`)
+- `DOTCLAW_BOOTSTRAP_BUILD` (`true`/`false`, default `true`)
+- `DOTCLAW_BOOTSTRAP_SELF_CHECK` (`true`/`false`, default `true`)
+- `DOTCLAW_MODEL_ALLOWLIST` (comma-separated)
+
 Manual setup:
 
 ### Configuration
@@ -81,6 +103,14 @@ DOTCLAW_MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS=900
 DOTCLAW_MEMORY_MODEL=moonshotai/kimi-k2.5
 DOTCLAW_MEMORY_ARCHIVE_SYNC=true
 DOTCLAW_MEMORY_EXTRACT_SCHEDULED=false
+DOTCLAW_MEMORY_EMBEDDINGS_ENABLED=true
+DOTCLAW_MEMORY_EMBEDDING_MODEL=openai/text-embedding-3-small
+DOTCLAW_MEMORY_EMBEDDING_BATCH_SIZE=8
+DOTCLAW_MEMORY_EMBEDDING_INTERVAL_MS=300000
+DOTCLAW_MEMORY_EMBEDDING_MIN_ITEMS=20
+DOTCLAW_MEMORY_EMBEDDING_MIN_QUERY_CHARS=40
+DOTCLAW_MEMORY_EMBEDDING_MAX_CANDIDATES=2000
+DOTCLAW_MEMORY_EMBEDDING_WEIGHT=0.6
 ```
 
 Optional safety/tool controls:
@@ -88,7 +118,10 @@ Optional safety/tool controls:
 DOTCLAW_ENABLE_BASH=true
 DOTCLAW_ENABLE_WEBSEARCH=true
 DOTCLAW_ENABLE_WEBFETCH=true
-DOTCLAW_MAX_TOOL_STEPS=12
+DOTCLAW_WEBFETCH_BLOCK_PRIVATE=true
+DOTCLAW_MAX_TOOL_STEPS=32
+DOTCLAW_TOOL_OUTPUT_LIMIT_BYTES=1500000
+DOTCLAW_WEBFETCH_MAX_BYTES=1500000
 DOTCLAW_WEBFETCH_ALLOWLIST=example.com,developer.mozilla.org
 DOTCLAW_WEBFETCH_BLOCKLIST=localhost,127.0.0.1
 ```
@@ -101,6 +134,12 @@ DOTCLAW_PLUGIN_DIRS=/workspace/group/plugins,/workspace/global/plugins
 # IPC tuning for memory requests
 DOTCLAW_IPC_REQUEST_TIMEOUT_MS=6000
 DOTCLAW_IPC_REQUEST_POLL_MS=150
+```
+
+Tool budgets (optional per-day caps; enforced before each run):
+```bash
+DOTCLAW_TOOL_BUDGETS_ENABLED=true
+DOTCLAW_TOOL_BUDGETS_PATH=./data/tool-budgets.json
 ```
 
 Optional Docker hardening:
@@ -116,9 +155,37 @@ CONTAINER_RUN_GID=1000
 
 Performance + observability:
 ```bash
-DOTCLAW_CONTAINER_MODE=ephemeral   # or "daemon"
+DOTCLAW_CONTAINER_MODE=daemon   # or "ephemeral"
 DOTCLAW_CONTAINER_DAEMON_POLL_MS=200
+CONTAINER_TIMEOUT=900000
+CONTAINER_MAX_OUTPUT_SIZE=20971520
+DOTCLAW_MAX_CONCURRENT_AGENTS=4
+DOTCLAW_AGENT_QUEUE_TIMEOUT_MS=0
+DOTCLAW_WARM_START=true
 DOTCLAW_METRICS_PORT=3001
+DOTCLAW_TRACE_RETENTION_DAYS=14
+DOTCLAW_MAINTENANCE_INTERVAL_MS=21600000
+DOTCLAW_HEARTBEAT_ENABLED=true
+DOTCLAW_HEARTBEAT_INTERVAL_MS=900000
+DOTCLAW_HEARTBEAT_GROUP=main
+DOTCLAW_TASK_MAX_RETRIES=3
+DOTCLAW_TASK_RETRY_BASE_MS=60000
+DOTCLAW_TASK_RETRY_MAX_MS=3600000
+DOTCLAW_PLANNER_ENABLED=true
+DOTCLAW_PLANNER_MODEL=
+DOTCLAW_PLANNER_MAX_OUTPUT_TOKENS=400
+DOTCLAW_PLANNER_TEMPERATURE=0.2
+DOTCLAW_PROGRESS_ENABLED=true
+DOTCLAW_PROGRESS_INITIAL_MS=30000
+DOTCLAW_PROGRESS_INTERVAL_MS=60000
+DOTCLAW_PROGRESS_MAX_UPDATES=3
+DOTCLAW_PROGRESS_MESSAGES="Working on it.|Still working.|Almost there."
+```
+
+Behavior config (optional):
+```bash
+DOTCLAW_BEHAVIOR_CONFIG_PATH=~/.config/dotclaw/behavior.json
+DOTCLAW_PERSONALIZATION_CACHE_MS=300000
 ```
 
 Autotune:
@@ -168,6 +235,24 @@ Example entry:
 ```
 
 4. Build and run:
+
+### Telegram Admin Commands
+
+Use these from your main (admin) chat:
+
+- `/dotclaw help`
+- `/dotclaw groups`
+- `/dotclaw add-group <chat_id> <name> [folder]`
+- `/dotclaw remove-group <chat_id|name|folder>`
+- `/dotclaw set-model <model> [global|group|user] [target_id]`
+- `/dotclaw remember <fact>`
+
+User preference shortcuts (any chat):
+
+- `/dotclaw style <concise|balanced|detailed>`
+- `/dotclaw tools <conservative|balanced|proactive>`
+- `/dotclaw caution <low|balanced|high>`
+- `/dotclaw memory <strict|balanced|loose>`
 
 ```bash
 npm run build

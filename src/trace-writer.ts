@@ -15,16 +15,27 @@ export type TraceRecord = {
   prompt_pack_versions?: Record<string, string>;
   memory_summary?: string;
   memory_facts?: string[];
+  memory_recall?: string[];
+  session_recall?: string[];
   tool_calls?: Array<{
     name: string;
     args?: unknown;
     ok: boolean;
     duration_ms?: number;
     error?: string;
+    output_bytes?: number;
+    output_truncated?: boolean;
   }>;
   latency_ms?: number;
   tokens_prompt?: number;
   tokens_completion?: number;
+  cost_prompt_usd?: number;
+  cost_completion_usd?: number;
+  cost_total_usd?: number;
+  memory_recall_count?: number;
+  session_recall_count?: number;
+  memory_items_upserted?: number;
+  memory_items_extracted?: number;
   error_code?: string;
   source?: string;
 };

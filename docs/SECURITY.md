@@ -94,6 +94,15 @@ const allowedPrefixes = ['DOTCLAW_'];
 
 > **Note:** OpenRouter and Brave credentials are mounted so the agent can authenticate. This means the agent can discover these credentials via Bash or file operations. Further isolation would require external secret management.
 
+### 6. Outbound Network Guardrails
+
+By default `WebFetch` blocks private and local network targets to reduce SSRF risk.  
+You can override with:
+```bash
+DOTCLAW_WEBFETCH_BLOCK_PRIVATE=false
+```
+Allow/deny lists remain supported via `DOTCLAW_WEBFETCH_ALLOWLIST` and `DOTCLAW_WEBFETCH_BLOCKLIST`.
+
 ## Privilege Comparison
 
 | Capability | Main Group | Non-Main Group |

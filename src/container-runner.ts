@@ -47,6 +47,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  taskId?: string;
   userId?: string;
   userName?: string;
   memoryRecall?: string[];
@@ -57,6 +58,17 @@ export interface ContainerInput {
     group: number;
     global: number;
   };
+  tokenEstimate?: {
+    tokens_per_char: number;
+    tokens_per_message: number;
+    tokens_per_request: number;
+  };
+  toolReliability?: Array<{
+    name: string;
+    success_rate: number;
+    count: number;
+    avg_duration_ms: number | null;
+  }>;
   behaviorConfig?: Record<string, unknown>;
   toolPolicy?: Record<string, unknown>;
   modelOverride?: string;
@@ -74,12 +86,20 @@ export interface ContainerOutput {
   prompt_pack_versions?: Record<string, string>;
   memory_summary?: string;
   memory_facts?: string[];
+  tokens_prompt?: number;
+  tokens_completion?: number;
+  memory_recall_count?: number;
+  session_recall_count?: number;
+  memory_items_upserted?: number;
+  memory_items_extracted?: number;
   tool_calls?: Array<{
     name: string;
     args?: unknown;
     ok: boolean;
     duration_ms?: number;
     error?: string;
+    output_bytes?: number;
+    output_truncated?: boolean;
   }>;
   latency_ms?: number;
 }
@@ -413,6 +433,12 @@ function ensureDaemonContainer(mounts: VolumeMount[], groupFolder: string): void
     logger.error({ groupFolder, status: result.status }, 'Failed to start daemon container');
     throw new Error(`Failed to start daemon container for ${groupFolder}`);
   }
+}
+
+export function warmGroupContainer(group: RegisteredGroup, isMain: boolean): void {
+  if (CONTAINER_MODE !== 'daemon') return;
+  const mounts = buildVolumeMounts(group, isMain);
+  ensureDaemonContainer(mounts, group.folder);
 }
 
 function writeAgentRequest(groupFolder: string, payload: object): { id: string; requestPath: string; responsePath: string } {
@@ -752,6 +778,9 @@ export function writeTasksSnapshot(
     schedule_value: string;
     status: string;
     next_run: string | null;
+    state_json?: string | null;
+    retry_count?: number | null;
+    last_error?: string | null;
   }>
 ): void {
   // Write filtered tasks to the group's IPC directory

@@ -14,11 +14,14 @@ export type MemoryType =
   | 'task'
   | 'note'
   | 'archive';
+export type MemoryKind = 'semantic' | 'episodic' | 'procedural' | 'preference';
 
 export interface MemoryItemInput {
   scope: MemoryScope;
   subject_id?: string | null;
   type: MemoryType;
+  kind?: MemoryKind;
+  conflict_key?: string | null;
   content: string;
   importance?: number;
   confidence?: number;
@@ -39,6 +42,9 @@ export interface MemoryItem extends MemoryItemInput {
   updated_at: string;
   last_accessed_at: string | null;
   expires_at: string | null;
+  embedding_json?: string | null;
+  embedding_model?: string | null;
+  embedding_updated_at?: string | null;
 }
 
 export interface MemorySearchResult extends MemoryItem {
@@ -46,10 +52,25 @@ export interface MemorySearchResult extends MemoryItem {
   score: number;
 }
 
+export interface PreferenceMemory {
+  conflict_key: string;
+  content: string;
+  tags: string[];
+  metadata: Record<string, unknown> | null;
+  scope: MemoryScope;
+  subject_id?: string | null;
+  updated_at: string;
+  importance: number;
+}
+
 const MEMORY_DB_PATH = path.join(STORE_DIR, 'memory.db');
 let memoryDb: Database.Database | null = null;
+let ftsEnabled = true;
 
 function getDb(): Database.Database {
+  if (!memoryDb) {
+    initMemoryStore();
+  }
   if (!memoryDb) {
     throw new Error('Memory store is not initialized');
   }
@@ -57,6 +78,7 @@ function getDb(): Database.Database {
 }
 
 export function initMemoryStore(): void {
+  if (memoryDb) return;
   fs.mkdirSync(STORE_DIR, { recursive: true });
   memoryDb = new Database(MEMORY_DB_PATH);
   memoryDb.pragma('journal_mode = WAL');
@@ -69,6 +91,8 @@ export function initMemoryStore(): void {
       scope TEXT NOT NULL,
       subject_id TEXT,
       type TEXT NOT NULL,
+      kind TEXT,
+      conflict_key TEXT,
       content TEXT NOT NULL,
       normalized TEXT NOT NULL,
       importance REAL NOT NULL,
@@ -80,30 +104,14 @@ export function initMemoryStore(): void {
       last_accessed_at TEXT,
       expires_at TEXT,
       source TEXT,
-      metadata_json TEXT
+      metadata_json TEXT,
+      embedding_json TEXT,
+      embedding_model TEXT,
+      embedding_updated_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_memory_group_scope ON memory_items(group_folder, scope, subject_id);
     CREATE INDEX IF NOT EXISTS idx_memory_updated_at ON memory_items(updated_at);
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-      id,
-      content,
-      tags,
-      tokenize = 'porter'
-    );
-
-    CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
-      INSERT INTO memory_fts (id, content, tags)
-      VALUES (new.id, new.content, new.tags_text);
-    END;
-    CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items BEGIN
-      UPDATE memory_fts
-      SET content = new.content, tags = new.tags_text
-      WHERE id = new.id;
-    END;
-    CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
-      DELETE FROM memory_fts WHERE id = old.id;
-    END;
+    CREATE INDEX IF NOT EXISTS idx_memory_conflict ON memory_items(group_folder, scope, subject_id, type, conflict_key);
 
     CREATE TABLE IF NOT EXISTS memory_sources (
       id TEXT PRIMARY KEY,
@@ -115,6 +123,50 @@ export function initMemoryStore(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_memory_sources_group ON memory_sources(group_folder, source_type);
   `);
+
+  try {
+    memoryDb.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+        id,
+        content,
+        tags,
+        tokenize = 'porter'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
+        INSERT INTO memory_fts (id, content, tags)
+        VALUES (new.id, new.content, new.tags_text);
+      END;
+      CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items BEGIN
+        UPDATE memory_fts
+        SET content = new.content, tags = new.tags_text
+        WHERE id = new.id;
+      END;
+      CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
+        DELETE FROM memory_fts WHERE id = old.id;
+      END;
+    `);
+    ftsEnabled = true;
+  } catch {
+    ftsEnabled = false;
+  }
+
+  // Migrate existing DBs to include embedding columns.
+  try {
+    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN embedding_json TEXT`);
+  } catch { /* already exists */ }
+  try {
+    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN embedding_model TEXT`);
+  } catch { /* already exists */ }
+  try {
+    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN embedding_updated_at TEXT`);
+  } catch { /* already exists */ }
+  try {
+    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN kind TEXT`);
+  } catch { /* already exists */ }
+  try {
+    memoryDb.exec(`ALTER TABLE memory_items ADD COLUMN conflict_key TEXT`);
+  } catch { /* already exists */ }
 }
 
 function normalizeContent(content: string): string {
@@ -151,6 +203,48 @@ function resolveScope(input: MemoryItemInput, groupFolder: string): MemoryScope 
   return input.scope;
 }
 
+function resolveKind(input: MemoryItemInput): MemoryKind {
+  if (input.kind === 'semantic' || input.kind === 'episodic' || input.kind === 'procedural' || input.kind === 'preference') {
+    return input.kind;
+  }
+  if (input.type === 'preference') return 'preference';
+  if (input.type === 'task' || input.type === 'project') return 'procedural';
+  if (input.type === 'archive') return 'episodic';
+  return 'semantic';
+}
+
+function normalizeConflictKey(value?: string | null): string | null {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed ? trimmed : null;
+}
+
+function parseJsonArray(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is string => typeof item === 'string');
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return [];
+}
+
+function parseJsonRecord(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
+
 export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[], source: string): MemoryItem[] {
   if (items.length === 0) return [];
   const db = getDb();
@@ -158,23 +252,31 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
   const results: MemoryItem[] = [];
 
   const selectStmt = db.prepare(`
-    SELECT id, content, importance, confidence, tags_json, tags_text
+    SELECT id, content, importance, confidence, tags_json, tags_text, embedding_json, embedding_model, embedding_updated_at, kind, conflict_key
     FROM memory_items
     WHERE group_folder = ? AND scope = ? AND IFNULL(subject_id, '') = ? AND type = ? AND normalized = ?
   `);
 
+  const deleteConflictStmt = db.prepare(`
+    DELETE FROM memory_items
+    WHERE group_folder = ? AND scope = ? AND IFNULL(subject_id, '') = ? AND type = ? AND conflict_key = ?
+  `);
+
   const insertStmt = db.prepare(`
     INSERT INTO memory_items (
-      id, group_folder, scope, subject_id, type, content, normalized,
+      id, group_folder, scope, subject_id, type, kind, conflict_key, content, normalized,
       importance, confidence, tags_json, tags_text, created_at, updated_at,
-      last_accessed_at, expires_at, source, metadata_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      last_accessed_at, expires_at, source, metadata_json,
+      embedding_json, embedding_model, embedding_updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const updateStmt = db.prepare(`
     UPDATE memory_items
     SET content = ?, importance = ?, confidence = ?, tags_json = ?, tags_text = ?,
-        updated_at = ?, expires_at = ?, source = ?, metadata_json = ?
+        updated_at = ?, expires_at = ?, source = ?, metadata_json = ?,
+        embedding_json = ?, embedding_model = ?, embedding_updated_at = ?,
+        kind = ?, conflict_key = ?
     WHERE id = ?
   `);
 
@@ -184,6 +286,8 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
       const normalized = normalizeContent(item.content);
       if (!normalized) continue;
       const scope = resolveScope(item, groupFolder);
+      const kind = resolveKind(item);
+      const conflictKey = normalizeConflictKey(item.conflict_key);
       const subjectId = scope === 'user' ? (item.subject_id || null) : null;
       const importance = clamp(item.importance ?? 0.5, 0, 1);
       const confidence = clamp(item.confidence ?? 0.6, 0, 1);
@@ -192,19 +296,43 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
       const expiresAt = getExpiresAt(item.ttl_days ?? null);
       const metadataJson = item.metadata ? JSON.stringify(item.metadata) : null;
 
+      if (conflictKey) {
+        deleteConflictStmt.run(
+          groupFolder,
+          scope,
+          subjectId || '',
+          item.type,
+          conflictKey
+        );
+      }
+
       const existing = selectStmt.get(
         groupFolder,
         scope,
         subjectId || '',
         item.type,
         normalized
-      ) as { id: string; content: string; importance: number; confidence: number; tags_json: string | null; tags_text: string | null } | undefined;
+      ) as {
+        id: string;
+        content: string;
+        importance: number;
+        confidence: number;
+        tags_json: string | null;
+        tags_text: string | null;
+        embedding_json: string | null;
+        embedding_model: string | null;
+        embedding_updated_at: string | null;
+      } | undefined;
 
       if (existing) {
         const mergedImportance = Math.max(existing.importance, importance);
         const mergedConfidence = Math.max(existing.confidence, confidence);
         const mergedContent = existing.content.length >= item.content.length ? existing.content : item.content;
         const mergedTags = Array.from(new Set([...(existing.tags_text || '').split(' ').filter(Boolean), ...tagsText.split(' ').filter(Boolean)])).join(' ');
+        const contentChanged = mergedContent !== existing.content;
+        const nextEmbeddingJson = contentChanged ? null : existing.embedding_json;
+        const nextEmbeddingModel = contentChanged ? null : existing.embedding_model;
+        const nextEmbeddingUpdatedAt = contentChanged ? null : existing.embedding_updated_at;
         updateStmt.run(
           mergedContent,
           mergedImportance,
@@ -215,6 +343,11 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
           expiresAt,
           item.source || source,
           metadataJson,
+          nextEmbeddingJson,
+          nextEmbeddingModel,
+          nextEmbeddingUpdatedAt,
+          kind,
+          conflictKey,
           existing.id
         );
         results.push({
@@ -223,6 +356,8 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
           scope,
           subject_id: subjectId,
           type: item.type,
+          kind,
+          conflict_key: conflictKey,
           content: mergedContent,
           normalized,
           importance: mergedImportance,
@@ -235,7 +370,10 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
           expires_at: expiresAt,
           ttl_days: item.ttl_days,
           source: item.source || source,
-          metadata: item.metadata
+          metadata: item.metadata,
+          embedding_json: nextEmbeddingJson,
+          embedding_model: nextEmbeddingModel,
+          embedding_updated_at: nextEmbeddingUpdatedAt
         });
         continue;
       }
@@ -247,6 +385,8 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
         scope,
         subjectId,
         item.type,
+        kind,
+        conflictKey,
         item.content,
         normalized,
         importance,
@@ -258,7 +398,10 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
         null,
         expiresAt,
         item.source || source,
-        metadataJson
+        metadataJson,
+        null,
+        null,
+        null
       );
 
       results.push({
@@ -267,6 +410,8 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
         scope,
         subject_id: subjectId,
         type: item.type,
+        kind,
+        conflict_key: conflictKey,
         content: item.content,
         normalized,
         importance,
@@ -279,7 +424,10 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
         expires_at: expiresAt,
         ttl_days: item.ttl_days,
         source: item.source || source,
-        metadata: item.metadata
+        metadata: item.metadata,
+        embedding_json: null,
+        embedding_model: null,
+        embedding_updated_at: null
       });
     }
   });
@@ -302,6 +450,9 @@ export function searchMemories(params: {
   limit?: number;
 }): MemorySearchResult[] {
   const db = getDb();
+  if (!ftsEnabled) {
+    return searchMemoriesFallback(params);
+  }
   const ftsQuery = buildFtsQuery(params.query);
   if (!ftsQuery) return [];
 
@@ -326,6 +477,57 @@ export function searchMemories(params: {
     const bm25Score = 1 / (1 + (row.bm25 || 0));
     const score = (bm25Score * 0.55) + (row.importance * 0.3) + (recency * 0.15);
     return { ...row, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored;
+}
+
+function searchMemoriesFallback(params: {
+  groupFolder: string;
+  userId?: string | null;
+  query: string;
+  limit?: number;
+}): MemorySearchResult[] {
+  const db = getDb();
+  const normalizedQuery = normalizeContent(params.query);
+  const tokens = normalizedQuery.split(' ').filter(Boolean).slice(0, 10);
+  if (tokens.length === 0) return [];
+
+  const clauses = tokens.map(() => '(m.normalized LIKE ? OR m.tags_text LIKE ?)');
+  const values: unknown[] = [];
+  for (const token of tokens) {
+    const pattern = `%${token}%`;
+    values.push(pattern, pattern);
+  }
+
+  const now = new Date().toISOString();
+  const limit = Math.min(params.limit || 12, 50);
+  const rows = db.prepare(`
+    SELECT m.*
+    FROM memory_items m
+    WHERE ${clauses.join(' AND ')}
+      AND (m.group_folder = ? OR m.group_folder = 'global')
+      AND (m.scope != 'user' OR m.subject_id = ?)
+      AND (m.expires_at IS NULL OR m.expires_at > ?)
+    ORDER BY m.updated_at DESC
+    LIMIT ?
+  `).all(...values, params.groupFolder, params.userId || '', now, limit) as Array<MemorySearchResult>;
+
+  const scored = rows.map(row => {
+    const normalized = row.normalized || '';
+    const tagsText = row.tags_text || '';
+    let matches = 0;
+    for (const token of tokens) {
+      if (normalized.includes(token) || tagsText.includes(token)) {
+        matches += 1;
+      }
+    }
+    const matchScore = tokens.length > 0 ? matches / tokens.length : 0;
+    const ageDays = row.updated_at ? (Date.now() - new Date(row.updated_at).getTime()) / (1000 * 60 * 60 * 24) : 365;
+    const recency = Math.exp(-ageDays / 30);
+    const score = (matchScore * 0.5) + (row.importance * 0.3) + (recency * 0.2);
+    return { ...row, bm25: 0, score };
   });
 
   scored.sort((a, b) => b.score - a.score);
@@ -482,4 +684,121 @@ export function buildMemoryRecall(params: {
   }
 
   return recall;
+}
+
+export function listMemoriesMissingEmbeddings(params: {
+  groupFolder?: string;
+  limit?: number;
+}): Array<{ id: string; content: string; group_folder: string }> {
+  const db = getDb();
+  const limit = Math.min(params.limit || 100, 1000);
+  if (params.groupFolder) {
+    return db.prepare(`
+      SELECT id, content, group_folder
+      FROM memory_items
+      WHERE group_folder = ?
+        AND content IS NOT NULL
+        AND (embedding_json IS NULL OR embedding_json = '')
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(params.groupFolder, limit) as Array<{ id: string; content: string; group_folder: string }>;
+  }
+  return db.prepare(`
+    SELECT id, content, group_folder
+    FROM memory_items
+    WHERE content IS NOT NULL
+      AND (embedding_json IS NULL OR embedding_json = '')
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(limit) as Array<{ id: string; content: string; group_folder: string }>;
+}
+
+export function updateMemoryEmbedding(params: {
+  id: string;
+  embedding: number[];
+  model: string;
+}): void {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const embeddingJson = JSON.stringify(params.embedding);
+  db.prepare(`
+    UPDATE memory_items
+    SET embedding_json = ?, embedding_model = ?, embedding_updated_at = ?
+    WHERE id = ?
+  `).run(embeddingJson, params.model, now, params.id);
+}
+
+export function listEmbeddedMemories(params: {
+  groupFolder: string;
+  userId?: string | null;
+  limit?: number;
+}): Array<{ id: string; content: string; type: MemoryType; importance: number; updated_at: string; embedding_json: string }> {
+  const db = getDb();
+  const limit = Math.min(params.limit || 2000, 5000);
+  const now = new Date().toISOString();
+  return db.prepare(`
+    SELECT id, content, type, importance, updated_at, embedding_json
+    FROM memory_items
+    WHERE (group_folder = ? OR group_folder = 'global')
+      AND (scope != 'user' OR subject_id = ?)
+      AND (expires_at IS NULL OR expires_at > ?)
+      AND embedding_json IS NOT NULL
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(params.groupFolder, params.userId || '', now, limit) as Array<{ id: string; content: string; type: MemoryType; importance: number; updated_at: string; embedding_json: string }>;
+}
+
+export function listPreferenceMemories(params: {
+  groupFolder: string;
+  userId?: string | null;
+  limit?: number;
+}): PreferenceMemory[] {
+  const db = getDb();
+  const limit = Math.min(params.limit || 50, 200);
+  if (params.userId) {
+    const rows = db.prepare(`
+      SELECT conflict_key, content, tags_json, metadata_json, scope, subject_id, updated_at, importance
+      FROM memory_items
+      WHERE (group_folder = ? OR group_folder = 'global')
+        AND type = 'preference'
+        AND conflict_key IS NOT NULL
+        AND (
+          (scope = 'user' AND subject_id = ?)
+          OR scope = 'group'
+          OR scope = 'global'
+        )
+      ORDER BY updated_at DESC
+      LIMIT ?
+    `).all(params.groupFolder, params.userId, limit) as Array<Record<string, unknown>>;
+    return rows.map(row => ({
+      conflict_key: String(row.conflict_key),
+      content: row.content ? String(row.content) : '',
+      tags: parseJsonArray(row.tags_json ? String(row.tags_json) : null),
+      metadata: parseJsonRecord(row.metadata_json ? String(row.metadata_json) : null),
+      scope: row.scope === 'user' || row.scope === 'group' || row.scope === 'global' ? row.scope : 'group',
+      subject_id: row.subject_id ? String(row.subject_id) : null,
+      updated_at: row.updated_at ? String(row.updated_at) : new Date(0).toISOString(),
+      importance: typeof row.importance === 'number' ? row.importance : Number(row.importance || 0)
+    }));
+  }
+  const rows = db.prepare(`
+    SELECT conflict_key, content, tags_json, metadata_json, scope, subject_id, updated_at, importance
+    FROM memory_items
+    WHERE (group_folder = ? OR group_folder = 'global')
+      AND type = 'preference'
+      AND conflict_key IS NOT NULL
+      AND (scope = 'group' OR scope = 'global')
+    ORDER BY updated_at DESC
+    LIMIT ?
+  `).all(params.groupFolder, limit) as Array<Record<string, unknown>>;
+  return rows.map(row => ({
+    conflict_key: String(row.conflict_key),
+    content: row.content ? String(row.content) : '',
+    tags: parseJsonArray(row.tags_json ? String(row.tags_json) : null),
+    metadata: parseJsonRecord(row.metadata_json ? String(row.metadata_json) : null),
+    scope: row.scope === 'user' || row.scope === 'group' || row.scope === 'global' ? row.scope : 'group',
+    subject_id: row.subject_id ? String(row.subject_id) : null,
+    updated_at: row.updated_at ? String(row.updated_at) : new Date(0).toISOString(),
+    importance: typeof row.importance === 'number' ? row.importance : Number(row.importance || 0)
+  }));
 }

@@ -65,6 +65,9 @@ export interface ScheduledTask {
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
+  state_json?: string | null;
+  retry_count?: number | null;
+  last_error?: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
 }
@@ -84,4 +87,10 @@ export interface ToolCallRecord {
   ok: boolean;
   duration_ms?: number;
   error?: string;
+}
+
+export interface TokenEstimateConfig {
+  tokens_per_char: number;
+  tokens_per_message: number;
+  tokens_per_request: number;
 }

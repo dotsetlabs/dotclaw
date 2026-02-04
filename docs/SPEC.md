@@ -180,7 +180,7 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
 // Container configuration
 export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'dotclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '300000', 10);
+export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '900000', 10);
 export const IPC_POLL_INTERVAL = 1000;
 
 ```
@@ -244,6 +244,38 @@ DOTCLAW_SUMMARY_MAX_OUTPUT_TOKENS=1200
 DOTCLAW_SUMMARY_MODEL=moonshotai/kimi-k2.5
 ```
 
+Memory embeddings (optional, local-only storage):
+```bash
+DOTCLAW_MEMORY_EMBEDDINGS_ENABLED=true
+DOTCLAW_MEMORY_EMBEDDING_MODEL=openai/text-embedding-3-small
+DOTCLAW_MEMORY_EMBEDDING_BATCH_SIZE=8
+DOTCLAW_MEMORY_EMBEDDING_INTERVAL_MS=300000
+DOTCLAW_MEMORY_EMBEDDING_MIN_ITEMS=20
+DOTCLAW_MEMORY_EMBEDDING_MIN_QUERY_CHARS=40
+DOTCLAW_MEMORY_EMBEDDING_MAX_CANDIDATES=2000
+DOTCLAW_MEMORY_EMBEDDING_WEIGHT=0.6
+```
+
+### Prompt Packs (Autotune)
+
+Autotune writes prompt packs to `~/.config/dotclaw/prompts`:
+
+- `task-extraction.json`
+- `response-quality.json`
+- `tool-calling.json`
+- `tool-outcome.json`
+- `memory-policy.json`
+- `memory-recall.json`
+
+Canary packs are stored as:
+
+- `task-extraction.canary.json`
+- `response-quality.canary.json`
+- `tool-calling.canary.json`
+- `tool-outcome.canary.json`
+- `memory-policy.canary.json`
+- `memory-recall.canary.json`
+
 ### Model Configuration
 
 The active model is stored in `data/model.json`:
@@ -283,6 +315,7 @@ Tool toggles:
 DOTCLAW_ENABLE_BASH=true
 DOTCLAW_ENABLE_WEBSEARCH=true
 DOTCLAW_ENABLE_WEBFETCH=true
+DOTCLAW_WEBFETCH_BLOCK_PRIVATE=true
 DOTCLAW_WEBFETCH_ALLOWLIST=example.com,developer.mozilla.org
 DOTCLAW_WEBFETCH_BLOCKLIST=localhost,127.0.0.1
 ```
@@ -449,11 +482,21 @@ This allows the agent to understand the conversation context even if it wasn't m
 | `@Assistant remember [fact]` | `@dotclaw_bot remember I prefer dark mode` | Add to global memory |
 | `@Assistant set model [model_id]` | `@dotclaw_bot set model moonshotai/kimi-k2.5` | Switch OpenRouter model (main only) |
 
+DotClaw also supports explicit slash commands:
+
+- `/dotclaw help`
+- `/dotclaw groups`
+- `/dotclaw add-group <chat_id> <name> [folder]`
+- `/dotclaw remove-group <chat_id|name|folder>`
+- `/dotclaw set-model <model> [global|group|user] [target_id]`
+- `/dotclaw remember <fact>`
+
 ---
 
 ## Scheduled Tasks
 
 DotClaw has a built-in scheduler that runs tasks as full agents in their group's context.
+It supports persistent task state (`state_json`) and automatic retries with exponential backoff.
 
 ### How Scheduling Works
 

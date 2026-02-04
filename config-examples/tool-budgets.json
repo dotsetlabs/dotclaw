@@ -1,0 +1,23 @@
+{
+  "default": {
+    "per_day": {
+      "WebSearch": 50,
+      "WebFetch": 50,
+      "Bash": 20
+    }
+  },
+  "groups": {
+    "main": {
+      "per_day": {
+        "Bash": 40
+      }
+    }
+  },
+  "users": {
+    "123456789": {
+      "per_day": {
+        "WebFetch": 10
+      }
+    }
+  }
+}
