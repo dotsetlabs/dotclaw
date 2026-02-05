@@ -6,6 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
+import { generateId } from './id.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -27,7 +28,7 @@ export interface IpcConfig {
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
 
-  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const filename = `${generateId('')}.json`;
   const filepath = path.join(dir, filename);
 
   const tempPath = `${filepath}.tmp`;
@@ -50,7 +51,7 @@ async function requestResponse(
   fs.mkdirSync(REQUESTS_DIR, { recursive: true });
   fs.mkdirSync(RESPONSES_DIR, { recursive: true });
 
-  const id = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = generateId('req');
   writeIpcFile(REQUESTS_DIR, {
     id,
     type,
@@ -92,19 +93,6 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       const filename = writeIpcFile(MESSAGES_DIR, data);
       return { ok: true, id: filename };
     },
-    async sendDraft(text: string, draftId: number) {
-      const data = {
-        type: 'message_draft',
-        chatJid,
-        text,
-        draftId,
-        groupFolder,
-        timestamp: new Date().toISOString()
-      };
-      const filename = writeIpcFile(MESSAGES_DIR, data);
-      return { ok: true, id: filename };
-    },
-
     async scheduleTask(args: {
       prompt: string;
       schedule_type: 'cron' | 'interval' | 'once';

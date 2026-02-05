@@ -479,8 +479,8 @@ function loadPluginConfigs(dirs: string[]): PluginConfig[] {
         const raw = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf-8'));
         const parsed = PLUGIN_SCHEMA.parse(raw);
         configs.push(parsed);
-      } catch {
-        // ignore malformed plugin
+      } catch (err) {
+        console.error(`[agent-runner] Malformed plugin config ${path.join(dir, file)}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
@@ -798,8 +798,9 @@ async function summarizeToolOutput(payload: ToolSummaryPayload, runtime: ToolRun
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        max_tokens: runtime.toolSummary.maxOutputTokens,
-        temperature: 0.2
+        max_completion_tokens: runtime.toolSummary.maxOutputTokens,
+        temperature: 0.2,
+        reasoning_effort: 'low'
       }),
       signal: controller.signal
     });
@@ -1016,7 +1017,7 @@ export function createTools(
     }),
     execute: wrapExecute('Python', async ({ code, timeoutMs }: { code: string; timeoutMs?: number }) => {
       // Write code to a temp file and execute it
-      const tempFile = `/tmp/script_${Date.now()}_${Math.random().toString(36).slice(2)}.py`;
+      const tempFile = path.join(WORKSPACE_GROUP, `.tmp_script_${Date.now()}_${Math.random().toString(36).slice(2)}.py`);
       fs.writeFileSync(tempFile, code);
       try {
         const result = await runCommand(`python3 ${tempFile}`, timeoutMs || 30000, runtime.bashOutputLimitBytes);

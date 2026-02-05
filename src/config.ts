@@ -60,3 +60,4 @@ export const AGENT_QUEUE_TIMEOUT_MS = runtime.host.concurrency.queueTimeoutMs;
 export const WARM_START_ENABLED = runtime.host.concurrency.warmStart;
 export const TRACE_RETENTION_DAYS = runtime.host.trace.retentionDays;
 export const MAINTENANCE_INTERVAL_MS = runtime.host.maintenance.intervalMs;
+export const BATCH_WINDOW_MS = runtime.host.messageQueue.batchWindowMs;

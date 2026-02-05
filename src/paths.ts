@@ -13,8 +13,9 @@
  * │   ├── tool-policy.json
  * │   └── tool-budgets.json
  * ├── data/             # Runtime data (databases, sessions, IPC)
- * │   ├── messages.db
- * │   ├── memory.db
+ * │   ├── store/
+ * │   │   ├── messages.db
+ * │   │   └── memory.db
  * │   ├── registered_groups.json
  * │   ├── sessions/
  * │   └── ipc/
@@ -23,6 +24,7 @@
  * │   └── global/
  * ├── logs/             # Log files
  * ├── traces/           # Trace files for autotune
+ * ├── prompts/          # Prompt packs for autotune
  * └── .env              # Environment secrets
  */
 

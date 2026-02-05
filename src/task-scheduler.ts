@@ -369,10 +369,14 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
 }
 
 
+let schedulerStopped = false;
+
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
+  schedulerStopped = false;
   logger.info('Scheduler loop started');
 
   const loop = async () => {
+    if (schedulerStopped) return;
     try {
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
@@ -392,8 +396,14 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       logger.error({ err }, 'Error in scheduler loop');
     }
 
-    setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    if (!schedulerStopped) {
+      setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    }
   };
 
   loop();
+}
+
+export function stopSchedulerLoop(): void {
+  schedulerStopped = true;
 }

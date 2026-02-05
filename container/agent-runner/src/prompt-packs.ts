@@ -61,36 +61,6 @@ function getCanaryRate(pack: PromptPack, fallbackRate: number): number {
   return clampRate(fallbackRate);
 }
 
-export function loadPromptPack(params: {
-  behavior: string;
-  groupDir: string;
-  globalDir?: string;
-  extraDirs?: string[];
-}): PromptPackLoadResult | null {
-  const filenames = [`${params.behavior}.json`];
-  const searchDirs: Array<{ dir: string; source: PromptPackSource }> = [
-    { dir: path.join(params.groupDir, 'prompts'), source: 'group' }
-  ];
-  if (params.extraDirs) {
-    for (const extraDir of params.extraDirs) {
-      searchDirs.push({ dir: extraDir, source: 'global' });
-    }
-  }
-  if (params.globalDir) {
-    searchDirs.push({ dir: path.join(params.globalDir, 'prompts'), source: 'global' });
-  }
-
-  for (const { dir, source } of searchDirs) {
-    for (const filename of filenames) {
-      const filePath = path.join(dir, filename);
-      const pack = readPromptPack(filePath, params.behavior);
-      if (pack) return { pack, source };
-    }
-  }
-
-  return null;
-}
-
 export function loadPromptPackWithCanary(params: {
   behavior: string;
   groupDir: string;
@@ -129,11 +99,13 @@ export function loadPromptPackWithCanary(params: {
   return null;
 }
 
-export function formatTaskExtractionPack(params: {
+export function formatPromptPack(params: {
+  label: string;
   pack: PromptPack;
   maxDemos: number;
   maxChars: number;
 }): string {
+  const header = `${params.label} (Autotune):`;
   const instructions = params.pack.instructions.trim();
   const demos = params.pack.demos.slice(0, params.maxDemos);
 
@@ -143,190 +115,14 @@ export function formatTaskExtractionPack(params: {
   });
 
   const block = [
-    'Task Extraction Guidelines (Autotune):',
+    header,
     instructions,
     demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
   ].filter(Boolean).join('\n\n');
 
   if (block.length <= params.maxChars) return block;
 
-  // Truncate demos if block exceeds max size
-  let trimmed = ['Task Extraction Guidelines (Autotune):', instructions].join('\n\n');
-  if (trimmed.length > params.maxChars) {
-    return trimmed.slice(0, params.maxChars);
-  }
-
-  for (const demo of demoLines) {
-    const candidate = `${trimmed}\n\nExamples:\n${demo}`;
-    if (candidate.length > params.maxChars) break;
-    trimmed = candidate;
-  }
-
-  return trimmed;
-}
-
-export function formatResponseQualityPack(params: {
-  pack: PromptPack;
-  maxDemos: number;
-  maxChars: number;
-}): string {
-  const instructions = params.pack.instructions.trim();
-  const demos = params.pack.demos.slice(0, params.maxDemos);
-
-  const demoLines = demos.map((demo) => {
-    const output = demo.output === null ? 'null' : JSON.stringify(demo.output);
-    return `Input: ${demo.input}\nOutput: ${output}`;
-  });
-
-  const block = [
-    'Response Quality Guidelines (Autotune):',
-    instructions,
-    demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
-  ].filter(Boolean).join('\n\n');
-
-  if (block.length <= params.maxChars) return block;
-
-  let trimmed = ['Response Quality Guidelines (Autotune):', instructions].join('\n\n');
-  if (trimmed.length > params.maxChars) {
-    return trimmed.slice(0, params.maxChars);
-  }
-
-  for (const demo of demoLines) {
-    const candidate = `${trimmed}\n\nExamples:\n${demo}`;
-    if (candidate.length > params.maxChars) break;
-    trimmed = candidate;
-  }
-
-  return trimmed;
-}
-
-export function formatToolCallingPack(params: {
-  pack: PromptPack;
-  maxDemos: number;
-  maxChars: number;
-}): string {
-  const instructions = params.pack.instructions.trim();
-  const demos = params.pack.demos.slice(0, params.maxDemos);
-
-  const demoLines = demos.map((demo) => {
-    const output = demo.output === null ? 'null' : JSON.stringify(demo.output);
-    return `Input: ${demo.input}\nOutput: ${output}`;
-  });
-
-  const block = [
-    'Tool Calling Guidelines (Autotune):',
-    instructions,
-    demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
-  ].filter(Boolean).join('\n\n');
-
-  if (block.length <= params.maxChars) return block;
-
-  let trimmed = ['Tool Calling Guidelines (Autotune):', instructions].join('\n\n');
-  if (trimmed.length > params.maxChars) {
-    return trimmed.slice(0, params.maxChars);
-  }
-
-  for (const demo of demoLines) {
-    const candidate = `${trimmed}\n\nExamples:\n${demo}`;
-    if (candidate.length > params.maxChars) break;
-    trimmed = candidate;
-  }
-
-  return trimmed;
-}
-
-export function formatToolOutcomePack(params: {
-  pack: PromptPack;
-  maxDemos: number;
-  maxChars: number;
-}): string {
-  const instructions = params.pack.instructions.trim();
-  const demos = params.pack.demos.slice(0, params.maxDemos);
-
-  const demoLines = demos.map((demo) => {
-    const output = demo.output === null ? 'null' : JSON.stringify(demo.output);
-    return `Input: ${demo.input}\nOutput: ${output}`;
-  });
-
-  const block = [
-    'Tool Outcome Guidelines (Autotune):',
-    instructions,
-    demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
-  ].filter(Boolean).join('\n\n');
-
-  if (block.length <= params.maxChars) return block;
-
-  let trimmed = ['Tool Outcome Guidelines (Autotune):', instructions].join('\n\n');
-  if (trimmed.length > params.maxChars) {
-    return trimmed.slice(0, params.maxChars);
-  }
-
-  for (const demo of demoLines) {
-    const candidate = `${trimmed}\n\nExamples:\n${demo}`;
-    if (candidate.length > params.maxChars) break;
-    trimmed = candidate;
-  }
-
-  return trimmed;
-}
-
-export function formatMemoryPolicyPack(params: {
-  pack: PromptPack;
-  maxDemos: number;
-  maxChars: number;
-}): string {
-  const instructions = params.pack.instructions.trim();
-  const demos = params.pack.demos.slice(0, params.maxDemos);
-
-  const demoLines = demos.map((demo) => {
-    const output = demo.output === null ? 'null' : JSON.stringify(demo.output);
-    return `Input: ${demo.input}\nOutput: ${output}`;
-  });
-
-  const block = [
-    'Memory Policy Guidelines (Autotune):',
-    instructions,
-    demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
-  ].filter(Boolean).join('\n\n');
-
-  if (block.length <= params.maxChars) return block;
-
-  let trimmed = ['Memory Policy Guidelines (Autotune):', instructions].join('\n\n');
-  if (trimmed.length > params.maxChars) {
-    return trimmed.slice(0, params.maxChars);
-  }
-
-  for (const demo of demoLines) {
-    const candidate = `${trimmed}\n\nExamples:\n${demo}`;
-    if (candidate.length > params.maxChars) break;
-    trimmed = candidate;
-  }
-
-  return trimmed;
-}
-
-export function formatMemoryRecallPack(params: {
-  pack: PromptPack;
-  maxDemos: number;
-  maxChars: number;
-}): string {
-  const instructions = params.pack.instructions.trim();
-  const demos = params.pack.demos.slice(0, params.maxDemos);
-
-  const demoLines = demos.map((demo) => {
-    const output = demo.output === null ? 'null' : JSON.stringify(demo.output);
-    return `Input: ${demo.input}\nOutput: ${output}`;
-  });
-
-  const block = [
-    'Memory Recall Guidelines (Autotune):',
-    instructions,
-    demoLines.length > 0 ? `Examples:\n${demoLines.join('\n\n')}` : ''
-  ].filter(Boolean).join('\n\n');
-
-  if (block.length <= params.maxChars) return block;
-
-  let trimmed = ['Memory Recall Guidelines (Autotune):', instructions].join('\n\n');
+  let trimmed = [header, instructions].join('\n\n');
   if (trimmed.length > params.maxChars) {
     return trimmed.slice(0, params.maxChars);
   }

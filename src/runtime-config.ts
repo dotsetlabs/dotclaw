@@ -51,12 +51,16 @@ export type RuntimeConfig = {
     maintenance: {
       intervalMs: number;
     };
+    messageQueue: {
+      batchWindowMs: number;
+    };
     metrics: {
       port: number;
       enabled: boolean;
     };
     dashboard: {
       enabled: boolean;
+      port: number;
     };
     memory: {
       recall: {
@@ -92,9 +96,6 @@ export type RuntimeConfig = {
       handlerTimeoutMs: number;
       sendRetries: number;
       sendRetryDelayMs: number;
-      streamMode: string;
-      streamMinIntervalMs: number;
-      streamMinChars: number;
       inputMessageMaxChars: number;
     };
     progress: {
@@ -301,10 +302,6 @@ export type RuntimeConfig = {
         tools: string[];
       };
     };
-    streaming: {
-      minIntervalMs: number;
-      minChars: number;
-    };
     ipc: {
       requestTimeoutMs: number;
       requestPollMs: number;
@@ -369,12 +366,16 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     maintenance: {
       intervalMs: 6 * 60 * 60 * 1000
     },
+    messageQueue: {
+      batchWindowMs: 2000
+    },
     metrics: {
       port: 3001,
       enabled: true
     },
     dashboard: {
-      enabled: true
+      enabled: true,
+      port: 3002
     },
     memory: {
       recall: {
@@ -410,9 +411,6 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       handlerTimeoutMs: DEFAULT_TELEGRAM_HANDLER_TIMEOUT_MS,
       sendRetries: 3,
       sendRetryDelayMs: 1000,
-      streamMode: 'off',
-      streamMinIntervalMs: 800,
-      streamMinChars: 120,
       inputMessageMaxChars: 4000
     },
     progress: {
@@ -539,7 +537,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       profiles: {
         fast: {
           model: 'openai/gpt-5-nano',
-          maxOutputTokens: 256,
+          maxOutputTokens: 4096,
           maxToolSteps: 6,
           recallMaxResults: 0,
           recallMaxTokens: 0,
@@ -556,7 +554,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         },
         standard: {
           model: 'openai/gpt-5-mini',
-          maxOutputTokens: 768,
+          maxOutputTokens: 4096,
           maxToolSteps: 16,
           recallMaxResults: 6,
           recallMaxTokens: 1500,
@@ -570,7 +568,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         },
         deep: {
           model: 'moonshotai/kimi-k2.5',
-          maxOutputTokens: 1536,
+          maxOutputTokens: 4096,
           maxToolSteps: 32,
           recallMaxResults: 12,
           recallMaxTokens: 2500,
@@ -584,7 +582,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         },
         background: {
           model: 'moonshotai/kimi-k2.5',
-          maxOutputTokens: 2048,
+          maxOutputTokens: 4096,
           maxToolSteps: 64,
           recallMaxResults: 16,
           recallMaxTokens: 4000,
@@ -634,7 +632,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       recentContextTokens: 8000,
       summaryUpdateEveryMessages: 20,
       maxOutputTokens: 1024,
-      summaryMaxOutputTokens: 600,
+      summaryMaxOutputTokens: 2048,
       temperature: 0.2,
       maxContextMessageTokens: 3000
     },
@@ -645,7 +643,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         enabled: true,
         async: true,
         maxMessages: 4,
-        maxOutputTokens: 200
+        maxOutputTokens: 1024
       },
       archiveSync: true,
       extractScheduled: false
@@ -662,12 +660,12 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       mode: 'auto',
       minTokens: 800,
       triggerRegex: '(plan|steps|roadmap|research|design|architecture|spec|strategy)',
-      maxOutputTokens: 200,
+      maxOutputTokens: 1024,
       temperature: 0.2
     },
     responseValidation: {
       enabled: true,
-      maxOutputTokens: 120,
+      maxOutputTokens: 1024,
       temperature: 0,
       maxRetries: 1,
       allowToolCalls: false,
@@ -713,10 +711,6 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         maxOutputTokens: 400,
         tools: ['WebFetch']
       }
-    },
-    streaming: {
-      minIntervalMs: 800,
-      minChars: 120
     },
     ipc: {
       requestTimeoutMs: 6000,

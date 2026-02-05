@@ -22,10 +22,6 @@ const DEFAULT_CONFIG: BehaviorConfig = {
 
 const CONFIG_PATH = BEHAVIOR_CONFIG_PATH;
 
-export function getBehaviorConfigPath(): string {
-  return CONFIG_PATH;
-}
-
 export function loadBehaviorConfig(): BehaviorConfig {
   const raw = loadJson<Partial<BehaviorConfig>>(CONFIG_PATH, {});
   const merged: BehaviorConfig = {

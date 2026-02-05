@@ -175,6 +175,8 @@ export function recordMemoryExtract(source: 'telegram' | 'scheduler', count: num
   if (Number.isFinite(count)) memoryExtractTotal.inc({ source }, count);
 }
 
+let metricsServer: http.Server | null = null;
+
 export function startMetricsServer(): void {
   if (!runtime.host.metrics.enabled) {
     logger.info('Metrics server disabled');
@@ -182,7 +184,7 @@ export function startMetricsServer(): void {
   }
   const port = runtime.host.metrics.port;
   const bind = runtime.host.bind;
-  const server = http.createServer(async (_req, res) => {
+  metricsServer = http.createServer(async (_req, res) => {
     try {
       const metrics = await registry.metrics();
       res.writeHead(200, { 'Content-Type': registry.contentType });
@@ -192,7 +194,21 @@ export function startMetricsServer(): void {
       res.end('metrics error');
     }
   });
-  server.listen(port, bind, () => {
+  metricsServer.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      logger.error({ port, bind }, `Metrics port ${port} is already in use. Check for conflicting instances or services.`);
+      process.exit(1);
+    }
+    logger.error({ err, port }, 'Metrics server error');
+  });
+  metricsServer.listen(port, bind, () => {
     logger.info({ port, bind }, 'Metrics server listening');
   });
+}
+
+export function stopMetricsServer(): void {
+  if (metricsServer) {
+    metricsServer.close();
+    metricsServer = null;
+  }
 }

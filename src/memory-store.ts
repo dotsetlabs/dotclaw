@@ -4,6 +4,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { MAIN_GROUP_FOLDER, STORE_DIR } from './config.js';
 import { loadRuntimeConfig } from './runtime-config.js';
+import { logger } from './logger.js';
 
 export type MemoryScope = 'user' | 'group' | 'global';
 export type MemoryType =
@@ -222,7 +223,7 @@ export function initMemoryStore(): void {
   try {
     ensureMemorySchema(memoryDb);
   } catch (err) {
-    console.error(`[memory-store] Schema check failed: ${err instanceof Error ? err.message : String(err)}`);
+    logger.error({ err }, 'Memory store schema check failed');
     throw err;
   }
 }

@@ -103,10 +103,6 @@ export type AgentRuntimeConfig = {
         tools: string[];
       };
     };
-    streaming: {
-      minIntervalMs: number;
-      minChars: number;
-    };
     ipc: {
       requestTimeoutMs: number;
       requestPollMs: number;
@@ -143,7 +139,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     recentContextTokens: 8000,
     summaryUpdateEveryMessages: 20,
     maxOutputTokens: 1024,
-    summaryMaxOutputTokens: 600,
+    summaryMaxOutputTokens: 2048,
     temperature: 0.2,
     maxContextMessageTokens: 3000
   },
@@ -154,7 +150,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
       enabled: true,
       async: true,
       maxMessages: 4,
-      maxOutputTokens: 200
+      maxOutputTokens: 1024
     },
     archiveSync: true,
     extractScheduled: false
@@ -171,12 +167,12 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     mode: 'auto',
     minTokens: 800,
     triggerRegex: '(plan|steps|roadmap|research|design|architecture|spec|strategy)',
-    maxOutputTokens: 200,
+    maxOutputTokens: 1024,
     temperature: 0.2
   },
   responseValidation: {
     enabled: true,
-    maxOutputTokens: 120,
+    maxOutputTokens: 1024,
     temperature: 0,
     maxRetries: 1,
     allowToolCalls: false,
@@ -222,10 +218,6 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
       maxOutputTokens: 400,
       tools: ['WebFetch']
     }
-  },
-  streaming: {
-    minIntervalMs: 800,
-    minChars: 120
   },
   ipc: {
     requestTimeoutMs: 6000,
@@ -275,7 +267,8 @@ function readJson(filePath: string): unknown {
     const raw = fs.readFileSync(filePath, 'utf-8');
     if (!raw.trim()) return null;
     return JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    console.error(`[agent-runner] Failed to load config ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }
