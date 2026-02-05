@@ -204,13 +204,22 @@ function ensureDirectoryStructureAt(dotclawHome: string): void {
   }
 }
 
-async function isPortAvailable(port: number): Promise<boolean> {
+type PortAvailability = 'available' | 'unavailable' | 'unknown';
+
+async function checkPortAvailability(port: number): Promise<PortAvailability> {
   return await new Promise((resolve) => {
     const server = net.createServer();
     server.unref();
-    server.on('error', () => resolve(false));
+    server.on('error', (err) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EPERM' || code === 'EACCES') {
+        resolve('unknown');
+        return;
+      }
+      resolve('unavailable');
+    });
     server.listen(port, '127.0.0.1', () => {
-      server.close(() => resolve(true));
+      server.close(() => resolve('available'));
     });
   });
 }
@@ -254,10 +263,18 @@ async function withPortLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 async function findAvailablePort(startPort: number, attempts = 20): Promise<number> {
+  let unknownPort: number | null = null;
   let port = startPort;
   for (let i = 0; i < attempts; i += 1) {
-    if (await isPortAvailable(port)) return port;
+    const status = await checkPortAvailability(port);
+    if (status === 'available') return port;
+    if (status === 'unknown' && unknownPort === null) {
+      unknownPort = port;
+    }
     port += 1;
+  }
+  if (unknownPort !== null) {
+    return unknownPort;
   }
   throw new Error(`No available port found in range ${startPort}-${startPort + attempts - 1}`);
 }

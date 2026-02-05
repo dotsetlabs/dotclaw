@@ -123,3 +123,32 @@ test('cleanupIpcErrorFiles returns 0 when no old error files', async () => {
     assert.equal(removed, 0);
   });
 });
+
+test('cleanupStaleSessionSnapshots removes stale session snapshot directories', async () => {
+  await withTempHome(tmpDir, async () => {
+    const openrouterDir = path.join(tmpDir, 'data', 'sessions', 'main', 'openrouter');
+    fs.mkdirSync(openrouterDir, { recursive: true });
+
+    const staleDash = path.join(openrouterDir, 'session-stale-1');
+    const staleUnderscore = path.join(openrouterDir, 'session_stale_2');
+    const freshDash = path.join(openrouterDir, 'session-fresh-3');
+    const nonSession = path.join(openrouterDir, 'notes');
+    fs.mkdirSync(staleDash, { recursive: true });
+    fs.mkdirSync(staleUnderscore, { recursive: true });
+    fs.mkdirSync(freshDash, { recursive: true });
+    fs.mkdirSync(nonSession, { recursive: true });
+
+    const oldTime = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(staleDash, oldTime, oldTime);
+    fs.utimesSync(staleUnderscore, oldTime, oldTime);
+
+    const mod = await importFresh(distPath('maintenance.js'));
+    const removed = mod.cleanupStaleSessionSnapshots();
+
+    assert.equal(removed, 2);
+    assert.equal(fs.existsSync(staleDash), false);
+    assert.equal(fs.existsSync(staleUnderscore), false);
+    assert.equal(fs.existsSync(freshDash), true);
+    assert.equal(fs.existsSync(nonSession), true);
+  });
+});

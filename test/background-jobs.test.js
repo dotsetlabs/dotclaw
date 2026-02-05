@@ -38,3 +38,36 @@ test('spawnBackgroundJob queues a job and cancelBackgroundJob marks it canceled'
     assert.equal(status?.status, 'canceled');
   });
 });
+
+test('resolveBackgroundJobStatus distinguishes timeout from cancel', async () => {
+  const { resolveBackgroundJobStatus } = await importFresh(distPath('background-jobs.js'));
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: true,
+    abortReason: 'timeout',
+    error: null
+  }), 'timed_out');
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: true,
+    abortReason: 'canceled_by_user',
+    error: null
+  }), 'canceled');
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: false,
+    error: 'Request timed out after 30s'
+  }), 'timed_out');
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: false,
+    error: 'Something failed'
+  }), 'failed');
+
+  assert.equal(resolveBackgroundJobStatus({
+    aborted: true,
+    abortReason: 'timeout',
+    latestStatus: 'canceled',
+    error: null
+  }), 'canceled');
+});

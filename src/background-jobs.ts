@@ -50,6 +50,40 @@ export interface BackgroundJobDependencies {
 
 const inFlightJobs = new Map<string, AbortController>();
 const claimedJobIds = new Set<string>();
+type BackgroundJobTerminalStatus = Exclude<BackgroundJobStatus, 'queued' | 'running'>;
+
+function isTimeoutAbortReason(reason: unknown): boolean {
+  if (reason === 'timeout') return true;
+  if (reason instanceof Error) {
+    const name = reason.name.toLowerCase();
+    const message = reason.message.toLowerCase();
+    return name.includes('timeout') || message.includes('timeout') || message.includes('timed out');
+  }
+  if (typeof reason === 'string') {
+    return reason.toLowerCase().includes('timeout') || reason.toLowerCase().includes('timed out');
+  }
+  return false;
+}
+
+export function resolveBackgroundJobStatus(params: {
+  aborted: boolean;
+  abortReason?: unknown;
+  error?: string | null;
+  latestStatus?: BackgroundJobStatus | null;
+}): BackgroundJobTerminalStatus {
+  let status: BackgroundJobTerminalStatus = 'succeeded';
+  if (params.aborted) {
+    status = isTimeoutAbortReason(params.abortReason) ? 'timed_out' : 'canceled';
+  } else if (params.error) {
+    status = /timed out|timeout/i.test(params.error) ? 'timed_out' : 'failed';
+  }
+
+  if (params.latestStatus === 'canceled') {
+    return 'canceled';
+  }
+
+  return status;
+}
 
 function formatJobCompletionMessage(params: {
   job: BackgroundJob;
@@ -155,7 +189,7 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
   const now = new Date().toISOString();
   const timeoutMs = job.timeout_ms ?? JOBS_MAX_RUNTIME_MS;
   const timeout = setTimeout(() => {
-    abortController.abort();
+    abortController.abort('timeout');
   }, timeoutMs);
 
   let output: ContainerOutput | null = null;
@@ -315,11 +349,15 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
     });
   }
 
-  let status: BackgroundJobStatus = 'succeeded';
-  if (abortController.signal.aborted) {
-    status = 'canceled';
-  } else if (error) {
-    status = /timed out|timeout/i.test(error) ? 'timed_out' : 'failed';
+  const latest = getBackgroundJobById(job.id);
+  let status = resolveBackgroundJobStatus({
+    aborted: abortController.signal.aborted,
+    abortReason: abortController.signal.reason,
+    error,
+    latestStatus: latest?.status ?? null
+  });
+  if (status === 'timed_out' && !error) {
+    error = `Job timed out after ${Math.round(timeoutMs / 1000)}s.`;
   }
 
   let outputPath: string | null = null;
@@ -330,7 +368,6 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
     outputSummary = `Error: ${error}`;
   }
 
-  const latest = getBackgroundJobById(job.id);
   if (latest?.status === 'canceled') {
     status = 'canceled';
     if (!error) error = 'Canceled by user.';
@@ -436,7 +473,7 @@ export async function stopBackgroundJobLoop(): Promise<void> {
   jobLoopStopped = true;
   // Abort all in-flight jobs
   for (const [jobId, controller] of inFlightJobs) {
-    controller.abort();
+    controller.abort('shutdown');
     logger.info({ jobId }, 'Aborted in-flight background job');
   }
   // Wait for in-flight jobs to drain (up to 10s)
@@ -544,7 +581,7 @@ export function cancelBackgroundJob(jobId: string): { ok: boolean; error?: strin
 
   const controller = inFlightJobs.get(jobId);
   if (controller) {
-    controller.abort();
+    controller.abort('canceled_by_user');
   }
 
   logBackgroundJobEvent({

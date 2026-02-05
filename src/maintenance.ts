@@ -152,7 +152,7 @@ function cleanupStaleCidFiles(): number {
 
 let maintenanceTimer: NodeJS.Timeout | null = null;
 
-function cleanupStaleSessionSnapshots(): number {
+export function cleanupStaleSessionSnapshots(): number {
   const sessionsBase = path.join(DATA_DIR, 'sessions');
   if (!fs.existsSync(sessionsBase)) return 0;
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -165,7 +165,12 @@ function cleanupStaleSessionSnapshots(): number {
       const openrouterDir = path.join(sessionsBase, groupDir, 'openrouter');
       if (!fs.existsSync(openrouterDir)) continue;
       const sessionDirs = fs.readdirSync(openrouterDir).filter(f => {
-        try { return f.startsWith('session_') && fs.statSync(path.join(openrouterDir, f)).isDirectory(); } catch { return false; }
+        try {
+          const isSessionDir = f.startsWith('session-') || f.startsWith('session_');
+          return isSessionDir && fs.statSync(path.join(openrouterDir, f)).isDirectory();
+        } catch {
+          return false;
+        }
       });
       for (const sessionDir of sessionDirs) {
         const sessionPath = path.join(openrouterDir, sessionDir);

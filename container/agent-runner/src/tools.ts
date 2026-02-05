@@ -872,6 +872,7 @@ export function createTools(
     (progressConfig.notifyTools || []).map(item => item.trim().toLowerCase()).filter(Boolean)
   );
   let lastProgressNotifyAt = 0;
+  const hasAllowPolicy = Array.isArray(policy?.allow);
   const allowList = (policy?.allow || []).map(item => item.toLowerCase());
   const denyList = (policy?.deny || []).map(item => item.toLowerCase());
   const maxPerRunConfig = policy?.max_per_run || {};
@@ -917,7 +918,7 @@ export function createTools(
         if (denyList.includes(normalizedName)) {
           throw new Error(`Tool is disabled by policy: ${name}`);
         }
-        if (allowList.length > 0 && !allowList.includes(normalizedName)) {
+        if (hasAllowPolicy && !allowList.includes(normalizedName)) {
           throw new Error(`Tool not allowed by policy: ${name}`);
         }
         const currentCount = usageCounts.get(name) || 0;

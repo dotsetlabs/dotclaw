@@ -12,7 +12,8 @@ import {
   CONTAINER_MODE,
   WARM_START_ENABLED,
   ENV_PATH,
-  BATCH_WINDOW_MS
+  BATCH_WINDOW_MS,
+  MAX_BATCH_SIZE
 } from './config.js';
 
 // Load .env from the canonical location (~/.dotclaw/.env)
@@ -612,7 +613,7 @@ async function drainQueue(chatId: string): Promise<void> {
   try {
     let iterations = 0;
     while (iterations < MAX_DRAIN_ITERATIONS) {
-      const batch = claimBatchForChat(chatId, BATCH_WINDOW_MS);
+      const batch = claimBatchForChat(chatId, BATCH_WINDOW_MS, MAX_BATCH_SIZE);
       if (batch.length === 0) break;
       iterations++;
       const last = batch[batch.length - 1];

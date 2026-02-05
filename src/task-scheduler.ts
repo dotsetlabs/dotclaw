@@ -71,13 +71,8 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  // Guard: skip if already running (running_since set)
-  const freshTask = getTaskById(task.id);
-  if (freshTask?.running_since) {
-    logger.warn({ taskId: task.id, runningSince: freshTask.running_since }, 'Task already running, skipping');
-    return;
-  }
-  updateTask(task.id, { running_since: new Date().toISOString() });
+  // Scheduler loop claims tasks in DB before dispatching runTask.
+  // Do not re-check/re-claim here or claimed tasks will be skipped.
 
   logger.info({ taskId: task.id, group: task.group_folder }, 'Running scheduled task');
   recordMessage('scheduler');
