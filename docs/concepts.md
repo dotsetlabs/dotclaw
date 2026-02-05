@@ -21,7 +21,9 @@ See [Memory](/operations/memory) for configuration options.
 
 ## Containers and isolation
 
-Each request runs inside a Docker container. The container only sees mounted directories that you explicitly allow. This protects the host and limits agent access to your data.
+Each request runs inside a Docker container. The container only sees mounted directories that you explicitly allow.
+By default, containers run in privileged mode for maximum in-container autonomy; you can disable this with
+`host.container.privileged=false` in runtime config.
 
 Container mode:
 
@@ -31,6 +33,9 @@ Container mode:
 ## Tools and policy
 
 Tools are governed by `~/.dotclaw/config/tool-policy.json`. You can allow or deny tools by default and override by group or user. Optional budgets in `~/.dotclaw/config/tool-budgets.json` limit daily tool usage.
+
+In addition to code tools, DotClaw exposes Telegram action tools (send/edit/delete messages, media, polls, buttons, etc.)
+that can be allowed or denied through the same policy file.
 
 ## Scheduler
 

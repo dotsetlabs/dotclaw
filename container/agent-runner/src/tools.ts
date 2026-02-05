@@ -189,13 +189,30 @@ function resolvePath(inputPath: string, isMain: boolean, mustExist = false): str
   return resolved;
 }
 
-function limitText(text: string, maxBytes: number): { text: string; truncated: boolean } {
-  if (Buffer.byteLength(text, 'utf-8') <= maxBytes) {
-    return { text, truncated: false };
+function resolveGroupPath(inputPath: string, mustExist = false): string {
+  if (!inputPath || typeof inputPath !== 'string') {
+    throw new Error('Path is required');
   }
-  const buffer = Buffer.from(text, 'utf-8');
-  const truncated = buffer.subarray(0, maxBytes).toString('utf-8');
-  return { text: truncated, truncated: true };
+  const groupRoot = path.resolve(WORKSPACE_GROUP);
+  const resolved = path.isAbsolute(inputPath)
+    ? path.resolve(inputPath)
+    : path.resolve(WORKSPACE_GROUP, inputPath);
+  if (!isWithinRoot(resolved, groupRoot)) {
+    throw new Error(`Path must be inside /workspace/group: ${resolved}`);
+  }
+  if (mustExist && !fs.existsSync(resolved)) {
+    throw new Error(`Path does not exist: ${resolved}`);
+  }
+  return resolved;
+}
+
+function limitText(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  const buf = Buffer.from(text, 'utf-8');
+  if (buf.length <= maxBytes) return { text, truncated: false };
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 0xC0) === 0x80) end--;
+  const truncated = buf.subarray(0, end).toString('utf-8');
+  return { text: truncated + '\n[OUTPUT TRUNCATED]', truncated: true };
 }
 
 function normalizeDomain(value: string): string {
@@ -298,14 +315,12 @@ function isPrivateIpv4(ip: string): boolean {
 
 function isPrivateIpv6(ip: string): boolean {
   const normalized = ip.toLowerCase();
-  return normalized === '::1'
-    || normalized.startsWith('fc')
-    || normalized.startsWith('fd')
-    || normalized.startsWith('fe80')
-    || normalized.startsWith('::ffff:127.')
-    || normalized.startsWith('::ffff:10.')
-    || normalized.startsWith('::ffff:192.168.')
-    || normalized.startsWith('::ffff:172.');
+  if (normalized === '::1') return true;
+  if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
+  if (normalized.startsWith('fe80')) return true;
+  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPrivateIpv4(mapped[1]);
+  return false;
 }
 
 function isPrivateIp(ip: string): boolean {
@@ -554,32 +569,49 @@ async function runCommand(command: string, timeoutMs: number, outputLimit: numbe
     const start = Date.now();
     const child = spawn('/bin/bash', ['-lc', command], {
       cwd,
-      env: process.env
+      env: process.env,
+      detached: true
     });
 
     let stdout = '';
     let stderr = '';
     let truncated = false;
+    let totalBytes = 0;
     const maxBytes = outputLimit;
+
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch {
+        try { child.kill(signal); } catch { /* process already exited */ }
+      }
+    };
 
     const append = (chunk: Buffer | string, isStdout: boolean) => {
       if (truncated) return;
       const text = chunk.toString();
-      const remaining = maxBytes - Buffer.byteLength(stdout + stderr, 'utf-8');
+      const chunkBytes = Buffer.byteLength(text, 'utf-8');
+      const remaining = maxBytes - totalBytes;
       if (remaining <= 0) {
         truncated = true;
+        killProcessGroup('SIGTERM');
+        setTimeout(() => killProcessGroup('SIGKILL'), 2000);
         return;
       }
-      const toAdd = Buffer.byteLength(text, 'utf-8') > remaining
+      const toAdd = chunkBytes > remaining
         ? Buffer.from(text).subarray(0, remaining).toString('utf-8')
         : text;
+      const addedBytes = chunkBytes > remaining ? remaining : chunkBytes;
       if (isStdout) {
         stdout += toAdd;
       } else {
         stderr += toAdd;
       }
-      if (Buffer.byteLength(stdout + stderr, 'utf-8') >= maxBytes) {
+      totalBytes += addedBytes;
+      if (totalBytes >= maxBytes) {
         truncated = true;
+        killProcessGroup('SIGTERM');
+        setTimeout(() => killProcessGroup('SIGKILL'), 2000);
       }
     };
 
@@ -587,7 +619,8 @@ async function runCommand(command: string, timeoutMs: number, outputLimit: numbe
     child.stderr.on('data', (data) => append(data, false));
 
     const timeout = setTimeout(() => {
-      child.kill('SIGKILL');
+      killProcessGroup('SIGTERM');
+      setTimeout(() => killProcessGroup('SIGKILL'), 5000);
     }, timeoutMs);
 
     child.on('close', (code) => {
@@ -856,6 +889,7 @@ export function createTools(
     (progressConfig.notifyTools || []).map(item => item.trim().toLowerCase()).filter(Boolean)
   );
   let lastProgressNotifyAt = 0;
+  const hasAllowPolicy = Array.isArray(policy?.allow);
   const allowList = (policy?.allow || []).map(item => item.toLowerCase());
   const denyList = (policy?.deny || []).map(item => item.toLowerCase());
   const maxPerRunConfig = policy?.max_per_run || {};
@@ -901,7 +935,7 @@ export function createTools(
         if (denyList.includes(normalizedName)) {
           throw new Error(`Tool is disabled by policy: ${name}`);
         }
-        if (allowList.length > 0 && !allowList.includes(normalizedName)) {
+        if (hasAllowPolicy && !allowList.includes(normalizedName)) {
           throw new Error(`Tool not allowed by policy: ${name}`);
         }
         const currentCount = usageCounts.get(name) || 0;
@@ -1157,7 +1191,7 @@ export function createTools(
       if (occurrences === 0) {
         return { path: resolved, replaced: false, occurrences: 0 };
       }
-      const updated = content.replace(old_text, new_text);
+      const updated = content.replaceAll(old_text, new_text);
       fs.writeFileSync(resolved, updated);
       return { path: resolved, replaced: true, occurrences };
     })
@@ -1495,7 +1529,11 @@ export function createTools(
           if (!config.command) {
             throw new Error(`Plugin ${config.name} missing command`);
           }
-          const command = interpolateTemplate(config.command, args);
+          const escaped: Record<string, unknown> = {};
+          for (const [key, val] of Object.entries(args)) {
+            escaped[key] = typeof val === 'string' ? shellEscape(val) : val;
+          }
+          const command = interpolateTemplate(config.command, escaped);
           return runCommand(command, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes);
         })
       });
@@ -1504,17 +1542,354 @@ export function createTools(
     return null;
   }).filter(Boolean) as Tool[];
 
+  const requiredTelegramText = z.string().trim().min(1);
+  const requiredTelegramSingleMessageText = z.string().trim().min(1).max(4096);
+  const optionalTelegramCaption = z.string().trim().min(1).max(1024).optional();
+  const requiredWorkspacePath = z.string().trim().min(1);
+  const optionalNameField = z.string().trim().min(1).max(128).optional();
+
   const sendMessageTool = tool({
     name: 'mcp__dotclaw__send_message',
     description: 'Send a message to the current Telegram chat.',
     inputSchema: z.object({
-      text: z.string().describe('The message text to send')
+      text: requiredTelegramText.describe('The message text to send'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
     }),
     outputSchema: z.object({
       ok: z.boolean(),
       id: z.string().optional()
     }),
-    execute: wrapExecute('mcp__dotclaw__send_message', async ({ text }: { text: string }) => ipc.sendMessage(text))
+    execute: wrapExecute('mcp__dotclaw__send_message', async ({ text, reply_to_message_id }: { text: string; reply_to_message_id?: number }) =>
+      ipc.sendMessage(text, reply_to_message_id ? { reply_to_message_id } : undefined))
+  });
+
+  const sendFileTool = tool({
+    name: 'mcp__dotclaw__send_file',
+    description: 'Send a file/document to the current Telegram chat. The file must exist under /workspace/group.',
+    inputSchema: z.object({
+      path: requiredWorkspacePath.describe('File path (relative to /workspace/group or absolute under /workspace/group)'),
+      caption: optionalTelegramCaption.describe('Optional caption text'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_file', async ({ path: inputPath, caption, reply_to_message_id }: { path: string; caption?: string; reply_to_message_id?: number }) => {
+      const resolved = resolveGroupPath(inputPath, true);
+      return ipc.sendFile({ path: resolved, caption, reply_to_message_id });
+    })
+  });
+
+  const sendPhotoTool = tool({
+    name: 'mcp__dotclaw__send_photo',
+    description: 'Send a photo/image to the current Telegram chat with compression. The file must exist under /workspace/group.',
+    inputSchema: z.object({
+      path: requiredWorkspacePath.describe('Image file path (relative to /workspace/group or absolute under /workspace/group)'),
+      caption: optionalTelegramCaption.describe('Optional caption text'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_photo', async ({ path: inputPath, caption, reply_to_message_id }: { path: string; caption?: string; reply_to_message_id?: number }) => {
+      const resolved = resolveGroupPath(inputPath, true);
+      return ipc.sendPhoto({ path: resolved, caption, reply_to_message_id });
+    })
+  });
+
+  const sendVoiceTool = tool({
+    name: 'mcp__dotclaw__send_voice',
+    description: 'Send a voice message to the current Telegram chat. File must be .ogg format with Opus codec.',
+    inputSchema: z.object({
+      path: requiredWorkspacePath.describe('Voice file path (relative to /workspace/group or absolute under /workspace/group)'),
+      caption: optionalTelegramCaption.describe('Optional caption text'),
+      duration: z.number().int().positive().optional().describe('Duration in seconds'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_voice', async ({ path: inputPath, caption, duration, reply_to_message_id }: { path: string; caption?: string; duration?: number; reply_to_message_id?: number }) => {
+      const resolved = resolveGroupPath(inputPath, true);
+      return ipc.sendVoice({ path: resolved, caption, duration, reply_to_message_id });
+    })
+  });
+
+  const sendAudioTool = tool({
+    name: 'mcp__dotclaw__send_audio',
+    description: 'Send an audio file to the current Telegram chat (mp3, m4a, etc.).',
+    inputSchema: z.object({
+      path: requiredWorkspacePath.describe('Audio file path (relative to /workspace/group or absolute under /workspace/group)'),
+      caption: optionalTelegramCaption.describe('Optional caption text'),
+      duration: z.number().int().positive().optional().describe('Duration in seconds'),
+      performer: optionalNameField.describe('Audio performer/artist'),
+      title: optionalNameField.describe('Audio title'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_audio', async ({ path: inputPath, caption, duration, performer, title, reply_to_message_id }: { path: string; caption?: string; duration?: number; performer?: string; title?: string; reply_to_message_id?: number }) => {
+      const resolved = resolveGroupPath(inputPath, true);
+      return ipc.sendAudio({ path: resolved, caption, duration, performer, title, reply_to_message_id });
+    })
+  });
+
+  const sendLocationTool = tool({
+    name: 'mcp__dotclaw__send_location',
+    description: 'Send a location pin to the current Telegram chat.',
+    inputSchema: z.object({
+      latitude: z.number().min(-90).max(90).describe('Latitude'),
+      longitude: z.number().min(-180).max(180).describe('Longitude'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_location', async ({ latitude, longitude, reply_to_message_id }: { latitude: number; longitude: number; reply_to_message_id?: number }) =>
+      ipc.sendLocation({ latitude, longitude, reply_to_message_id }))
+  });
+
+  const sendContactTool = tool({
+    name: 'mcp__dotclaw__send_contact',
+    description: 'Send a contact card to the current Telegram chat.',
+    inputSchema: z.object({
+      phone_number: z.string().trim().min(1).max(64).describe('Phone number with country code'),
+      first_name: z.string().trim().min(1).max(64).describe('First name'),
+      last_name: z.string().trim().min(1).max(64).optional().describe('Last name'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_contact', async ({ phone_number, first_name, last_name, reply_to_message_id }: { phone_number: string; first_name: string; last_name?: string; reply_to_message_id?: number }) =>
+      ipc.sendContact({ phone_number, first_name, last_name, reply_to_message_id }))
+  });
+
+  const sendPollTool = tool({
+    name: 'mcp__dotclaw__send_poll',
+    description: 'Create a Telegram poll in the current chat.',
+    inputSchema: z.object({
+      question: z.string().trim().min(1).max(300).describe('Poll question'),
+      options: z.array(z.string().trim().min(1).max(100)).min(2).max(10).describe('Poll options (2-10)'),
+      is_anonymous: z.boolean().optional().describe('Anonymous poll (default true)'),
+      allows_multiple_answers: z.boolean().optional().describe('Allow multiple answers'),
+      type: z.enum(['regular', 'quiz']).optional().describe('Poll type'),
+      correct_option_id: z.number().int().nonnegative().optional().describe('Correct option index for quiz polls'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }).superRefine((value, ctx) => {
+      const uniqueCount = new Set(value.options.map(option => option.toLowerCase())).size;
+      if (uniqueCount !== value.options.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['options'],
+          message: 'Poll options must be unique.'
+        });
+      }
+      if (value.type === 'quiz' && value.correct_option_id === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['correct_option_id'],
+          message: 'Quiz polls must specify correct_option_id.'
+        });
+      }
+      if (value.type !== 'quiz' && value.correct_option_id !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['correct_option_id'],
+          message: 'correct_option_id is only valid for quiz polls.'
+        });
+      }
+      if (value.correct_option_id !== undefined && value.correct_option_id >= value.options.length) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['correct_option_id'],
+          message: 'correct_option_id must be less than options length.'
+        });
+      }
+      if (value.type === 'quiz' && value.allows_multiple_answers) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['allows_multiple_answers'],
+          message: 'Quiz polls cannot allow multiple answers.'
+        });
+      }
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_poll', async (args: { question: string; options: string[]; is_anonymous?: boolean; allows_multiple_answers?: boolean; type?: string; correct_option_id?: number; reply_to_message_id?: number }) =>
+      ipc.sendPoll(args))
+  });
+
+  const sendButtonsTool = tool({
+    name: 'mcp__dotclaw__send_buttons',
+    description: 'Send a message with inline keyboard buttons. Each button can be a URL link or a callback button.',
+    inputSchema: z.object({
+      text: requiredTelegramSingleMessageText.describe('Message text above the buttons'),
+      buttons: z.array(z.array(z.object({
+        text: z.string().trim().min(1).max(64).describe('Button label'),
+        url: z.string().trim().min(1).optional().describe('URL to open (for link buttons)'),
+        callback_data: z.string().trim().min(1).max(64).optional().describe('Callback data (for interactive buttons)')
+      }).superRefine((button, ctx) => {
+        const hasUrl = typeof button.url === 'string' && button.url.trim().length > 0;
+        const hasCallback = typeof button.callback_data === 'string' && button.callback_data.length > 0;
+        if (hasUrl === hasCallback) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['url'],
+            message: 'Each button must provide exactly one of url or callback_data.'
+          });
+          return;
+        }
+        if (hasUrl) {
+          try {
+            const parsed = new URL(button.url!);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'tg:') {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['url'],
+                message: 'Button URL must use http, https, or tg protocol.'
+              });
+            }
+          } catch {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['url'],
+              message: 'Button URL is invalid.'
+            });
+          }
+        }
+      })).min(1)).min(1).describe('2D array of buttons (rows × columns)'),
+      reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      id: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__send_buttons', async (args: { text: string; buttons: Array<Array<{ text: string; url?: string; callback_data?: string }>>; reply_to_message_id?: number }) =>
+      ipc.sendButtons(args))
+  });
+
+  const editMessageTool = tool({
+    name: 'mcp__dotclaw__edit_message',
+    description: 'Edit a previously sent message by message ID.',
+    inputSchema: z.object({
+      message_id: z.number().int().positive().describe('The message ID to edit'),
+      text: requiredTelegramSingleMessageText.describe('New message text'),
+      chat_jid: z.string().optional().describe('Target chat ID (defaults to current chat)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__edit_message', async ({ message_id, text, chat_jid }: { message_id: number; text: string; chat_jid?: string }) =>
+      ipc.editMessage({ message_id, text, chat_jid }))
+  });
+
+  const deleteMessageTool = tool({
+    name: 'mcp__dotclaw__delete_message',
+    description: 'Delete a message by message ID.',
+    inputSchema: z.object({
+      message_id: z.number().int().positive().describe('The message ID to delete'),
+      chat_jid: z.string().optional().describe('Target chat ID (defaults to current chat)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__delete_message', async ({ message_id, chat_jid }: { message_id: number; chat_jid?: string }) =>
+      ipc.deleteMessage({ message_id, chat_jid }))
+  });
+
+  const downloadUrlTool = tool({
+    name: 'mcp__dotclaw__download_url',
+    description: 'Download a URL to the workspace as a file.',
+    inputSchema: z.object({
+      url: z.string().describe('URL to download'),
+      filename: z.string().optional().describe('Output filename (auto-detected from URL if omitted)'),
+      output_dir: z.string().optional().describe('Output directory under /workspace/group (default: /workspace/group/downloads)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      path: z.string().optional(),
+      size: z.number().optional(),
+      content_type: z.string().nullable().optional(),
+      truncated: z.boolean().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__download_url', async ({ url, filename, output_dir }: { url: string; filename?: string; output_dir?: string }) => {
+      await assertUrlAllowed({
+        url,
+        allowlist: webFetchAllowlist,
+        blocklist: webFetchBlocklist,
+        blockPrivate
+      });
+
+      const response = await fetchWithRedirects({
+        url,
+        options: {
+          headers: {
+            'User-Agent': 'DotClaw/1.0',
+            'Accept': '*/*'
+          }
+        },
+        timeoutMs: runtime.webfetchTimeoutMs,
+        label: 'download_url',
+        allowlist: webFetchAllowlist,
+        blocklist: webFetchBlocklist,
+        blockPrivate
+      });
+
+      if (!response.ok) {
+        return { ok: false, error: `HTTP ${response.status}: ${response.statusText}` };
+      }
+
+      const { body, truncated } = await readResponseWithLimit(response, runtime.webfetchMaxBytes);
+
+      let outputFilename = filename;
+      if (!outputFilename) {
+        try {
+          const urlPath = new URL(url).pathname;
+          const basename = path.basename(urlPath);
+          outputFilename = basename && basename !== '/' ? basename : `download_${Date.now()}`;
+        } catch {
+          outputFilename = `download_${Date.now()}`;
+        }
+      }
+      outputFilename = outputFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      if (!outputFilename || outputFilename === '.' || outputFilename === '..') {
+        outputFilename = `download_${Date.now()}`;
+      }
+
+      const outputDirectory = output_dir
+        ? resolveGroupPath(output_dir, false)
+        : resolveGroupPath('downloads', false);
+      fs.mkdirSync(outputDirectory, { recursive: true });
+
+      const outputPath = path.join(outputDirectory, outputFilename);
+      fs.writeFileSync(outputPath, body);
+
+      const contentType = response.headers.get('content-type');
+      return {
+        ok: true,
+        path: outputPath,
+        size: body.length,
+        content_type: contentType,
+        truncated
+      };
+    })
   });
 
   const scheduleTaskTool = tool({
@@ -1524,6 +1899,7 @@ export function createTools(
       prompt: z.string().describe('Task prompt'),
       schedule_type: z.enum(['cron', 'interval', 'once']),
       schedule_value: z.string(),
+      timezone: z.string().optional().describe('Optional IANA timezone (e.g., America/New_York)'),
       context_mode: z.enum(['group', 'isolated']).optional(),
       target_group: z.string().optional()
     }),
@@ -1532,7 +1908,7 @@ export function createTools(
       id: z.string().optional(),
       error: z.string().optional()
     }),
-    execute: wrapExecute('mcp__dotclaw__schedule_task', async (args: { prompt: string; schedule_type: 'cron' | 'interval' | 'once'; schedule_value: string; context_mode?: 'group' | 'isolated'; target_group?: string }) =>
+    execute: wrapExecute('mcp__dotclaw__schedule_task', async (args: { prompt: string; schedule_type: 'cron' | 'interval' | 'once'; schedule_value: string; timezone?: string; context_mode?: 'group' | 'isolated'; target_group?: string }) =>
       ipc.scheduleTask(args))
   });
 
@@ -1606,6 +1982,7 @@ export function createTools(
       prompt: z.string().optional(),
       schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
       schedule_value: z.string().optional(),
+      timezone: z.string().optional(),
       context_mode: z.enum(['group', 'isolated']).optional(),
       status: z.enum(['active', 'paused', 'completed']).optional()
     }),
@@ -1613,7 +1990,7 @@ export function createTools(
       ok: z.boolean(),
       error: z.string().optional()
     }),
-    execute: wrapExecute('mcp__dotclaw__update_task', async (args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) =>
+    execute: wrapExecute('mcp__dotclaw__update_task', async (args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; timezone?: string; context_mode?: string; status?: string }) =>
       ipc.updateTask(args))
   });
 
@@ -1880,6 +2257,16 @@ export function createTools(
     gitCloneTool,
     npmInstallTool,
     sendMessageTool,
+    sendFileTool,
+    sendPhotoTool,
+    sendVoiceTool,
+    sendAudioTool,
+    sendLocationTool,
+    sendContactTool,
+    sendPollTool,
+    sendButtonsTool,
+    editMessageTool,
+    deleteMessageTool,
     scheduleTaskTool,
     runTaskTool,
     listTasksTool,
@@ -1909,7 +2296,10 @@ export function createTools(
     tools.push(pythonTool as Tool);
   }
   if (enableWebSearch) tools.push(webSearchTool as Tool);
-  if (enableWebFetch) tools.push(webFetchTool as Tool);
+  if (enableWebFetch) {
+    tools.push(webFetchTool as Tool);
+    tools.push(downloadUrlTool as Tool);
+  }
 
   return tools;
 }

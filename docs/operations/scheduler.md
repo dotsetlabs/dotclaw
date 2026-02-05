@@ -4,11 +4,11 @@ title: Scheduler
 
 # Scheduler
 
-DotClaw supports one-off and recurring tasks, scheduled in the host timezone by default.
+DotClaw supports one-off and recurring tasks.
 
 ## Timezone
 
-Set `host.timezone` in `~/.dotclaw/config/runtime.json` to override the system timezone:
+Set `host.timezone` in `~/.dotclaw/config/runtime.json` to override the system default timezone:
 
 ```json
 {
@@ -19,6 +19,8 @@ Set `host.timezone` in `~/.dotclaw/config/runtime.json` to override the system t
 ```
 
 This timezone is also passed to the agent so it can interpret and present timestamps consistently.
+
+You can override timezone per scheduled task by providing a `timezone` value (IANA format, for example `America/New_York`) when calling `mcp__dotclaw__schedule_task` or `mcp__dotclaw__update_task`.
 
 ## Scheduling tasks
 
@@ -31,6 +33,8 @@ schedule a daily standup summary at 9:30am
 
 Ask the assistant to list, pause, resume, or cancel tasks when needed.
 You can also ask it to run a scheduled task immediately without changing its schedule.
+
+Each scheduled run sends a completion or failure notification message to the task chat.
 
 ## Targeting other groups
 

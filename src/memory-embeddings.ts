@@ -19,8 +19,11 @@ const QUERY_CACHE_TTL_MS = config.queryCacheTtlMs;
 const QUERY_CACHE_MAX = config.queryCacheMax;
 
 const queryCache = new Map<string, { embedding: number[]; expiresAt: number }>();
+let queryCachePruneCounter = 0;
 
 function pruneQueryCache(): void {
+  queryCachePruneCounter += 1;
+  if (queryCachePruneCounter % 50 !== 0 && queryCache.size <= QUERY_CACHE_MAX) return;
   const now = Date.now();
   for (const [key, value] of queryCache.entries()) {
     if (value.expiresAt <= now) {
@@ -54,7 +57,8 @@ async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
     body: JSON.stringify({
       model: EMBEDDING_MODEL,
       input: texts
-    })
+    }),
+    signal: AbortSignal.timeout(30_000)
   });
   const body = await response.text();
   if (!response.ok) {
@@ -67,6 +71,19 @@ async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
   return payload.data.map(item => Array.isArray(item.embedding) ? item.embedding : []);
 }
 
+async function fetchEmbeddingsWithRetry(texts: string[], maxRetries = 2): Promise<number[][]> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetchEmbeddings(texts);
+    } catch (err) {
+      if (attempt < maxRetries) {
+        await new Promise(r => setTimeout(r, 2000 * Math.pow(2, attempt)));
+      } else throw err;
+    }
+  }
+  throw new Error('unreachable');
+}
+
 export async function getQueryEmbedding(query: string): Promise<number[] | null> {
   if (!EMBEDDINGS_ENABLED) return null;
   const trimmed = query.trim();
@@ -77,7 +94,7 @@ export async function getQueryEmbedding(query: string): Promise<number[] | null>
   if (cached && cached.expiresAt > Date.now()) {
     return cached.embedding;
   }
-  const vectors = await fetchEmbeddings([trimmed]);
+  const vectors = await fetchEmbeddingsWithRetry([trimmed]);
   const embedding = vectors[0] || [];
   if (embedding.length === 0) return null;
   queryCache.set(cacheKey, { embedding, expiresAt: Date.now() + QUERY_CACHE_TTL_MS });
@@ -96,7 +113,7 @@ export async function backfillEmbeddings(): Promise<number> {
   const missing = listMemoriesMissingEmbeddings({ limit: EMBEDDING_BATCH_SIZE });
   if (missing.length === 0) return 0;
   const texts = missing.map(item => item.content);
-  const embeddings = await fetchEmbeddings(texts);
+  const embeddings = await fetchEmbeddingsWithRetry(texts);
   let updated = 0;
   for (let i = 0; i < missing.length; i += 1) {
     const embedding = embeddings[i];
@@ -112,6 +129,7 @@ export async function backfillEmbeddings(): Promise<number> {
 }
 
 let embeddingWorkerStopped = false;
+let embeddingTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function startEmbeddingWorker(): void {
   if (!EMBEDDINGS_ENABLED) return;
@@ -124,7 +142,7 @@ export function startEmbeddingWorker(): void {
       // ignore embedding worker errors
     }
     if (!embeddingWorkerStopped) {
-      setTimeout(loop, EMBEDDING_INTERVAL_MS);
+      embeddingTimer = setTimeout(loop, EMBEDDING_INTERVAL_MS);
     }
   };
   loop();
@@ -132,4 +150,8 @@ export function startEmbeddingWorker(): void {
 
 export function stopEmbeddingWorker(): void {
   embeddingWorkerStopped = true;
+  if (embeddingTimer) {
+    clearTimeout(embeddingTimer);
+    embeddingTimer = null;
+  }
 }

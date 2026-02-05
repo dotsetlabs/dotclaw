@@ -22,4 +22,5 @@ DotClaw is designed for macOS and Linux hosts with Docker installed.
 
 - Write access to the project directory
 - Docker running under your user account
+- Docker host policy that allows privileged containers (default runtime mode)
 - Free disk space for container images and runtime logs

@@ -68,7 +68,7 @@ export interface PreferenceMemory {
 const MEMORY_DB_PATH = path.join(STORE_DIR, 'memory.db');
 let memoryDb: Database.Database | null = null;
 let ftsEnabled = true;
-const MEMORY_SCHEMA_VERSION = 3;
+const MEMORY_SCHEMA_VERSION = 4;
 
 function getUserVersion(db: Database.Database): number {
   const version = db.pragma('user_version', { simple: true }) as number;
@@ -119,6 +119,45 @@ function ensureMemorySchema(db: Database.Database): void {
     );
   `);
 
+  // Migration v4: Rebuild FTS table with id UNINDEXED to prevent false-positive matches on UUID fragments
+  if (currentVersion < 4) {
+    const ftsRebuildApplied = getMemoryMeta(db, 'fts_id_unindexed');
+    if (!ftsRebuildApplied) {
+      try {
+        db.exec(`DROP TRIGGER IF EXISTS memory_items_ai`);
+        db.exec(`DROP TRIGGER IF EXISTS memory_items_au`);
+        db.exec(`DROP TRIGGER IF EXISTS memory_items_ad`);
+        db.exec(`DROP TABLE IF EXISTS memory_fts`);
+        db.exec(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+            id UNINDEXED,
+            content,
+            tags,
+            tokenize = 'porter'
+          );
+          INSERT INTO memory_fts (id, content, tags)
+            SELECT id, content, tags_text FROM memory_items;
+          CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items BEGIN
+            INSERT INTO memory_fts (id, content, tags)
+            VALUES (new.id, new.content, new.tags_text);
+          END;
+          CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items BEGIN
+            UPDATE memory_fts
+            SET content = new.content, tags = new.tags_text
+            WHERE id = new.id;
+          END;
+          CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items BEGIN
+            DELETE FROM memory_fts WHERE id = old.id;
+          END;
+        `);
+        setMemoryMeta(db, 'fts_id_unindexed', '1');
+        logger.info('FTS table rebuilt with id UNINDEXED');
+      } catch (err) {
+        logger.warn({ err }, 'FTS migration failed; will retry on next startup');
+      }
+    }
+  }
+
   if (currentVersion !== MEMORY_SCHEMA_VERSION) {
     setUserVersion(db, MEMORY_SCHEMA_VERSION);
   }
@@ -153,6 +192,16 @@ export function initMemoryStore(): void {
   memoryDb = new Database(MEMORY_DB_PATH);
   memoryDb.pragma('journal_mode = WAL');
   memoryDb.pragma('busy_timeout = 3000');
+  memoryDb.pragma('max_page_count = 262144');
+  const currentAutoVacuum = memoryDb.pragma('auto_vacuum', { simple: true }) as number;
+  if (currentAutoVacuum !== 2) {
+    memoryDb.pragma('auto_vacuum = INCREMENTAL');
+    try {
+      memoryDb.exec('VACUUM');
+    } catch {
+      // VACUUM may fail on very large DBs; auto_vacuum will take effect on next VACUUM
+    }
+  }
 
   memoryDb.exec(`
     CREATE TABLE IF NOT EXISTS memory_items (
@@ -196,7 +245,7 @@ export function initMemoryStore(): void {
   try {
     memoryDb.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-        id,
+        id UNINDEXED,
         content,
         tags,
         tokenize = 'porter'
@@ -216,7 +265,8 @@ export function initMemoryStore(): void {
       END;
     `);
     ftsEnabled = true;
-  } catch {
+  } catch (err) {
+    console.warn('[memory-store] FTS5 initialization failed, falling back to LIKE search:', err instanceof Error ? err.message : String(err));
     ftsEnabled = false;
   }
 
@@ -225,6 +275,16 @@ export function initMemoryStore(): void {
   } catch (err) {
     logger.error({ err }, 'Memory store schema check failed');
     throw err;
+  }
+}
+
+export function closeMemoryStore(): void {
+  if (memoryDb) {
+    try {
+      memoryDb.pragma('wal_checkpoint(TRUNCATE)');
+      memoryDb.close();
+    } catch { /* best-effort close */ }
+    memoryDb = null;
   }
 }
 
@@ -533,7 +593,7 @@ export function searchMemories(params: {
   const scored = rows.map(row => {
     const ageDays = row.updated_at ? (Date.now() - new Date(row.updated_at).getTime()) / (1000 * 60 * 60 * 24) : 365;
     const recency = Math.exp(-ageDays / 30);
-    const bm25Score = 1 / (1 + (row.bm25 || 0));
+    const bm25Score = 1 / (1 + Math.abs(row.bm25 || 0));
     const score = (bm25Score * 0.55) + (row.importance * 0.3) + (recency * 0.15);
     return { ...row, score };
   });
@@ -703,13 +763,13 @@ export function recordMemoryAccess(ids: string[]): void {
   const db = getDb();
   const now = new Date().toISOString();
 
-  // Boost importance by 2% per access, capped at 1.0
+  // Boost importance by 2% per access, capped at 0.9 (reserving 0.9-1.0 for manual/critical items)
   const placeholders = ids.map(() => '?').join(',');
   db.prepare(`
     UPDATE memory_items
     SET last_accessed_at = ?,
         access_count = COALESCE(access_count, 0) + 1,
-        importance = MIN(1.0, importance + 0.02)
+        importance = MIN(0.9, importance + 0.02)
     WHERE id IN (${placeholders})
   `).run(now, ...ids);
 }
@@ -723,9 +783,9 @@ export function decayUnusedMemories(): number {
   const db = getDb();
   const info = db.prepare(`
     UPDATE memory_items
-    SET importance = MAX(0.1, importance - 0.01)
+    SET importance = MAX(0.05, importance * 0.98)
     WHERE (last_accessed_at IS NULL OR last_accessed_at < datetime('now', '-30 days'))
-      AND importance > 0.1
+      AND importance > 0.05
       AND (priority IS NULL OR priority != 'critical')
   `).run();
   return info.changes;
@@ -821,7 +881,7 @@ export function runMemoryMaintenance(): { expired: number; pruned: number; decay
     const intervalMs = vacuumIntervalDays * 24 * 60 * 60 * 1000;
     if (!Number.isFinite(lastVacuum) || (now - lastVacuum) >= intervalMs) {
       try {
-        db.exec('VACUUM');
+        db.pragma('incremental_vacuum(1000)');
         setMemoryMeta(db, 'last_vacuum_at', new Date(now).toISOString());
         vacuumed = true;
       } catch {

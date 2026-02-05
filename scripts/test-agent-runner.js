@@ -22,3 +22,8 @@ if (!skipInstall) {
 }
 
 runNpm(['run', 'build']);
+
+execFileSync(process.execPath, ['--test', 'test/**/*.test.js'], {
+  cwd: agentRunnerDir,
+  stdio: 'inherit'
+});

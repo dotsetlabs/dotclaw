@@ -51,12 +51,14 @@ All runtime data is stored in `~/.dotclaw` (configurable via `DOTCLAW_HOME` envi
     store/
       messages.db         Message history
       memory.db           Long-term memory
-    ipc/                  Container communication
+    ipc/                  Container communication (messages/tasks/requests + daemon agent_requests)
     sessions/             Per-group session state
   groups/
     main/CLAUDE.md        Main group memory
     global/CLAUDE.md      Global memory
     <group>/CLAUDE.md     Group memory
+    <group>/inbox/        Downloaded incoming Telegram media
+    <group>/downloads/    Files downloaded by mcp__dotclaw__download_url
     <group>/jobs/         Background job artifacts
   logs/
   prompts/

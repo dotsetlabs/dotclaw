@@ -59,6 +59,7 @@ function buildTaskSnapshot() {
     prompt: t.prompt,
     schedule_type: t.schedule_type,
     schedule_value: t.schedule_value,
+    timezone: t.timezone ?? null,
     status: t.status,
     next_run: t.next_run,
     state_json: t.state_json ?? null,
@@ -98,6 +99,17 @@ export async function executeAgentRun(params: {
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   maxToolSteps?: number;
   timeoutMs?: number;
+  timezone?: string;
+  attachments?: Array<{
+    type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
+    path: string;
+    file_name?: string;
+    mime_type?: string;
+    file_size?: number;
+    duration?: number;
+    width?: number;
+    height?: number;
+  }>;
 }): Promise<{ output: ContainerOutput; context: AgentContext }> {
   const group = params.group;
   const isMain = group.folder === MAIN_GROUP_FOLDER;
@@ -149,12 +161,13 @@ export async function executeAgentRun(params: {
     modelMaxOutputTokens: Number.isFinite(resolvedMaxOutputTokens) ? resolvedMaxOutputTokens : undefined,
     modelContextTokens: context.resolvedModel.override?.context_window,
     modelTemperature: context.resolvedModel.override?.temperature,
-    timezone: TIMEZONE,
+    timezone: params.timezone || TIMEZONE,
     disablePlanner: params.disablePlanner,
     disableResponseValidation: params.disableResponseValidation,
     responseValidationMaxRetries: params.responseValidationMaxRetries,
     disableMemoryExtraction: params.disableMemoryExtraction,
-    maxToolSteps: params.maxToolSteps
+    maxToolSteps: params.maxToolSteps,
+    attachments: params.attachments
   }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });
 
   let output: ContainerOutput;

@@ -3,6 +3,7 @@
     "logLevel": "info",
     "container": {
       "mode": "daemon",
+      "privileged": true,
       "instanceId": ""
     },
     "metrics": {

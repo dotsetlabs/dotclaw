@@ -38,6 +38,23 @@ dotclaw build
 
 Check `~/.dotclaw/logs/dotclaw.error.log` for details.
 
+## Unexpected container privilege behavior
+
+By default, DotClaw runs agent containers in privileged mode (`host.container.privileged=true`).
+If you need reduced container privileges, set:
+
+```json
+{
+  "host": {
+    "container": {
+      "privileged": false
+    }
+  }
+}
+```
+
+Then restart DotClaw.
+
 ## Diagnostics
 
 Run the doctor script to inspect common issues:

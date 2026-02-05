@@ -52,6 +52,25 @@ function calculateMemoryBudget(
   );
 }
 
+export function applyToolAllowOverride(policy: ToolPolicy, toolAllow?: string[]): ToolPolicy {
+  if (!Array.isArray(toolAllow) || toolAllow.length === 0) return policy;
+
+  const requested = Array.from(new Set(
+    toolAllow
+      .map(item => item.trim())
+      .filter(Boolean)
+  ));
+  const requestedLower = new Set(requested.map(item => item.toLowerCase()));
+
+  if (Array.isArray(policy.allow)) {
+    const filtered = policy.allow.filter(name => requestedLower.has(name.toLowerCase()));
+    return { ...policy, allow: filtered };
+  }
+
+  // If policy has no explicit allow-list, honor requested tools directly.
+  return { ...policy, allow: requested };
+}
+
 export async function buildAgentContext(params: {
   groupFolder: string;
   userId?: string | null;
@@ -126,13 +145,7 @@ export async function buildAgentContext(params: {
     ? mergeToolPolicyDeny(budgetedToolPolicy, params.toolDeny)
     : budgetedToolPolicy;
 
-  if (params.toolAllow && params.toolAllow.length > 0) {
-    const allowSet = new Set(params.toolAllow.map(item => item.trim()).filter(Boolean));
-    toolPolicy = {
-      ...toolPolicy,
-      allow: (toolPolicy.allow || []).filter(name => allowSet.has(name))
-    };
-  }
+  toolPolicy = applyToolAllowOverride(toolPolicy, params.toolAllow);
 
   const toolReliability = getToolReliability({ groupFolder: params.groupFolder, limit: 200 })
     .map(row => ({

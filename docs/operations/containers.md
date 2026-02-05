@@ -23,6 +23,25 @@ Set this in `~/.dotclaw/config/runtime.json`:
 }
 ```
 
+## Privilege mode
+
+`host.container.privileged` controls Docker privilege mode:
+
+- `true` (default): containers run `--privileged` as root for maximum in-container command capability.
+- `false`: containers run with a reduced capability set (`--cap-drop=ALL` plus required caps).
+
+Set this in `~/.dotclaw/config/runtime.json`:
+
+```json
+{
+  "host": {
+    "container": {
+      "privileged": true
+    }
+  }
+}
+```
+
 ## Browser automation
 
 The container image includes `agent-browser`, which can be invoked via the `Bash` tool
@@ -37,6 +56,13 @@ You can tune resource limits in `~/.dotclaw/config/runtime.json`:
 - `host.container.cpus`
 - `host.container.timeoutMs`
 - `host.container.maxOutputBytes`
+
+## Workspace file exchange
+
+- Incoming Telegram media (photo/document/voice/video/audio) is downloaded to
+  `~/.dotclaw/groups/<group>/inbox/` and exposed in-container as `/workspace/group/inbox/`.
+- The `mcp__dotclaw__download_url` tool saves files to `/workspace/group/downloads/` by default.
+- Maintenance cleanup prunes inbox files older than 14 days and enforces a 500MB per-group inbox budget.
 
 ## Read-only root
 

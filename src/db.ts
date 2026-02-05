@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import {
   NewMessage,
+  MessageAttachment,
   ScheduledTask,
   TaskRunLog,
   BackgroundJob,
@@ -31,6 +32,8 @@ export function initDatabase(): void {
 
   db = new Database(dbPath);
   dbInitialized = true;
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 3000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -57,6 +60,7 @@ export function initDatabase(): void {
       prompt TEXT NOT NULL,
       schedule_type TEXT NOT NULL,
       schedule_value TEXT NOT NULL,
+      timezone TEXT,
       next_run TEXT,
       last_run TEXT,
       last_result TEXT,
@@ -197,7 +201,8 @@ export function initDatabase(): void {
       created_at TEXT NOT NULL,
       started_at TEXT,
       completed_at TEXT,
-      error TEXT
+      error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_mq_chat_status ON message_queue(chat_jid, status);
   `);
@@ -219,6 +224,10 @@ export function initDatabase(): void {
   addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
   addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
   addColumnIfMissing(`ALTER TABLE tool_audit ADD COLUMN user_id TEXT`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN running_since TEXT`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT`);
+  addColumnIfMissing(`ALTER TABLE message_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`);
+  addColumnIfMissing(`ALTER TABLE messages ADD COLUMN attachments_json TEXT`);
 }
 
 /**
@@ -232,10 +241,12 @@ export function storeMessage(
   senderName: string,
   content: string,
   timestamp: string,
-  isFromMe: boolean
+  isFromMe: boolean,
+  attachments?: MessageAttachment[]
 ): void {
-  db.prepare(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .run(msgId, chatId, senderId, senderName, content, timestamp, isFromMe ? 1 : 0);
+  const attachmentsJson = attachments && attachments.length > 0 ? JSON.stringify(attachments) : null;
+  db.prepare(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(msgId, chatId, senderId, senderName, content, timestamp, isFromMe ? 1 : 0, attachmentsJson);
 }
 
 export function upsertChat(params: { chatId: string; name?: string | null; lastMessageTime?: string | null }): void {
@@ -266,7 +277,7 @@ export function getMessagesSinceCursor(
   const timestamp = sinceTimestamp || '1970-01-01T00:00:00.000Z';
   const messageId = sinceMessageId || '0';
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, attachments_json
     FROM messages
     WHERE chat_jid = ? AND is_from_me = 0 AND (
       timestamp > ? OR (timestamp = ? AND CAST(id AS INTEGER) > CAST(? AS INTEGER))
@@ -338,10 +349,10 @@ export function pauseTasksForGroup(groupFolder: string): number {
 export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>): void {
   db.prepare(`
     INSERT INTO scheduled_tasks (
-      id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode,
+      id, group_folder, chat_jid, prompt, schedule_type, schedule_value, timezone, context_mode,
       next_run, status, created_at, state_json, retry_count, last_error
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     task.id,
     task.group_folder,
@@ -349,6 +360,7 @@ export function createTask(task: Omit<ScheduledTask, 'last_run' | 'last_result'>
     task.prompt,
     task.schedule_type,
     task.schedule_value,
+    task.timezone ?? null,
     task.context_mode || 'isolated',
     task.next_run,
     task.status,
@@ -367,19 +379,21 @@ export function getAllTasks(): ScheduledTask[] {
   return db.prepare('SELECT * FROM scheduled_tasks ORDER BY created_at DESC').all() as ScheduledTask[];
 }
 
-export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status' | 'state_json' | 'retry_count' | 'last_error' | 'context_mode'>>): void {
+export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'prompt' | 'schedule_type' | 'schedule_value' | 'timezone' | 'next_run' | 'status' | 'state_json' | 'retry_count' | 'last_error' | 'context_mode' | 'running_since'>>): void {
   const fields: string[] = [];
   const values: unknown[] = [];
 
   if (updates.prompt !== undefined) { fields.push('prompt = ?'); values.push(updates.prompt); }
   if (updates.schedule_type !== undefined) { fields.push('schedule_type = ?'); values.push(updates.schedule_type); }
   if (updates.schedule_value !== undefined) { fields.push('schedule_value = ?'); values.push(updates.schedule_value); }
+  if (updates.timezone !== undefined) { fields.push('timezone = ?'); values.push(updates.timezone); }
   if (updates.next_run !== undefined) { fields.push('next_run = ?'); values.push(updates.next_run); }
   if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
   if (updates.context_mode !== undefined) { fields.push('context_mode = ?'); values.push(updates.context_mode); }
   if (updates.state_json !== undefined) { fields.push('state_json = ?'); values.push(updates.state_json); }
   if (updates.retry_count !== undefined) { fields.push('retry_count = ?'); values.push(updates.retry_count); }
   if (updates.last_error !== undefined) { fields.push('last_error = ?'); values.push(updates.last_error); }
+  if (updates.running_since !== undefined) { fields.push('running_since = ?'); values.push(updates.running_since); }
 
   if (fields.length === 0) return;
 
@@ -388,9 +402,10 @@ export function updateTask(id: string, updates: Partial<Pick<ScheduledTask, 'pro
 }
 
 export function deleteTask(id: string): void {
-  // Delete child records first (FK constraint)
-  db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
-  db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
+    db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
+  })();
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -400,6 +415,42 @@ export function getDueTasks(): ScheduledTask[] {
     WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?
     ORDER BY next_run
   `).all(now) as ScheduledTask[];
+}
+
+export function claimDueTasks(): ScheduledTask[] {
+  const now = new Date().toISOString();
+  const staleThreshold = new Date(Date.now() - 900_000).toISOString();
+  const claim = db.transaction(() => {
+    const tasks = db.prepare(`
+      SELECT * FROM scheduled_tasks
+      WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?
+        AND (running_since IS NULL OR running_since < ?)
+      ORDER BY next_run
+    `).all(now, staleThreshold) as ScheduledTask[];
+
+    for (const task of tasks) {
+      db.prepare(`UPDATE scheduled_tasks SET running_since = ? WHERE id = ?`).run(now, task.id);
+    }
+    return tasks;
+  });
+  return claim();
+}
+
+const VALID_TASK_TRANSITIONS: Record<string, string[]> = {
+  active: ['paused', 'completed', 'deleted'],
+  paused: ['active', 'deleted'],
+  completed: ['active', 'deleted'],
+  deleted: [],
+};
+
+export function transitionTaskStatus(id: string, newStatus: string): boolean {
+  const task = db.prepare('SELECT status FROM scheduled_tasks WHERE id = ?').get(id) as { status: string } | undefined;
+  if (!task) return false;
+  const allowed = VALID_TASK_TRANSITIONS[task.status] || [];
+  if (!allowed.includes(newStatus)) return false;
+  db.prepare('UPDATE scheduled_tasks SET status = ?, running_since = NULL WHERE id = ?')
+    .run(newStatus, id);
+  return true;
 }
 
 export function updateTaskAfterRun(
@@ -413,7 +464,8 @@ export function updateTaskAfterRun(
   db.prepare(`
     UPDATE scheduled_tasks
     SET next_run = ?, last_run = ?, last_result = ?, last_error = ?, retry_count = ?,
-        status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+        status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END,
+        running_since = NULL
     WHERE id = ?
   `).run(nextRun, now, lastResult, lastError, retryCount, nextRun, id);
 }
@@ -636,6 +688,23 @@ export function failExpiredBackgroundJobs(nowIso: string): number {
         last_error = COALESCE(last_error, 'Job lease expired')
     WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
   `).run(nowIso, nowIso, nowIso);
+  return info.changes;
+}
+
+export function resetStalledBackgroundJobs(): number {
+  const now = new Date().toISOString();
+  const info = db.prepare(`
+    UPDATE background_jobs
+    SET status = 'queued',
+        updated_at = ?,
+        started_at = NULL,
+        lease_expires_at = NULL,
+        last_error = CASE
+          WHEN last_error IS NULL OR last_error = '' THEN 'Recovered after restart'
+          ELSE last_error || '; recovered after restart'
+        END
+    WHERE status = 'running'
+  `).run(now);
   return info.changes;
 }
 
@@ -872,7 +941,7 @@ export function enqueueMessageItem(item: {
   return Number(info.lastInsertRowid);
 }
 
-export function claimBatchForChat(chatJid: string, windowMs: number): QueuedMessage[] {
+export function claimBatchForChat(chatJid: string, windowMs: number, maxBatchSize: number = 50): QueuedMessage[] {
   const select = db.prepare(`
     SELECT * FROM message_queue
     WHERE chat_jid = ? AND status = 'pending'
@@ -883,10 +952,11 @@ export function claimBatchForChat(chatJid: string, windowMs: number): QueuedMess
     SELECT * FROM message_queue
     WHERE chat_jid = ? AND status = 'pending' AND created_at <= ?
     ORDER BY id ASC
+    LIMIT ?
   `);
   const update = db.prepare(`
     UPDATE message_queue
-    SET status = 'processing', started_at = ?
+    SET status = 'processing', started_at = ?, attempt_count = COALESCE(attempt_count, 0) + 1
     WHERE id = ?
   `);
 
@@ -894,7 +964,7 @@ export function claimBatchForChat(chatJid: string, windowMs: number): QueuedMess
     const oldest = select.get(chatJid) as QueuedMessage | undefined;
     if (!oldest) return [];
     const cutoff = new Date(new Date(oldest.created_at).getTime() + windowMs).toISOString();
-    const batch = selectWindow.all(chatJid, cutoff) as QueuedMessage[];
+    const batch = selectWindow.all(chatJid, cutoff, maxBatchSize) as QueuedMessage[];
     const now = new Date().toISOString();
     for (const row of batch) {
       update.run(now, row.id);
@@ -908,7 +978,7 @@ export function claimBatchForChat(chatJid: string, windowMs: number): QueuedMess
 export function completeQueuedMessages(ids: number[]): void {
   if (ids.length === 0) return;
   const now = new Date().toISOString();
-  const stmt = db.prepare(`UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ?`);
+  const stmt = db.prepare(`UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ? AND status = 'processing'`);
   const txn = db.transaction((idList: number[]) => {
     for (const id of idList) {
       stmt.run(now, id);
@@ -920,10 +990,28 @@ export function completeQueuedMessages(ids: number[]): void {
 export function failQueuedMessages(ids: number[], error: string): void {
   if (ids.length === 0) return;
   const now = new Date().toISOString();
-  const stmt = db.prepare(`UPDATE message_queue SET status = 'failed', completed_at = ?, error = ? WHERE id = ?`);
+  const stmt = db.prepare(`UPDATE message_queue SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status = 'processing'`);
   const txn = db.transaction((idList: number[]) => {
     for (const id of idList) {
       stmt.run(now, error, id);
+    }
+  });
+  txn(ids);
+}
+
+export function requeueQueuedMessages(ids: number[], error: string): void {
+  if (ids.length === 0) return;
+  const stmt = db.prepare(`
+    UPDATE message_queue
+    SET status = 'pending',
+        started_at = NULL,
+        completed_at = NULL,
+        error = ?
+    WHERE id = ? AND status = 'processing'
+  `);
+  const txn = db.transaction((idList: number[]) => {
+    for (const id of idList) {
+      stmt.run(error, id);
     }
   });
   txn(ids);
@@ -936,11 +1024,12 @@ export function getChatsWithPendingMessages(): string[] {
   return rows.map(r => r.chat_jid);
 }
 
-export function resetStalledMessages(): number {
+export function resetStalledMessages(olderThanMs: number = 300_000): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
   const info = db.prepare(`
     UPDATE message_queue SET status = 'pending', started_at = NULL
-    WHERE status = 'processing'
-  `).run();
+    WHERE status = 'processing' AND started_at < ?
+  `).run(cutoff);
   return info.changes;
 }
 
@@ -951,4 +1040,53 @@ export function cleanupCompletedMessages(olderThanMs: number): number {
     WHERE status IN ('completed', 'failed') AND created_at < ?
   `).run(cutoff);
   return info.changes;
+}
+
+export function cleanupCompletedBackgroundJobs(olderThanMs: number): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  return db.transaction(() => {
+    const jobIds = db.prepare(`
+      SELECT id FROM background_jobs
+      WHERE status IN ('succeeded', 'failed', 'canceled', 'timed_out')
+        AND updated_at < ?
+    `).all(cutoff) as { id: string }[];
+    if (jobIds.length === 0) return 0;
+    const ids = jobIds.map(j => j.id);
+    const ph = ids.map(() => '?').join(',');
+    db.prepare(`DELETE FROM background_job_runs WHERE job_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM background_job_events WHERE job_id IN (${ph})`).run(...ids);
+    db.prepare(`DELETE FROM background_jobs WHERE id IN (${ph})`).run(...ids);
+    return ids.length;
+  })();
+}
+
+export function cleanupOldTaskRunLogs(olderThanMs: number): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const info = db.prepare('DELETE FROM task_run_logs WHERE run_at < ?').run(cutoff);
+  return info.changes;
+}
+
+export function cleanupOldToolAudit(olderThanMs: number): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const info = db.prepare('DELETE FROM tool_audit WHERE created_at < ?').run(cutoff);
+  return info.changes;
+}
+
+export function cleanupOldMessageTraces(olderThanMs: number): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const info = db.prepare('DELETE FROM message_traces WHERE created_at < ?').run(cutoff);
+  return info.changes;
+}
+
+export function cleanupOldUserFeedback(olderThanMs: number): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const info = db.prepare('DELETE FROM user_feedback WHERE created_at < ?').run(cutoff);
+  return info.changes;
+}
+
+export function getPendingMessageCount(): number {
+  try {
+    const row = db.prepare("SELECT COUNT(*) as count FROM message_queue WHERE status = 'pending'").get() as { count: number };
+    return row.count;
+  } catch { return 0; }
 }

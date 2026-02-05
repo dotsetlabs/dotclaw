@@ -108,3 +108,27 @@ Example:
   "nonMainReadOnly": true
 }
 ```
+
+## Built-in DotClaw tools
+
+DotClaw injects MCP tools prefixed with `mcp__dotclaw__...` in addition to standard coding tools.
+
+Telegram output tools:
+
+- `mcp__dotclaw__send_message`
+- `mcp__dotclaw__send_file`
+- `mcp__dotclaw__send_photo`
+- `mcp__dotclaw__send_voice`
+- `mcp__dotclaw__send_audio`
+- `mcp__dotclaw__send_location`
+- `mcp__dotclaw__send_contact`
+- `mcp__dotclaw__send_poll`
+- `mcp__dotclaw__send_buttons`
+- `mcp__dotclaw__edit_message`
+- `mcp__dotclaw__delete_message`
+
+Utility:
+
+- `mcp__dotclaw__download_url` (enabled when WebFetch is enabled)
+
+Most send tools support `reply_to_message_id` for threaded replies.

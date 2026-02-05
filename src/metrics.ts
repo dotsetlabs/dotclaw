@@ -197,7 +197,7 @@ export function startMetricsServer(): void {
   metricsServer.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
       logger.error({ port, bind }, `Metrics port ${port} is already in use. Check for conflicting instances or services.`);
-      process.exit(1);
+      process.kill(process.pid, 'SIGTERM');
     }
     logger.error({ err, port }, 'Metrics server error');
   });

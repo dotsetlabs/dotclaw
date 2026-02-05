@@ -20,3 +20,30 @@ test('getEffectiveToolPolicy returns policy with expected tools', async () => {
   assert.ok(policy.max_per_run?.Bash !== undefined, 'Should have Bash limit');
   assert.ok(policy.max_per_run?.Python !== undefined, 'Should have Python limit');
 });
+
+test('applyToolAllowOverride filters allow-list case-insensitively', async () => {
+  const { applyToolAllowOverride } = await importFresh(distPath('agent-context.js'));
+  const next = applyToolAllowOverride(
+    { allow: ['Read', 'WebSearch', 'Bash'], deny: [] },
+    ['websearch', 'READ']
+  );
+
+  assert.deepEqual(next.allow, ['Read', 'WebSearch']);
+});
+
+test('applyToolAllowOverride fails closed when requested tools do not match policy', async () => {
+  const { applyToolAllowOverride } = await importFresh(distPath('agent-context.js'));
+  const next = applyToolAllowOverride(
+    { allow: ['Read', 'WebSearch'], deny: [] },
+    ['NoSuchTool']
+  );
+
+  assert.deepEqual(next.allow, []);
+});
+
+test('applyToolAllowOverride applies explicit allow-list when policy has no allow entries', async () => {
+  const { applyToolAllowOverride } = await importFresh(distPath('agent-context.js'));
+  const next = applyToolAllowOverride({ deny: [] }, ['Bash', 'Python']);
+
+  assert.deepEqual(next.allow, ['Bash', 'Python']);
+});

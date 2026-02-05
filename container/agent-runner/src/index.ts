@@ -40,6 +40,9 @@ const AVAILABLE_GROUPS_PATH = '/workspace/ipc/available_groups.json';
 const GROUP_CLAUDE_PATH = path.join(GROUP_DIR, 'CLAUDE.md');
 const GLOBAL_CLAUDE_PATH = path.join(GLOBAL_DIR, 'CLAUDE.md');
 const CLAUDE_NOTES_MAX_CHARS = 4000;
+const SKILL_NOTES_MAX_FILES = 16;
+const SKILL_NOTES_MAX_CHARS = 3000;
+const SKILL_NOTES_TOTAL_MAX_CHARS = 18_000;
 
 const agentConfig = loadAgentConfig();
 const agent = agentConfig.agent;
@@ -470,6 +473,7 @@ function buildSystemInstructions(params: {
   assistantName: string;
   groupNotes?: string | null;
   globalNotes?: string | null;
+  skillNotes?: SkillNote[];
   memorySummary: string;
   memoryFacts: string[];
   sessionRecall: string[];
@@ -502,7 +506,19 @@ function buildSystemInstructions(params: {
     '- `GitClone`: clone git repositories into the workspace.',
     '- `NpmInstall`: install npm dependencies in the workspace.',
     '- `mcp__dotclaw__send_message`: send Telegram messages.',
-    '- `mcp__dotclaw__schedule_task`: schedule tasks.',
+    '- `mcp__dotclaw__send_file`: send a file/document.',
+    '- `mcp__dotclaw__send_photo`: send a photo with compression.',
+    '- `mcp__dotclaw__send_voice`: send a voice message (.ogg format).',
+    '- `mcp__dotclaw__send_audio`: send an audio file (mp3, m4a, etc.).',
+    '- `mcp__dotclaw__send_location`: send a map pin (latitude/longitude).',
+    '- `mcp__dotclaw__send_contact`: send a contact card (phone + name).',
+    '- `mcp__dotclaw__send_poll`: create a Telegram poll.',
+    '- `mcp__dotclaw__send_buttons`: send a message with inline keyboard buttons.',
+    '- `mcp__dotclaw__edit_message`: edit a previously sent message.',
+    '- `mcp__dotclaw__delete_message`: delete a message.',
+    '- `mcp__dotclaw__download_url`: download a URL to the workspace as a file.',
+    '- Users may send photos, documents, voice messages, and videos. These are downloaded to `/workspace/group/inbox/` and referenced as `<attachment>` tags in messages. Process them with Read/Bash/Python tools.',
+    '- `mcp__dotclaw__schedule_task`: schedule tasks (set `timezone` for locale-specific schedules).',
     '- `mcp__dotclaw__run_task`: run a scheduled task immediately.',
     '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
     '- `mcp__dotclaw__update_task`: update a task (state, prompt, schedule, status).',
@@ -552,6 +568,7 @@ function buildSystemInstructions(params: {
 
   const groupNotes = params.groupNotes ? `Group notes:\n${params.groupNotes}` : '';
   const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
+  const skillNotes = formatSkillNotes(params.skillNotes || []);
 
   const toolReliability = params.toolReliability && params.toolReliability.length > 0
     ? params.toolReliability
@@ -629,6 +646,7 @@ function buildSystemInstructions(params: {
     browserAutomation,
     groupNotes,
     globalNotes,
+    skillNotes,
     timezoneNote,
     params.planBlock || '',
     toolCallingBlock,
@@ -690,6 +708,123 @@ function loadClaudeNotes(): { group: string | null; global: string | null } {
   };
 }
 
+export type SkillNote = {
+  scope: 'group' | 'global';
+  path: string;
+  content: string;
+};
+
+function collectSkillFiles(rootDir: string, maxFiles: number): string[] {
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const addFile = (filePath: string) => {
+    const normalized = path.resolve(filePath);
+    if (seen.has(normalized)) return;
+    if (!fs.existsSync(normalized)) return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(normalized);
+    } catch {
+      return;
+    }
+    if (!stat.isFile()) return;
+    if (!normalized.toLowerCase().endsWith('.md')) return;
+    seen.add(normalized);
+    files.push(normalized);
+  };
+
+  addFile(path.join(rootDir, 'SKILL.md'));
+
+  const skillsDir = path.join(rootDir, 'skills');
+  if (fs.existsSync(skillsDir)) {
+    const stack = [skillsDir];
+    while (stack.length > 0 && files.length < maxFiles) {
+      const current = stack.pop();
+      if (!current) continue;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const nextPath = path.join(current, entry.name);
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isDirectory()) {
+          stack.push(nextPath);
+          continue;
+        }
+        if (entry.isFile()) {
+          addFile(nextPath);
+        }
+        if (files.length >= maxFiles) break;
+      }
+    }
+  }
+
+  files.sort((a, b) => a.localeCompare(b));
+  return files.slice(0, maxFiles);
+}
+
+export function loadSkillNotesFromRoots(params: {
+  groupDir: string;
+  globalDir: string;
+  maxFiles?: number;
+  maxCharsPerFile?: number;
+  maxTotalChars?: number;
+}): SkillNote[] {
+  const maxFiles = Number.isFinite(params.maxFiles) ? Math.max(1, Math.floor(params.maxFiles!)) : SKILL_NOTES_MAX_FILES;
+  const maxCharsPerFile = Number.isFinite(params.maxCharsPerFile)
+    ? Math.max(200, Math.floor(params.maxCharsPerFile!))
+    : SKILL_NOTES_MAX_CHARS;
+  const maxTotalChars = Number.isFinite(params.maxTotalChars)
+    ? Math.max(maxCharsPerFile, Math.floor(params.maxTotalChars!))
+    : SKILL_NOTES_TOTAL_MAX_CHARS;
+
+  const notes: SkillNote[] = [];
+  let consumedChars = 0;
+
+  const appendScopeNotes = (scope: 'group' | 'global', rootDir: string) => {
+    const skillFiles = collectSkillFiles(rootDir, maxFiles);
+    for (const filePath of skillFiles) {
+      if (notes.length >= maxFiles) break;
+      if (consumedChars >= maxTotalChars) break;
+      const content = readTextFileLimited(filePath, maxCharsPerFile);
+      if (!content) continue;
+      const remaining = maxTotalChars - consumedChars;
+      const truncated = content.length > remaining
+        ? `${content.slice(0, remaining)}\n\n[Truncated for total skill budget]`
+        : content;
+      const relativePath = path.relative(rootDir, filePath).split(path.sep).join('/');
+      notes.push({
+        scope,
+        path: relativePath || path.basename(filePath),
+        content: truncated
+      });
+      consumedChars += truncated.length;
+      if (consumedChars >= maxTotalChars) break;
+    }
+  };
+
+  appendScopeNotes('group', params.groupDir);
+  appendScopeNotes('global', params.globalDir);
+  return notes;
+}
+
+function formatSkillNotes(notes: SkillNote[]): string {
+  if (!notes || notes.length === 0) return '';
+  const lines: string[] = [
+    'Skill instructions (loaded from SKILL.md / skills/*.md):',
+    'When a task matches a skill, follow that skill workflow first and keep output concise.'
+  ];
+  for (const note of notes) {
+    lines.push(`[${note.scope}] ${note.path}`);
+    lines.push(note.content);
+  }
+  return lines.join('\n\n');
+}
+
 function extractQueryFromPrompt(prompt: string): string {
   if (!prompt) return '';
   const messageMatches = [...prompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
@@ -705,6 +840,7 @@ function decodeXml(value: string): string {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
     .replace(/&amp;/g, '&');
 }
 
@@ -1002,6 +1138,10 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const tokenEstimate = resolveTokenEstimate(input, agentConfig);
   const availableGroups = loadAvailableGroups();
   const claudeNotes = loadClaudeNotes();
+  const skillNotes = loadSkillNotesFromRoots({
+    groupDir: GROUP_DIR,
+    globalDir: GLOBAL_DIR
+  });
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
   const toolCalls: ToolCallRecord[] = [];
@@ -1051,6 +1191,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   let prompt = input.prompt;
   if (input.isScheduledTask) {
     prompt = `[SCHEDULED TASK - You are running automatically, not in response to a user message. Use mcp__dotclaw__send_message if needed to communicate with the user.]\n\n${input.prompt}`;
+  }
+  if (Array.isArray(input.attachments) && input.attachments.length > 0) {
+    const attachmentSummary = input.attachments.map(attachment => {
+      const parts = [`type=${attachment.type}`, `path=${attachment.path}`];
+      if (attachment.file_name) parts.push(`filename=${attachment.file_name}`);
+      if (attachment.mime_type) parts.push(`mime=${attachment.mime_type}`);
+      if (Number.isFinite(attachment.file_size)) parts.push(`size=${attachment.file_size}`);
+      return `- ${parts.join(' ')}`;
+    }).join('\n');
+    prompt = `${prompt}\n\n<latest_attachments>\n${attachmentSummary}\n</latest_attachments>`;
   }
 
   appendHistory(sessionCtx, 'user', prompt);
@@ -1182,6 +1332,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     assistantName,
     groupNotes: claudeNotes.group,
     globalNotes: claudeNotes.global,
+    skillNotes,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
     sessionRecall,
@@ -1288,6 +1439,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
       + tokenEstimate.tokensPerRequest;
 
+    const safeLimit = Math.floor(config.maxContextTokens * 0.9);
+    if (resolvedPromptTokens > safeLimit && contextMessages.length > 2) {
+      log(`Estimated ${resolvedPromptTokens} tokens exceeds safe limit ${safeLimit}, truncating`);
+      while (contextMessages.length > 2) {
+        const currentTokens = resolvedInstructionTokens + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage) + tokenEstimate.tokensPerRequest;
+        if (currentTokens <= safeLimit) break;
+        contextMessages.splice(0, 1);
+      }
+    }
+
     log('Starting OpenRouter call...');
     const startedAt = Date.now();
     const callParams = {
@@ -1358,8 +1519,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       && completionTokens >= responseValidateMinResponseTokens
       && (responseValidateAllowToolCalls || modelToolCalls.length === 0);
     if (shouldValidate) {
+      const MAX_VALIDATION_ITERATIONS = 5;
       let retriesLeft = responseValidateMaxRetries;
-      while (true) {
+      for (let _validationIter = 0; _validationIter < MAX_VALIDATION_ITERATIONS; _validationIter++) {
         if (!responseValidateAllowToolCalls && modelToolCalls.length > 0) {
           break;
         }
@@ -1498,16 +1660,25 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   };
 
   if (memoryExtractionEnabled && (!input.isScheduledTask || memoryExtractScheduled)) {
-    if (memoryExtractionAsync && isDaemon) {
-      void runMemoryExtraction().catch(err => {
-        log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
-    } else {
-      try {
-        await runMemoryExtraction();
-      } catch (err) {
-        log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+    const runMemoryExtractionWithRetry = async (maxRetries = 2): Promise<void> => {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          await runMemoryExtraction();
+          return;
+        } catch (err) {
+          log(`Memory extraction attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+          }
+        }
       }
+      log('Memory extraction failed after all retries');
+    };
+
+    if (memoryExtractionAsync && isDaemon) {
+      void runMemoryExtractionWithRetry().catch(() => {});
+    } else {
+      await runMemoryExtractionWithRetry();
     }
   }
 

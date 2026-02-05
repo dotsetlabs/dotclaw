@@ -35,5 +35,27 @@ test('loadRuntimeConfig merges defaults with overrides', async () => {
     // defaults still applied
     assert.equal(typeof config.host.container.maxOutputBytes, 'number');
     assert.equal(config.host.container.maxOutputBytes > 0, true);
+    assert.equal(config.host.container.privileged, true);
+  });
+});
+
+test('loadRuntimeConfig allows overriding container privileged mode', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-runtime-'));
+  const configDir = path.join(tempDir, 'config');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  const runtimePayload = {
+    host: {
+      container: {
+        privileged: false
+      }
+    }
+  };
+  fs.writeFileSync(path.join(configDir, 'runtime.json'), JSON.stringify(runtimePayload, null, 2));
+
+  await withTempHome(tempDir, async () => {
+    const { loadRuntimeConfig } = await importFresh(distPath('runtime-config.js'));
+    const config = loadRuntimeConfig();
+    assert.equal(config.host.container.privileged, false);
   });
 });

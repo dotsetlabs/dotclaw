@@ -78,7 +78,7 @@ export function createProgressManager(params: {
   stageThrottleMs?: number;
   send: (text: string) => Promise<void>;
   onError?: (err: unknown) => void;
-}): { start: () => void; stop: () => void; setStage: (stage: string) => void; notify: (text: string) => void } {
+}): { start: () => void; stop: () => Promise<void>; setStage: (stage: string) => void; notify: (text: string) => void } {
   const maxUpdates = Math.max(0, Math.floor(params.maxUpdates));
   const initialDelay = Math.max(0, Math.floor(params.initialDelayMs));
   const intervalDelay = Math.max(0, Math.floor(params.intervalMs));
@@ -94,13 +94,15 @@ export function createProgressManager(params: {
   let intervalTimer: NodeJS.Timeout | null = null;
   let lastStageSent: string | null = null;
   let lastSentAt = 0;
+  let pendingSend: Promise<void> | null = null;
 
-  const stop = () => {
+  const stop = (): Promise<void> => {
     stopped = true;
     if (initialTimer) clearTimeout(initialTimer);
     if (intervalTimer) clearInterval(intervalTimer);
     initialTimer = null;
     intervalTimer = null;
+    return pendingSend || Promise.resolve();
   };
 
   const ensureInterval = () => {
@@ -114,19 +116,20 @@ export function createProgressManager(params: {
     if (stopped || !params.enabled) return;
     if (maxUpdates === 0) return;
     if (updateCount >= maxUpdates) {
-      stop();
+      void stop();
       return;
     }
     updateCount += 1;
     ensureInterval();
     lastSentAt = Date.now();
-    try {
-      await params.send(text);
-    } catch (err) {
+    pendingSend = params.send(text).catch((err) => {
       params.onError?.(err);
-    }
+    }).finally(() => {
+      pendingSend = null;
+    });
+    await pendingSend;
     if (updateCount >= maxUpdates) {
-      stop();
+      void stop();
     }
   };
 
@@ -184,7 +187,7 @@ export function createProgressNotifier(params: {
   messages: string[];
   send: (text: string) => Promise<void>;
   onError?: (err: unknown) => void;
-}): { start: () => void; stop: () => void } {
+}): { start: () => void; stop: () => Promise<void> } {
   const maxUpdates = Math.max(0, Math.floor(params.maxUpdates));
   const initialDelay = Math.max(0, Math.floor(params.initialDelayMs));
   const intervalDelay = Math.max(0, Math.floor(params.intervalMs));
@@ -194,13 +197,15 @@ export function createProgressNotifier(params: {
   let updateCount = 0;
   let initialTimer: NodeJS.Timeout | null = null;
   let intervalTimer: NodeJS.Timeout | null = null;
+  let pendingSend: Promise<void> | null = null;
 
-  const stop = () => {
+  const stop = (): Promise<void> => {
     stopped = true;
     if (initialTimer) clearTimeout(initialTimer);
     if (intervalTimer) clearInterval(intervalTimer);
     initialTimer = null;
     intervalTimer = null;
+    return pendingSend || Promise.resolve();
   };
 
   const ensureInterval = () => {
@@ -214,19 +219,20 @@ export function createProgressNotifier(params: {
     if (stopped || !params.enabled) return;
     if (maxUpdates === 0) return;
     if (updateCount >= maxUpdates) {
-      stop();
+      void stop();
       return;
     }
     const index = Math.min(updateCount, messages.length - 1);
     updateCount += 1;
     ensureInterval();
-    try {
-      await params.send(messages[index]);
-    } catch (err) {
+    pendingSend = params.send(messages[index]).catch((err) => {
       params.onError?.(err);
-    }
+    }).finally(() => {
+      pendingSend = null;
+    });
+    await pendingSend;
     if (updateCount >= maxUpdates) {
-      stop();
+      void stop();
     }
   };
 

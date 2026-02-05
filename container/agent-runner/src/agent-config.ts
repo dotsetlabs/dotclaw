@@ -3,6 +3,7 @@ import fs from 'fs';
 export type AgentRuntimeConfig = {
   defaultModel: string;
   daemonPollMs: number;
+  daemonHeartbeatIntervalMs: number;
   agent: {
     assistantName: string;
     openrouter: {
@@ -118,6 +119,7 @@ export type AgentRuntimeConfig = {
 const CONFIG_PATH = '/workspace/config/runtime.json';
 const DEFAULT_DEFAULT_MODEL = 'moonshotai/kimi-k2.5';
 const DEFAULT_DAEMON_POLL_MS = 200;
+const DEFAULT_DAEMON_HEARTBEAT_INTERVAL_MS = 1_000;
 
 const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
   assistantName: 'Rain',
@@ -279,6 +281,7 @@ export function loadAgentConfig(): AgentRuntimeConfig {
 
   let defaultModel = DEFAULT_DEFAULT_MODEL;
   let daemonPollMs = DEFAULT_DAEMON_POLL_MS;
+  let daemonHeartbeatIntervalMs = DEFAULT_DAEMON_HEARTBEAT_INTERVAL_MS;
   let agentOverrides: unknown = null;
 
   if (isPlainObject(raw)) {
@@ -288,8 +291,13 @@ export function loadAgentConfig(): AgentRuntimeConfig {
         defaultModel = host.defaultModel.trim();
       }
       const container = host.container;
-      if (isPlainObject(container) && typeof container.daemonPollMs === 'number') {
-        daemonPollMs = container.daemonPollMs;
+      if (isPlainObject(container)) {
+        if (typeof container.daemonPollMs === 'number') {
+          daemonPollMs = container.daemonPollMs;
+        }
+        if (typeof container.daemonHeartbeatIntervalMs === 'number') {
+          daemonHeartbeatIntervalMs = container.daemonHeartbeatIntervalMs;
+        }
       }
     }
     if (isPlainObject(raw.agent)) {
@@ -300,6 +308,7 @@ export function loadAgentConfig(): AgentRuntimeConfig {
   cachedConfig = {
     defaultModel,
     daemonPollMs,
+    daemonHeartbeatIntervalMs,
     agent: mergeDefaults(DEFAULT_AGENT_CONFIG, agentOverrides)
   };
   return cachedConfig;

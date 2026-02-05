@@ -23,10 +23,14 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    sudo \
     python3 \
     python3-pip \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# Allow the node user to install system packages via sudo
+RUN echo 'node ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/node && chmod 0440 /etc/sudoers.d/node
 
 # Install common Python packages
 RUN pip3 install --break-system-packages pandas numpy requests beautifulsoup4 matplotlib

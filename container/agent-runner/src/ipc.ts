@@ -42,6 +42,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function isValidTimezone(timezone: string): boolean {
+  if (!timezone || typeof timezone !== 'string') return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function requestResponse(
   type: string,
   payload: Record<string, unknown>,
@@ -82,27 +92,172 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
   const { chatJid, groupFolder, isMain } = ctx;
 
   return {
-    async sendMessage(text: string) {
-      const data = {
+    async sendMessage(text: string, options?: { reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
         type: 'message',
         chatJid,
         text,
         groupFolder,
         timestamp: new Date().toISOString()
       };
+      if (options?.reply_to_message_id) data.reply_to_message_id = options.reply_to_message_id;
       const filename = writeIpcFile(MESSAGES_DIR, data);
       return { ok: true, id: filename };
+    },
+    async sendFile(args: { path: string; caption?: string; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_file',
+        chatJid,
+        path: args.path,
+        caption: args.caption,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendPhoto(args: { path: string; caption?: string; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_photo',
+        chatJid,
+        path: args.path,
+        caption: args.caption,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendVoice(args: { path: string; caption?: string; duration?: number; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_voice',
+        chatJid,
+        path: args.path,
+        caption: args.caption,
+        duration: args.duration,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendAudio(args: { path: string; caption?: string; duration?: number; performer?: string; title?: string; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_audio',
+        chatJid,
+        path: args.path,
+        caption: args.caption,
+        duration: args.duration,
+        performer: args.performer,
+        title: args.title,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendLocation(args: { latitude: number; longitude: number; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_location',
+        chatJid,
+        latitude: args.latitude,
+        longitude: args.longitude,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendContact(args: { phone_number: string; first_name: string; last_name?: string; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_contact',
+        chatJid,
+        phone_number: args.phone_number,
+        first_name: args.first_name,
+        last_name: args.last_name,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendPoll(args: {
+      question: string;
+      options: string[];
+      is_anonymous?: boolean;
+      allows_multiple_answers?: boolean;
+      type?: string;
+      correct_option_id?: number;
+      reply_to_message_id?: number;
+    }) {
+      const data: Record<string, unknown> = {
+        type: 'send_poll',
+        chatJid,
+        question: args.question,
+        options: args.options,
+        is_anonymous: args.is_anonymous,
+        allows_multiple_answers: args.allows_multiple_answers,
+        poll_type: args.type,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (typeof args.correct_option_id === 'number') data.correct_option_id = args.correct_option_id;
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async sendButtons(args: { text: string; buttons: Array<Array<{ text: string; url?: string; callback_data?: string }>>; reply_to_message_id?: number }) {
+      const data: Record<string, unknown> = {
+        type: 'send_buttons',
+        chatJid,
+        text: args.text,
+        buttons: args.buttons,
+        groupFolder,
+        timestamp: new Date().toISOString()
+      };
+      if (args.reply_to_message_id) data.reply_to_message_id = args.reply_to_message_id;
+      const filename = writeIpcFile(MESSAGES_DIR, data);
+      return { ok: true, id: filename };
+    },
+    async editMessage(args: { message_id: number; text: string; chat_jid?: string }) {
+      return requestResponse('edit_message', {
+        message_id: args.message_id,
+        text: args.text,
+        chat_jid: args.chat_jid || chatJid
+      }, config);
+    },
+    async deleteMessage(args: { message_id: number; chat_jid?: string }) {
+      return requestResponse('delete_message', {
+        message_id: args.message_id,
+        chat_jid: args.chat_jid || chatJid
+      }, config);
     },
     async scheduleTask(args: {
       prompt: string;
       schedule_type: 'cron' | 'interval' | 'once';
       schedule_value: string;
+      timezone?: string;
       context_mode?: 'group' | 'isolated';
       target_group?: string;
     }) {
+      const timezone = typeof args.timezone === 'string' && args.timezone.trim()
+        ? args.timezone.trim()
+        : undefined;
+      if (timezone && !isValidTimezone(timezone)) {
+        return {
+          ok: false,
+          error: `Invalid timezone: "${args.timezone}". Use an IANA timezone like "America/New_York".`
+        };
+      }
       if (args.schedule_type === 'cron') {
         try {
-          CronExpressionParser.parse(args.schedule_value);
+          CronExpressionParser.parse(args.schedule_value, timezone ? { tz: timezone } : undefined);
         } catch {
           return {
             ok: false,
@@ -134,6 +289,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
         prompt: args.prompt,
         schedule_type: args.schedule_type,
         schedule_value: args.schedule_value,
+        timezone,
         context_mode: args.context_mode || 'group',
         groupFolder: targetGroup,
         chatJid,
@@ -190,7 +346,11 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       return { ok: true };
     },
 
-    async updateTask(args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; context_mode?: string; status?: string }) {
+    async updateTask(args: { task_id: string; state_json?: string; prompt?: string; schedule_type?: string; schedule_value?: string; timezone?: string; context_mode?: string; status?: string }) {
+      const timezone = typeof args.timezone === 'string' ? args.timezone.trim() : undefined;
+      if (timezone && !isValidTimezone(timezone)) {
+        return { ok: false, error: `Invalid timezone: "${args.timezone}".` };
+      }
       writeIpcFile(TASKS_DIR, {
         type: 'update_task',
         taskId: args.task_id,
@@ -198,6 +358,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
         prompt: args.prompt,
         schedule_type: args.schedule_type,
         schedule_value: args.schedule_value,
+        timezone,
         context_mode: args.context_mode,
         status: args.status,
         groupFolder,

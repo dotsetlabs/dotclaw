@@ -61,7 +61,9 @@ test('cleanupTraceFiles returns 0 when trace dir has no old files', async () => 
 test('cleanupOrphanedIpcFiles removes stale IPC files', async () => {
   await withTempHome(tmpDir, async () => {
     const ipcDir = path.join(tmpDir, 'data', 'ipc', 'main', 'requests');
+    const agentRequestsDir = path.join(tmpDir, 'data', 'ipc', 'main', 'agent_requests');
     fs.mkdirSync(ipcDir, { recursive: true });
+    fs.mkdirSync(agentRequestsDir, { recursive: true });
 
     // Create a stale file (set mtime to 10 minutes ago)
     const staleFile = path.join(ipcDir, 'old-request.json');
@@ -73,12 +75,21 @@ test('cleanupOrphanedIpcFiles removes stale IPC files', async () => {
     const freshFile = path.join(ipcDir, 'fresh-request.json');
     fs.writeFileSync(freshFile, '{}');
 
+    // Create stale and fresh daemon cancel sentinels
+    const staleCancel = path.join(agentRequestsDir, 'old-request.cancel');
+    fs.writeFileSync(staleCancel, '');
+    fs.utimesSync(staleCancel, pastTime, pastTime);
+    const freshCancel = path.join(agentRequestsDir, 'fresh-request.cancel');
+    fs.writeFileSync(freshCancel, '');
+
     const mod = await importFresh(distPath('maintenance.js'));
     const removed = mod.cleanupOrphanedIpcFiles();
 
-    assert.equal(removed, 1);
+    assert.equal(removed, 2);
     assert.ok(!fs.existsSync(staleFile), 'Stale file should be removed');
+    assert.ok(!fs.existsSync(staleCancel), 'Stale cancel sentinel should be removed');
     assert.ok(fs.existsSync(freshFile), 'Fresh file should remain');
+    assert.ok(fs.existsSync(freshCancel), 'Fresh cancel sentinel should remain');
   });
 });
 
@@ -121,5 +132,34 @@ test('cleanupIpcErrorFiles returns 0 when no old error files', async () => {
     const mod = await importFresh(distPath('maintenance.js'));
     const removed = mod.cleanupIpcErrorFiles();
     assert.equal(removed, 0);
+  });
+});
+
+test('cleanupStaleSessionSnapshots removes stale session snapshot directories', async () => {
+  await withTempHome(tmpDir, async () => {
+    const openrouterDir = path.join(tmpDir, 'data', 'sessions', 'main', 'openrouter');
+    fs.mkdirSync(openrouterDir, { recursive: true });
+
+    const staleDash = path.join(openrouterDir, 'session-stale-1');
+    const staleUnderscore = path.join(openrouterDir, 'session_stale_2');
+    const freshDash = path.join(openrouterDir, 'session-fresh-3');
+    const nonSession = path.join(openrouterDir, 'notes');
+    fs.mkdirSync(staleDash, { recursive: true });
+    fs.mkdirSync(staleUnderscore, { recursive: true });
+    fs.mkdirSync(freshDash, { recursive: true });
+    fs.mkdirSync(nonSession, { recursive: true });
+
+    const oldTime = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(staleDash, oldTime, oldTime);
+    fs.utimesSync(staleUnderscore, oldTime, oldTime);
+
+    const mod = await importFresh(distPath('maintenance.js'));
+    const removed = mod.cleanupStaleSessionSnapshots();
+
+    assert.equal(removed, 2);
+    assert.equal(fs.existsSync(staleDash), false);
+    assert.equal(fs.existsSync(staleUnderscore), false);
+    assert.equal(fs.existsSync(freshDash), true);
+    assert.equal(fs.existsSync(nonSession), true);
   });
 });

@@ -45,6 +45,16 @@ export interface ContainerInput {
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
   disableMemoryExtraction?: boolean;
+  attachments?: Array<{
+    type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
+    path: string;
+    file_name?: string;
+    mime_type?: string;
+    file_size?: number;
+    duration?: number;
+    width?: number;
+    height?: number;
+  }>;
 }
 
 export interface ContainerOutput {

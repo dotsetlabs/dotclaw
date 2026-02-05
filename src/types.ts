@@ -45,6 +45,19 @@ export interface Session {
   [folder: string]: string;
 }
 
+export interface MessageAttachment {
+  type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+  local_path?: string;
+  duration?: number;
+  width?: number;
+  height?: number;
+}
+
 export interface NewMessage {
   id: string;
   chat_jid: string;
@@ -52,6 +65,8 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
+  attachments?: MessageAttachment[];
+  attachments_json?: string | null;
 }
 
 export interface ScheduledTask {
@@ -61,6 +76,7 @@ export interface ScheduledTask {
   prompt: string;
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
+  timezone?: string | null;
   context_mode: 'group' | 'isolated';
   next_run: string | null;
   last_run: string | null;
@@ -68,6 +84,7 @@ export interface ScheduledTask {
   state_json?: string | null;
   retry_count?: number | null;
   last_error?: string | null;
+  running_since?: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
 }
@@ -153,4 +170,5 @@ export interface QueuedMessage {
   message_thread_id: number | null;
   status: string;
   created_at: string;
+  attempt_count?: number | null;
 }

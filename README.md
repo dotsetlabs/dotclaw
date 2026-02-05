@@ -6,6 +6,8 @@ Personal OpenRouter-based assistant for Telegram. Each request runs inside an is
 
 - Telegram bot interface with per-group isolation
 - Containerized agent runtime with strict mounts
+- Rich Telegram I/O tools (file/photo/voice/audio/location/contact/poll/buttons/edit/delete)
+- Incoming media ingestion to workspace (`/workspace/group/inbox`) for agent processing
 - Long-term memory with embeddings and semantic search
 - Scheduled tasks (cron and one-off)
 - Background jobs for long-running work
