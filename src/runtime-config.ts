@@ -117,6 +117,20 @@ export type RuntimeConfig = {
       contextModeDefault: 'group' | 'isolated';
       toolAllow: string[];
       toolDeny: string[];
+      autoSpawn: {
+        enabled: boolean;
+        foregroundTimeoutMs: number;
+        onTimeout: boolean;
+        onToolLimit: boolean;
+        classifier: {
+          enabled: boolean;
+          model: string;
+          timeoutMs: number;
+          maxOutputTokens: number;
+          temperature: number;
+          confidenceThreshold: number;
+        };
+      };
     };
     toolBudgets: {
       enabled: boolean;
@@ -357,7 +371,21 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         'mcp__dotclaw__pause_task',
         'mcp__dotclaw__resume_task',
         'mcp__dotclaw__cancel_task'
-      ]
+      ],
+      autoSpawn: {
+        enabled: true,
+        foregroundTimeoutMs: 180_000,
+        onTimeout: true,
+        onToolLimit: true,
+        classifier: {
+          enabled: true,
+          model: 'openai/gpt-5-nano',
+          timeoutMs: 3000,
+          maxOutputTokens: 32,
+          temperature: 0,
+          confidenceThreshold: 0.6
+        }
+      }
     },
     toolBudgets: {
       enabled: true,

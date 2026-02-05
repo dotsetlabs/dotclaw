@@ -39,3 +39,14 @@ Key fields:
 - `inlineMaxChars`: inline output limit before artifacts are used
 - `contextModeDefault`: `group` or `isolated`
 - `toolAllow` and `toolDeny`: job-specific tool policy
+- `autoSpawn.enabled`: toggle auto-spawn (queue background jobs when foreground runs stall)
+- `autoSpawn.foregroundTimeoutMs`: max foreground runtime before auto-queue
+- `autoSpawn.onTimeout`: enqueue on timeouts
+- `autoSpawn.onToolLimit`: enqueue on tool-call step limits
+- `autoSpawn.classifier`: LLM router settings for immediate queueing
+- `autoSpawn.classifier.enabled`: toggle the classifier
+- `autoSpawn.classifier.model`: classifier model id
+- `autoSpawn.classifier.timeoutMs`: classifier timeout
+- `autoSpawn.classifier.maxOutputTokens`: classifier max output tokens
+- `autoSpawn.classifier.temperature`: classifier temperature
+- `autoSpawn.classifier.confidenceThreshold`: minimum confidence to queue

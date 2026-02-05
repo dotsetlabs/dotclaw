@@ -19,7 +19,9 @@ dotenv.config({ path: ENV_PATH });
 import { RegisteredGroup, Session, BackgroundJobStatus } from './types.js';
 import {
   initDatabase,
-  storeMessage,  getMessagesSinceCursor,
+  storeMessage,
+  upsertChat,
+  getMessagesSinceCursor,
   getChatState,
   updateChatState,
   createTask,
@@ -72,6 +74,7 @@ import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionE
 import { logger } from './logger.js';
 import { startDashboard, setTelegramConnected, setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
 import { humanizeError } from './error-messages.js';
+import { classifyBackgroundJob } from './background-job-classifier.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -222,6 +225,14 @@ const PROGRESS_MESSAGES = runtime.host.progress.messages.length > 0
 const HEARTBEAT_ENABLED = runtime.host.heartbeat.enabled;
 const HEARTBEAT_INTERVAL_MS = runtime.host.heartbeat.intervalMs;
 const HEARTBEAT_GROUP_FOLDER = (runtime.host.heartbeat.groupFolder || MAIN_GROUP_FOLDER).trim() || MAIN_GROUP_FOLDER;
+const BACKGROUND_JOBS_ENABLED = runtime.host.backgroundJobs.enabled;
+const AUTO_SPAWN_CONFIG = runtime.host.backgroundJobs.autoSpawn;
+const AUTO_SPAWN_ENABLED = BACKGROUND_JOBS_ENABLED && AUTO_SPAWN_CONFIG.enabled;
+const AUTO_SPAWN_FOREGROUND_TIMEOUT_MS = AUTO_SPAWN_CONFIG.foregroundTimeoutMs;
+const AUTO_SPAWN_ON_TIMEOUT = AUTO_SPAWN_CONFIG.onTimeout;
+const AUTO_SPAWN_ON_TOOL_LIMIT = AUTO_SPAWN_CONFIG.onToolLimit;
+const AUTO_SPAWN_CLASSIFIER_ENABLED = AUTO_SPAWN_CONFIG.classifier.enabled;
+const TOOL_CALL_FALLBACK_PATTERN = /tool calls? but did not get a final response/i;
 
 // Initialize Telegram bot with extended timeout for long-running agent tasks
 const telegrafBot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!, {
@@ -780,6 +791,74 @@ ${lines.join('\n')}
   let context: AgentContext | null = null;
   let errorMessage: string | null = null;
 
+  const isTimeoutError = (value?: string | null): boolean => {
+    if (!value) return false;
+    return /timed out|timeout/i.test(value);
+  };
+
+  const maybeAutoSpawn = async (reason: 'timeout' | 'tool_limit' | 'classifier', detail?: string | null): Promise<boolean> => {
+    if (!AUTO_SPAWN_ENABLED) return false;
+    if (reason === 'timeout' && !AUTO_SPAWN_ON_TIMEOUT) return false;
+    if (reason === 'tool_limit' && !AUTO_SPAWN_ON_TOOL_LIMIT) return false;
+
+    const result = spawnBackgroundJob({
+      prompt,
+      groupFolder: group.folder,
+      chatJid: msg.chatId,
+      contextMode: 'group',
+      tags: ['auto-spawn', reason],
+      parentTraceId: traceBase.trace_id,
+      parentMessageId: msg.messageId
+    });
+    if (!result.ok || !result.jobId) {
+      logger.warn({ chatId: msg.chatId, reason, error: result.error }, 'Auto-spawn background job failed');
+      return false;
+    }
+
+    const detailLine = detail ? `\n\nReason: ${detail}` : '';
+    await sendMessage(
+      msg.chatId,
+      `Queued this as background job ${result.jobId}. I'll report back when it's done. You can keep chatting while it runs.${detailLine}`,
+      { messageThreadId: msg.messageThreadId }
+    );
+
+    if (lastMessage) {
+      updateChatState(msg.chatId, lastMessage.timestamp, lastMessage.id);
+    }
+    if (draftId) {
+      clearDraftSession(msg.chatId, draftId);
+    }
+    return true;
+  };
+
+  if (AUTO_SPAWN_ENABLED && AUTO_SPAWN_CLASSIFIER_ENABLED && lastMessage) {
+    try {
+      const classifierResult = await classifyBackgroundJob({
+        lastMessage,
+        recentMessages: missedMessages,
+        isGroup: msg.isGroup,
+        chatType: msg.chatType
+      });
+      logger.info({
+        chatId: msg.chatId,
+        decision: classifierResult.shouldBackground,
+        confidence: classifierResult.confidence,
+        latencyMs: classifierResult.latencyMs,
+        model: classifierResult.model,
+        reason: classifierResult.reason,
+        error: classifierResult.error
+      }, 'Background job classifier decision');
+      if (classifierResult.shouldBackground) {
+        const autoSpawned = await maybeAutoSpawn('classifier');
+        if (autoSpawned) {
+          return true;
+        }
+      }
+    } catch (err) {
+      logger.warn({ chatId: msg.chatId, err }, 'Background job classifier failed');
+    }
+  }
+
   const progressNotifier = createProgressNotifier({
     enabled: PROGRESS_ENABLED && !streamingEnabled,
     initialDelayMs: PROGRESS_INITIAL_MS,
@@ -810,7 +889,10 @@ ${lines.join('\n')}
           minChars: TELEGRAM_STREAM_MIN_CHARS
         }
         : undefined,
-      availableGroups: buildAvailableGroupsSnapshot()
+      availableGroups: buildAvailableGroupsSnapshot(),
+      timeoutMs: AUTO_SPAWN_ENABLED && AUTO_SPAWN_FOREGROUND_TIMEOUT_MS > 0
+        ? AUTO_SPAWN_FOREGROUND_TIMEOUT_MS
+        : undefined
     });
     output = execution.output;
     context = execution.context;
@@ -859,6 +941,12 @@ ${lines.join('\n')}
         source: traceBase.source
       });
     }
+    if (isTimeoutError(message)) {
+      const autoSpawned = await maybeAutoSpawn('timeout', message);
+      if (autoSpawned) {
+        return true;
+      }
+    }
     const userMessage = humanizeError(errorMessage || 'Unknown error');
     await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
     if (draftId) {
@@ -880,7 +968,14 @@ ${lines.join('\n')}
       });
     }
     logger.error({ group: group.name, error: output.error }, 'Container agent error');
-    const userMessage = humanizeError(errorMessage || output.error || 'Unknown error');
+    const errorText = errorMessage || output.error || 'Unknown error';
+    if (isTimeoutError(errorText)) {
+      const autoSpawned = await maybeAutoSpawn('timeout', errorText);
+      if (autoSpawned) {
+        return true;
+      }
+    }
+    const userMessage = humanizeError(errorText);
     await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
     if (draftId) {
       clearDraftSession(msg.chatId, draftId);
@@ -910,6 +1005,22 @@ ${lines.join('\n')}
       }
     }
   } else if (output.tool_calls && output.tool_calls.length > 0) {
+    const toolLimitHit = !output.result || !output.result.trim() || TOOL_CALL_FALLBACK_PATTERN.test(output.result);
+    if (toolLimitHit) {
+      const autoSpawned = await maybeAutoSpawn('tool_limit', 'Tool-call step limit reached');
+      if (autoSpawned) {
+        if (context) {
+          recordAgentTelemetry({
+            traceBase,
+            output,
+            context,
+            metricsSource: 'telegram',
+            toolAuditSource: 'message'
+          });
+        }
+        return true;
+      }
+    }
     await sendMessage(
       msg.chatId,
       'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
@@ -2020,6 +2131,11 @@ function setupTelegramHandlers(): void {
     const isPrivate = chatType === 'private';
     const senderId = String(ctx.from?.id || ctx.chat.id);
     const senderName = ctx.from?.first_name || ctx.from?.username || 'User';
+    const chatName = ('title' in ctx.chat && ctx.chat.title)
+      || ('username' in ctx.chat && ctx.chat.username)
+      || ctx.from?.first_name
+      || ctx.from?.username
+      || senderName;
     const content = ctx.message.text;
     const timestamp = new Date(ctx.message.date * 1000).toISOString();
     const messageId = String(ctx.message.message_id);
@@ -2030,6 +2146,7 @@ function setupTelegramHandlers(): void {
 
     try {
       // Store message in database
+      upsertChat({ chatId, name: chatName, lastMessageTime: timestamp });
       storeMessage(
         String(ctx.message.message_id),
         chatId,

@@ -342,7 +342,7 @@ function buildSystemInstructions(params: {
     '- `mcp__dotclaw__spawn_job`: start a background job.',
     '- `mcp__dotclaw__job_status`, `mcp__dotclaw__list_jobs`, `mcp__dotclaw__cancel_job`.',
     '- `mcp__dotclaw__job_update`: log job progress or notify the user.',
-    'Tip: For long-running work (multi-step coding, large research), prefer `mcp__dotclaw__spawn_job` and report back when done.',
+    'Rule: If the task is likely to take more than ~2 minutes or needs multi-step research/coding, you MUST call `mcp__dotclaw__spawn_job` immediately and tell the user you queued it. Do not run long tasks in the foreground.',
     '- `mcp__dotclaw__register_group`: main group only.',
     '- `mcp__dotclaw__remove_group`, `mcp__dotclaw__list_groups`: main group only.',
     '- `mcp__dotclaw__set_model`: main group only.',

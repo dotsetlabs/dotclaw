@@ -217,6 +217,26 @@ export function storeMessage(
     .run(msgId, chatId, senderId, senderName, content, timestamp, isFromMe ? 1 : 0);
 }
 
+export function upsertChat(params: { chatId: string; name?: string | null; lastMessageTime?: string | null }): void {
+  const name = params.name?.trim() || null;
+  const lastMessageTime = params.lastMessageTime ?? null;
+
+  db.prepare(`INSERT OR IGNORE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)`)
+    .run(params.chatId, name, lastMessageTime);
+
+  db.prepare(`
+    UPDATE chats
+    SET
+      name = COALESCE(?, name),
+      last_message_time = CASE
+        WHEN ? IS NULL THEN last_message_time
+        WHEN last_message_time IS NULL OR last_message_time < ? THEN ?
+        ELSE last_message_time
+      END
+    WHERE jid = ?
+  `).run(name, lastMessageTime, lastMessageTime, lastMessageTime, params.chatId);
+}
+
 export function getMessagesSinceCursor(
   chatJid: string,
   sinceTimestamp: string | null,

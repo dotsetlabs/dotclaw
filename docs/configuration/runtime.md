@@ -32,7 +32,21 @@ title: Runtime Config
       "maxConcurrent": 2,
       "maxRuntimeMs": 2400000,
       "inlineMaxChars": 8000,
-      "contextModeDefault": "group"
+      "contextModeDefault": "group",
+      "autoSpawn": {
+        "enabled": true,
+        "foregroundTimeoutMs": 180000,
+        "onTimeout": true,
+        "onToolLimit": true,
+        "classifier": {
+          "enabled": true,
+          "model": "openai/gpt-5-nano",
+          "timeoutMs": 3000,
+          "maxOutputTokens": 32,
+          "temperature": 0,
+          "confidenceThreshold": 0.6
+        }
+      }
     }
   },
   "agent": {
@@ -71,7 +85,9 @@ title: Runtime Config
 ## Background jobs
 
 `host.backgroundJobs` enables a durable background job queue for long-running tasks that should complete
-asynchronously and report back when done.
+asynchronously and report back when done. `autoSpawn` can promote stalled foreground requests into
+background jobs automatically. The `autoSpawn.classifier` setting enables an LLM router to decide
+immediately when a request should run in the background.
 
 Example:
 
@@ -87,7 +103,13 @@ Example:
       "inlineMaxChars": 8000,
       "contextModeDefault": "group",
       "toolAllow": [],
-      "toolDeny": ["mcp__dotclaw__schedule_task"]
+      "toolDeny": ["mcp__dotclaw__schedule_task"],
+      "autoSpawn": {
+        "enabled": true,
+        "foregroundTimeoutMs": 180000,
+        "onTimeout": true,
+        "onToolLimit": true
+      }
     }
   }
 }
