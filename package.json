@@ -1,6 +1,6 @@
 {
   "name": "@dotsetlabs/dotclaw",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Personal OpenRouter-based assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
