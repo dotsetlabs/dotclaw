@@ -49,6 +49,7 @@ export interface BackgroundJobDependencies {
 }
 
 const inFlightJobs = new Map<string, AbortController>();
+const claimedJobIds = new Set<string>();
 
 function formatJobCompletionMessage(params: {
   job: BackgroundJob;
@@ -85,7 +86,7 @@ function extractEstimatedMinutes(tags?: string | null): number | null {
     if (!Array.isArray(parsed)) return null;
     for (const tag of parsed) {
       if (typeof tag !== 'string') continue;
-      const match = tag.match(/^eta:(\\d+(?:\\.\\d+)?)$/i);
+      const match = tag.match(/^eta:(\d+(?:\.\d+)?)$/i);
       if (match) {
         const value = Number(match[1]);
         if (Number.isFinite(value) && value > 0) return value;
@@ -411,10 +412,13 @@ export function startBackgroundJobLoop(deps: BackgroundJobDependencies): void {
       const now = new Date().toISOString();
       failExpiredBackgroundJobs(now);
 
-      while (inFlightJobs.size < JOBS_MAX_CONCURRENT) {
+      while ((inFlightJobs.size + claimedJobIds.size) < JOBS_MAX_CONCURRENT) {
         const job = claimNextBackgroundJob({ now, defaultLeaseMs: JOBS_MAX_RUNTIME_MS });
         if (!job) break;
-        void runBackgroundJob(job, deps);
+        claimedJobIds.add(job.id);
+        void runBackgroundJob(job, deps).finally(() => {
+          claimedJobIds.delete(job.id);
+        });
       }
     } catch (err) {
       logger.error({ err }, 'Error in background job loop');
@@ -428,12 +432,20 @@ export function startBackgroundJobLoop(deps: BackgroundJobDependencies): void {
   loop();
 }
 
-export function stopBackgroundJobLoop(): void {
+export async function stopBackgroundJobLoop(): Promise<void> {
   jobLoopStopped = true;
   // Abort all in-flight jobs
   for (const [jobId, controller] of inFlightJobs) {
     controller.abort();
     logger.info({ jobId }, 'Aborted in-flight background job');
+  }
+  // Wait for in-flight jobs to drain (up to 10s)
+  const deadline = Date.now() + 10_000;
+  while (inFlightJobs.size > 0 && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 200));
+  }
+  if (inFlightJobs.size > 0) {
+    logger.warn({ count: inFlightJobs.size }, 'Force-closing with in-flight background jobs');
   }
 }
 

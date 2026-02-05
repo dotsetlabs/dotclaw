@@ -151,6 +151,18 @@ function extractOverrides(memories: PreferenceMemory[]): Partial<BehaviorConfig>
   return overrides;
 }
 
+export function invalidatePersonalizationCache(groupFolder?: string, userId?: string): void {
+  if (!groupFolder) { cache.clear(); return; }
+  const prefix = `${groupFolder}:`;
+  for (const key of cache.keys()) {
+    if (key.startsWith(prefix)) {
+      if (!userId || key === `${groupFolder}:${userId}`) {
+        cache.delete(key);
+      }
+    }
+  }
+}
+
 export function loadPersonalizedBehaviorConfig(params: { groupFolder: string; userId?: string | null }): BehaviorConfig {
   const cacheKey = `${params.groupFolder}:${params.userId || 'none'}`;
   if (CACHE_TTL_MS > 0) {

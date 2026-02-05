@@ -85,7 +85,11 @@ function mergeResults(params: {
   }
   for (const item of params.semantic) {
     const existing = merged.get(item.id);
-    if (!existing || item.score > existing.score) {
+    if (existing) {
+      // Boost: item appears in both FTS and semantic results
+      const combined = Math.max(existing.score, item.score) + Math.min(existing.score, item.score) * 0.3;
+      merged.set(item.id, { ...item, score: combined });
+    } else {
       merged.set(item.id, item);
     }
   }

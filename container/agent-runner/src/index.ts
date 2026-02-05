@@ -705,6 +705,7 @@ function decodeXml(value: string): string {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
     .replace(/&amp;/g, '&');
 }
 
@@ -1288,6 +1289,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
       + tokenEstimate.tokensPerRequest;
 
+    const safeLimit = Math.floor(config.maxContextTokens * 0.9);
+    if (resolvedPromptTokens > safeLimit && contextMessages.length > 2) {
+      log(`Estimated ${resolvedPromptTokens} tokens exceeds safe limit ${safeLimit}, truncating`);
+      while (contextMessages.length > 2) {
+        const currentTokens = resolvedInstructionTokens + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage) + tokenEstimate.tokensPerRequest;
+        if (currentTokens <= safeLimit) break;
+        contextMessages.splice(0, 1);
+      }
+    }
+
     log('Starting OpenRouter call...');
     const startedAt = Date.now();
     const callParams = {
@@ -1358,8 +1369,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       && completionTokens >= responseValidateMinResponseTokens
       && (responseValidateAllowToolCalls || modelToolCalls.length === 0);
     if (shouldValidate) {
+      const MAX_VALIDATION_ITERATIONS = 5;
       let retriesLeft = responseValidateMaxRetries;
-      while (true) {
+      for (let _validationIter = 0; _validationIter < MAX_VALIDATION_ITERATIONS; _validationIter++) {
         if (!responseValidateAllowToolCalls && modelToolCalls.length > 0) {
           break;
         }
@@ -1498,16 +1510,25 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   };
 
   if (memoryExtractionEnabled && (!input.isScheduledTask || memoryExtractScheduled)) {
-    if (memoryExtractionAsync && isDaemon) {
-      void runMemoryExtraction().catch(err => {
-        log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
-    } else {
-      try {
-        await runMemoryExtraction();
-      } catch (err) {
-        log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+    const runMemoryExtractionWithRetry = async (maxRetries = 2): Promise<void> => {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          await runMemoryExtraction();
+          return;
+        } catch (err) {
+          log(`Memory extraction attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+          if (attempt < maxRetries) {
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+          }
+        }
       }
+      log('Memory extraction failed after all retries');
+    };
+
+    if (memoryExtractionAsync && isDaemon) {
+      void runMemoryExtractionWithRetry().catch(() => {});
+    } else {
+      await runMemoryExtractionWithRetry();
     }
   }
 

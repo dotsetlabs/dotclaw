@@ -43,6 +43,14 @@ const CONTAINER_INSTANCE_ID = CONTAINER_INSTANCE_ID_RAW.trim()
 // Sentinel markers for robust output parsing (must match agent-runner)
 const CONTAINER_ID_DIR = path.join(DATA_DIR, 'tmp');
 
+const SAFE_FOLDER_RE = /^[a-zA-Z0-9_-]+$/;
+function sanitizeGroupFolder(folder: string): string {
+  if (!SAFE_FOLDER_RE.test(folder)) {
+    throw new Error(`Invalid group folder name: ${folder}`);
+  }
+  return folder;
+}
+
 
 interface VolumeMount {
   hostPath: string;
@@ -240,7 +248,9 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   if (envVars.size > 0) {
     const mergedLines = Array.from(envVars.entries()).map(([key, value]) => `${key}=${value}`);
     const envOutPath = path.join(envDir, 'env');
-    fs.writeFileSync(envOutPath, mergedLines.join('\n') + '\n');
+    const tmpEnvPath = envOutPath + '.tmp';
+    fs.writeFileSync(tmpEnvPath, mergedLines.join('\n') + '\n');
+    fs.renameSync(tmpEnvPath, envOutPath);
     try {
       fs.chmodSync(envOutPath, 0o600);
     } catch {
@@ -366,68 +376,142 @@ function getDaemonContainerName(groupFolder: string): string {
 
 function isContainerRunning(name: string): boolean {
   try {
-    const output = execSync(`docker ps --filter "name=${name}" --format "{{.ID}}"`, { stdio: 'pipe' })
+    const output = execSync(`docker ps --filter "name=^${name}$" --format "{{.Names}}"`, { stdio: 'pipe', timeout: 15_000 })
       .toString()
       .trim();
-    return output.length > 0;
+    if (!output) return false;
+    return output.split('\n').some(n => n.trim() === name);
   } catch {
     return false;
   }
 }
 
-const DAEMON_HEALTH_CHECK_INTERVAL_MS = 60_000; // Check every 60 seconds
-const DAEMON_HEARTBEAT_MAX_AGE_MS = 30_000; // Consider unhealthy if heartbeat older than 30s
+const daemonConfig = runtime.host.container.daemon;
 
-/**
- * Check if a daemon container is healthy by reading its heartbeat file
- */
-export function checkDaemonHealth(groupFolder: string): { healthy: boolean; lastHeartbeat?: number; ageMs?: number } {
-  const heartbeatPath = path.join(DATA_DIR, 'ipc', groupFolder, 'heartbeat');
+type DaemonHealthState = 'healthy' | 'busy' | 'dead';
+
+interface DaemonStatus {
+  state: 'idle' | 'processing';
+  ts: number;
+  request_id: string | null;
+  started_at: number | null;
+  pid: number;
+}
+
+interface DaemonHealthResult {
+  state: DaemonHealthState;
+  lastHeartbeat?: number;
+  ageMs?: number;
+  daemonState?: string;
+  processingMs?: number;
+}
+
+function readDaemonStatus(groupFolder: string): DaemonStatus | null {
+  const statusPath = path.join(DATA_DIR, 'ipc', groupFolder, 'daemon_status.json');
   try {
-    if (!fs.existsSync(heartbeatPath)) {
-      return { healthy: false };
-    }
-    const content = fs.readFileSync(heartbeatPath, 'utf-8').trim();
-    const lastHeartbeat = parseInt(content, 10);
-    if (!Number.isFinite(lastHeartbeat)) {
-      return { healthy: false };
-    }
-    const ageMs = Date.now() - lastHeartbeat;
-    return {
-      healthy: ageMs < DAEMON_HEARTBEAT_MAX_AGE_MS,
-      lastHeartbeat,
-      ageMs
-    };
+    if (!fs.existsSync(statusPath)) return null;
+    const raw = fs.readFileSync(statusPath, 'utf-8').trim();
+    return JSON.parse(raw) as DaemonStatus;
   } catch {
-    return { healthy: false };
+    return null;
   }
 }
 
 /**
- * Restart a daemon container if unhealthy
+ * 3-state health check: healthy / busy / dead
+ *
+ * - Fresh heartbeat → healthy (regardless of state)
+ * - Stale heartbeat + processing state → busy (tolerated up to container timeout)
+ * - Stale heartbeat + idle/missing state → dead
  */
-export function restartDaemonContainer(group: RegisteredGroup, isMain: boolean): void {
-  const containerName = getDaemonContainerName(group.folder);
-
-  // Stop existing container
+export function checkDaemonHealth(groupFolder: string): DaemonHealthResult {
+  const heartbeatPath = path.join(DATA_DIR, 'ipc', groupFolder, 'heartbeat');
   try {
-    execSync(`docker rm -f ${containerName}`, { stdio: 'ignore' });
+    if (!fs.existsSync(heartbeatPath)) {
+      return { state: 'dead' };
+    }
+    const content = fs.readFileSync(heartbeatPath, 'utf-8').trim();
+    const lastHeartbeat = parseInt(content, 10);
+    if (!Number.isFinite(lastHeartbeat)) {
+      return { state: 'dead' };
+    }
+    const ageMs = Date.now() - lastHeartbeat;
+
+    // Fresh heartbeat → healthy
+    if (ageMs < daemonConfig.heartbeatMaxAgeMs) {
+      return { state: 'healthy', lastHeartbeat, ageMs };
+    }
+
+    // Stale heartbeat — check daemon_status.json for processing state
+    const status = readDaemonStatus(groupFolder);
+
+    if (status && status.state === 'processing' && status.started_at) {
+      const processingMs = Date.now() - status.started_at;
+      return {
+        state: 'busy',
+        lastHeartbeat,
+        ageMs,
+        daemonState: 'processing',
+        processingMs,
+      };
+    }
+
+    // Stale heartbeat + idle or no status file → dead
+    return { state: 'dead', lastHeartbeat, ageMs, daemonState: status?.state };
   } catch {
-    // Ignore if container doesn't exist
+    return { state: 'dead' };
+  }
+}
+
+/**
+ * Graceful restart: docker stop (SIGTERM + grace period), then docker rm -f fallback
+ */
+export function gracefulRestartDaemonContainer(group: RegisteredGroup, isMain: boolean): void {
+  const containerName = getDaemonContainerName(group.folder);
+  const graceSeconds = Math.ceil(daemonConfig.gracePeriodMs / 1000);
+
+  try {
+    execSync(`docker stop -t ${graceSeconds} ${containerName}`, { stdio: 'ignore', timeout: (daemonConfig.gracePeriodMs + 5000) });
+  } catch {
+    // docker stop failed or timed out — force remove
+    try {
+      execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 15_000 });
+    } catch {
+      // ignore
+    }
   }
 
   // Start new container
   const mounts = buildVolumeMounts(group, isMain);
   ensureDaemonContainer(mounts, group.folder);
-  logger.info({ groupFolder: group.folder }, 'Daemon container restarted');
+  logger.info({ groupFolder: group.folder }, 'Daemon container restarted (graceful)');
+}
+
+/**
+ * Force restart (kept for programmatic use where graceful isn't needed)
+ */
+export function restartDaemonContainer(group: RegisteredGroup, isMain: boolean): void {
+  const containerName = getDaemonContainerName(group.folder);
+
+  try {
+    execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 15_000 });
+  } catch {
+    // Ignore if container doesn't exist
+  }
+
+  const mounts = buildVolumeMounts(group, isMain);
+  ensureDaemonContainer(mounts, group.folder);
+  logger.info({ groupFolder: group.folder }, 'Daemon container restarted (force)');
 }
 
 // Track daemon health check state
 let healthCheckInterval: NodeJS.Timeout | null = null;
-const unhealthyDaemons = new Map<string, number>(); // Track consecutive unhealthy checks
+const unhealthyDaemons = new Map<string, number>(); // Track consecutive dead checks
 
 /**
- * Perform health check on all daemon containers and restart if needed
+ * Perform health check on all daemon containers and restart if needed.
+ * Uses 3-state model: healthy resets counter, busy is tolerated up to
+ * container timeout, dead increments failure counter.
  */
 export function performDaemonHealthChecks(
   getRegisteredGroups: () => Record<string, RegisteredGroup>,
@@ -448,22 +532,42 @@ export function performDaemonHealthChecks(
 
     const health = checkDaemonHealth(group.folder);
 
-    if (health.healthy) {
+    if (health.state === 'healthy') {
       unhealthyDaemons.delete(group.folder);
+    } else if (health.state === 'busy') {
+      // Tolerate busy daemons up to container timeout
+      if (health.processingMs && health.processingMs > CONTAINER_TIMEOUT) {
+        logger.warn({
+          groupFolder: group.folder,
+          processingMs: health.processingMs,
+          containerTimeout: CONTAINER_TIMEOUT
+        }, 'Daemon processing exceeded container timeout, restarting');
+        gracefulRestartDaemonContainer(group, group.folder === mainGroupFolder);
+        unhealthyDaemons.delete(group.folder);
+      } else {
+        // Still within timeout — reset failure counter, don't restart
+        unhealthyDaemons.delete(group.folder);
+        logger.debug({
+          groupFolder: group.folder,
+          processingMs: health.processingMs
+        }, 'Daemon busy but within timeout');
+      }
     } else {
+      // dead
       const consecutiveFailures = (unhealthyDaemons.get(group.folder) || 0) + 1;
       unhealthyDaemons.set(group.folder, consecutiveFailures);
 
       logger.warn({
         groupFolder: group.folder,
         consecutiveFailures,
-        ageMs: health.ageMs
-      }, 'Daemon container unhealthy');
+        ageMs: health.ageMs,
+        daemonState: health.daemonState
+      }, 'Daemon container appears dead');
 
-      // Restart after 2 consecutive failures
+      // Restart after 2 consecutive dead checks
       if (consecutiveFailures >= 2) {
-        logger.info({ groupFolder: group.folder }, 'Restarting unhealthy daemon');
-        restartDaemonContainer(group, group.folder === mainGroupFolder);
+        logger.info({ groupFolder: group.folder }, 'Restarting dead daemon');
+        gracefulRestartDaemonContainer(group, group.folder === mainGroupFolder);
         unhealthyDaemons.delete(group.folder);
       }
     }
@@ -482,9 +586,9 @@ export function startDaemonHealthCheckLoop(
 
   healthCheckInterval = setInterval(() => {
     performDaemonHealthChecks(getRegisteredGroups, mainGroupFolder);
-  }, DAEMON_HEALTH_CHECK_INTERVAL_MS);
+  }, daemonConfig.healthCheckIntervalMs);
 
-  logger.info('Daemon health check loop started');
+  logger.info({ intervalMs: daemonConfig.healthCheckIntervalMs }, 'Daemon health check loop started');
 }
 
 /**
@@ -502,7 +606,7 @@ function ensureDaemonContainer(mounts: VolumeMount[], groupFolder: string): void
   if (isContainerRunning(containerName)) return;
 
   try {
-    execSync(`docker rm -f ${containerName}`, { stdio: 'ignore' });
+    execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 15_000 });
   } catch {
     // ignore if container doesn't exist
   }
@@ -546,7 +650,18 @@ async function waitForAgentResponse(
       throw new Error('Agent run preempted');
     }
     if (fs.existsSync(responsePath)) {
-      const raw = fs.readFileSync(responsePath, 'utf-8');
+      let raw: string;
+      try {
+        raw = fs.readFileSync(responsePath, 'utf-8');
+      } catch (readErr: unknown) {
+        const code = (readErr as NodeJS.ErrnoException)?.code;
+        if (code === 'ENOENT') {
+          // File disappeared between existsSync and readFileSync; continue polling
+          await new Promise(resolve => setTimeout(resolve, CONTAINER_DAEMON_POLL_MS));
+          continue;
+        }
+        throw readErr;
+      }
       fs.unlinkSync(responsePath);
       try {
         return JSON.parse(raw) as ContainerOutput;
@@ -579,6 +694,8 @@ export async function runContainerAgent(
   input: ContainerInput,
   options?: { abortSignal?: AbortSignal; timeoutMs?: number }
 ): Promise<ContainerOutput> {
+  sanitizeGroupFolder(group.folder);
+
   if (CONTAINER_MODE === 'daemon') {
     return runContainerAgentDaemon(group, input, options);
   }
@@ -796,7 +913,7 @@ export async function runContainerAgent(
       try {
         // Extract JSON between sentinel markers for robust parsing
         const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
-        const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
+        const endIdx = stdout.lastIndexOf(OUTPUT_END_MARKER);
 
         let jsonLine: string;
         if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
@@ -807,7 +924,15 @@ export async function runContainerAgent(
           jsonLine = lines[lines.length - 1];
         }
 
-        const output: ContainerOutput = JSON.parse(jsonLine);
+        let output: ContainerOutput;
+        try {
+          output = JSON.parse(jsonLine) as ContainerOutput;
+        } catch (parseErr) {
+          throw new Error(`Invalid JSON in container output: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+        }
+        if (!output || typeof output.status !== 'string') {
+          throw new Error('Container output missing required "status" field');
+        }
 
         logger.info({
           group: group.name,
@@ -862,19 +987,26 @@ async function runContainerAgentDaemon(
   const mounts = buildVolumeMounts(group, input.isMain);
   ensureDaemonContainer(mounts, group.folder);
 
-  const { responsePath, requestPath } = writeAgentRequest(group.folder, input);
+  const { id: requestId, responsePath, requestPath } = writeAgentRequest(group.folder, input);
+  const requestsDir = path.join(DATA_DIR, 'ipc', group.folder, 'agent_requests');
   const timeoutMs = options?.timeoutMs || group.containerConfig?.timeout || CONTAINER_TIMEOUT;
   const abortSignal = options?.abortSignal;
-  const containerName = getDaemonContainerName(group.folder);
 
   const abortHandler = () => {
     logger.warn({ group: group.name }, 'Daemon run preempted');
+    // Write cancel sentinel so daemon can detect the abort
+    const cancelPath = path.join(requestsDir, `${requestId}.cancel`);
+    try { fs.writeFileSync(cancelPath, ''); } catch { /* ignore */ }
     try {
       if (fs.existsSync(requestPath)) fs.unlinkSync(requestPath);
     } catch {
       // ignore cleanup failure
     }
-    spawn('docker', ['rm', '-f', containerName], { stdio: 'ignore' });
+    try {
+      if (fs.existsSync(responsePath)) fs.unlinkSync(responsePath);
+    } catch {
+      // ignore cleanup failure
+    }
   };
 
   if (abortSignal) {
@@ -904,7 +1036,7 @@ async function runContainerAgentDaemon(
       // ignore cleanup failure
     }
     try {
-      spawn('docker', ['rm', '-f', containerName], { stdio: 'ignore' });
+      if (fs.existsSync(responsePath)) fs.unlinkSync(responsePath);
     } catch {
       // ignore cleanup failure
     }
@@ -933,7 +1065,7 @@ export function cleanupInstanceContainers(): void {
       filterArgs = '--filter "label=dotclaw.group"';
     }
 
-    const ids = execSync(`docker ps -q ${filterArgs}`, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+    const ids = execSync(`docker ps -q ${filterArgs}`, { encoding: 'utf-8', stdio: 'pipe', timeout: 15_000 }).trim();
     if (!ids) return;
 
     const containerIds = ids.split('\n').filter(Boolean);
@@ -944,7 +1076,7 @@ export function cleanupInstanceContainers(): void {
       toRemove = containerIds.filter(id => {
         try {
           const label = execSync(`docker inspect --format '{{index .Config.Labels "dotclaw.instance"}}' ${id}`, {
-            encoding: 'utf-8', stdio: 'pipe'
+            encoding: 'utf-8', stdio: 'pipe', timeout: 15_000
           }).trim();
           return !label;
         } catch {
@@ -954,7 +1086,16 @@ export function cleanupInstanceContainers(): void {
     }
 
     if (toRemove.length > 0) {
-      execSync(`docker rm -f ${toRemove.join(' ')}`, { stdio: 'ignore' });
+      const graceSeconds = Math.ceil(daemonConfig.gracePeriodMs / 1000);
+      try {
+        execSync(`docker stop -t ${graceSeconds} ${toRemove.join(' ')}`, {
+          stdio: 'ignore',
+          timeout: (daemonConfig.gracePeriodMs + 5000)
+        });
+      } catch {
+        // Graceful stop failed or timed out — force remove
+        execSync(`docker rm -f ${toRemove.join(' ')}`, { stdio: 'ignore', timeout: 15_000 });
+      }
       logger.info({ count: toRemove.length }, 'Cleaned up instance containers');
     }
   } catch {
@@ -988,7 +1129,9 @@ export function writeTasksSnapshot(
     : tasks.filter(t => t.groupFolder === groupFolder);
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
-  fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+  const tasksTmpFile = tasksFile + '.tmp';
+  fs.writeFileSync(tasksTmpFile, JSON.stringify(filteredTasks, null, 2));
+  fs.renameSync(tasksTmpFile, tasksFile);
 }
 
 export interface AvailableGroup {
@@ -1015,8 +1158,10 @@ export function writeGroupsSnapshot(
   const visibleGroups = isMain ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
-  fs.writeFileSync(groupsFile, JSON.stringify({
+  const groupsTmpFile = groupsFile + '.tmp';
+  fs.writeFileSync(groupsTmpFile, JSON.stringify({
     groups: visibleGroups,
     lastSync: new Date().toISOString()
   }, null, 2));
+  fs.renameSync(groupsTmpFile, groupsFile);
 }

@@ -68,6 +68,7 @@ export interface ScheduledTask {
   state_json?: string | null;
   retry_count?: number | null;
   last_error?: string | null;
+  running_since?: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
 }

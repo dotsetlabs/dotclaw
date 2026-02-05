@@ -44,7 +44,9 @@ import {
   completeQueuedMessages,
   failQueuedMessages,
   getChatsWithPendingMessages,
-  resetStalledMessages
+  resetStalledMessages,
+  resetStalledBackgroundJobs,
+  getPendingMessageCount
 } from './db.js';
 import { startSchedulerLoop, stopSchedulerLoop, runTaskNow } from './task-scheduler.js';
 import {
@@ -63,6 +65,7 @@ import { writeTrace } from './trace-writer.js';
 import { formatTelegramMessage, TELEGRAM_PARSE_MODE } from './telegram-format.js';
 import {
   initMemoryStore,
+  closeMemoryStore,
   getMemoryStats,
   upsertMemoryItems,
   searchMemories,
@@ -81,6 +84,7 @@ import { startMetricsServer, stopMetricsServer, recordMessage, recordError, reco
 import { startMaintenanceLoop, stopMaintenanceLoop } from './maintenance.js';
 import { warmGroupContainer, startDaemonHealthCheckLoop, stopDaemonHealthCheckLoop, cleanupInstanceContainers } from './container-runner.js';
 import { loadRuntimeConfig } from './runtime-config.js';
+import { invalidatePersonalizationCache } from './personalization.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
 import { startDashboard, stopDashboard, setTelegramConnected, setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
@@ -218,7 +222,7 @@ function cleanupRateLimiter(): void {
 }
 
 // Clean up expired rate limit entries periodically
-setInterval(cleanupRateLimiter, 60_000);
+const rateLimiterInterval = setInterval(cleanupRateLimiter, 60_000);
 
 const TELEGRAM_HANDLER_TIMEOUT_MS = runtime.host.telegram.handlerTimeoutMs;
 const TELEGRAM_SEND_RETRIES = runtime.host.telegram.sendRetries;
@@ -254,15 +258,17 @@ const TELEGRAM_SEND_DELAY_MS = 250;
 
 const activeDrains = new Set<string>();
 const activeRuns = new Map<string, AbortController>();
+const MAX_DRAIN_ITERATIONS = 50;
+
+const CANCEL_PHRASES = new Set([
+  'cancel', 'stop', 'abort', 'cancel request', 'stop request'
+]);
 
 function isCancelMessage(content: string): boolean {
   if (!content) return false;
-  const normalized = content.trim().toLowerCase();
-  return normalized === 'cancel'
-    || normalized === 'stop'
-    || normalized === 'abort'
-    || normalized === 'cancel request'
-    || normalized === 'stop request';
+  const trimmed = content.trim();
+  if (trimmed.length > 20) return false;
+  return CANCEL_PHRASES.has(trimmed.toLowerCase());
 }
 
 function inferProgressStage(params: { content: string; plannerTools: string[]; plannerSteps: string[]; enablePlanner: boolean }): string {
@@ -592,7 +598,7 @@ function enqueueMessage(msg: TelegramMessage): void {
     chat_type: msg.chatType,
     message_thread_id: msg.messageThreadId
   });
-  setMessageQueueDepth(activeDrains.size);
+  setMessageQueueDepth(getPendingMessageCount());
   if (!activeDrains.has(msg.chatId)) {
     void drainQueue(msg.chatId);
   }
@@ -601,11 +607,14 @@ function enqueueMessage(msg: TelegramMessage): void {
 async function drainQueue(chatId: string): Promise<void> {
   if (activeDrains.has(chatId)) return;
   activeDrains.add(chatId);
-  setMessageQueueDepth(activeDrains.size);
+  setMessageQueueDepth(getPendingMessageCount());
+  let reschedule = false;
   try {
-    while (true) {
+    let iterations = 0;
+    while (iterations < MAX_DRAIN_ITERATIONS) {
       const batch = claimBatchForChat(chatId, BATCH_WINDOW_MS);
       if (batch.length === 0) break;
+      iterations++;
       const last = batch[batch.length - 1];
       const triggerMsg: TelegramMessage = {
         chatId: last.chat_jid,
@@ -628,9 +637,19 @@ async function drainQueue(chatId: string): Promise<void> {
         logger.error({ chatId, err }, 'Error processing message batch');
       }
     }
+    if (iterations >= MAX_DRAIN_ITERATIONS) {
+      reschedule = true;
+      logger.warn({ chatId, iterations }, 'Drain loop hit iteration limit; re-scheduling');
+      setTimeout(() => {
+        activeDrains.delete(chatId);
+        void drainQueue(chatId);
+      }, 1000);
+    }
   } finally {
-    activeDrains.delete(chatId);
-    setMessageQueueDepth(activeDrains.size);
+    if (!reschedule) {
+      activeDrains.delete(chatId);
+    }
+    setMessageQueueDepth(getPendingMessageCount());
   }
 }
 
@@ -1139,6 +1158,7 @@ function startIpcWatcher(): void {
   const processIpcFiles = async () => {
     if (processing) return;
     processing = true;
+    try {
     // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
@@ -1148,7 +1168,6 @@ function startIpcWatcher(): void {
       });
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
-      processing = false;
       return;
     }
 
@@ -1225,7 +1244,9 @@ function startIpcWatcher(): void {
               const response = await processRequestIpc(data, sourceGroup, isMain);
               if (response?.id) {
                 const responsePath = path.join(responsesDir, `${response.id}.json`);
-                fs.writeFileSync(responsePath, JSON.stringify(response, null, 2));
+                const tmpPath = responsePath + '.tmp';
+                fs.writeFileSync(tmpPath, JSON.stringify(response, null, 2));
+                fs.renameSync(tmpPath, responsePath);
               }
               fs.unlinkSync(filePath);
             } catch (err) {
@@ -1241,7 +1262,9 @@ function startIpcWatcher(): void {
       }
     }
 
-    processing = false;
+    } finally {
+      processing = false;
+    }
   };
 
   const scheduleProcess = () => {
@@ -1707,6 +1730,7 @@ async function processRequestIpc(
         const groupFolder = resolveGroupFolder();
         const source = typeof payload.source === 'string' ? payload.source : 'agent';
         const results = upsertMemoryItems(groupFolder, items, source);
+        invalidatePersonalizationCache(groupFolder);
         return { id: requestId, ok: true, result: { count: results.length } };
       }
       case 'memory_forget': {
@@ -1722,6 +1746,7 @@ async function processRequestIpc(
           scope,
           userId
         });
+        invalidatePersonalizationCache(groupFolder);
         return { id: requestId, ok: true, result: { count } };
       }
       case 'memory_list': {
@@ -2223,7 +2248,20 @@ function setupTelegramHandlers(): void {
 
   // Handle all text messages
   telegrafBot.on('message', async (ctx) => {
-    if (!ctx.message || !('text' in ctx.message)) return;
+    if (!ctx.message || !('text' in ctx.message)) {
+      // Acknowledge media messages with a brief reply
+      if (ctx.message && ('photo' in ctx.message || 'document' in ctx.message || 'voice' in ctx.message || 'video' in ctx.message)) {
+        try {
+          const chatId = String(ctx.chat.id);
+          const rawThreadId = (ctx.message as { message_thread_id?: number }).message_thread_id;
+          const messageThreadId = Number.isFinite(rawThreadId) ? Number(rawThreadId) : undefined;
+          await sendMessage(chatId, 'I can only process text messages right now.', { messageThreadId });
+        } catch {
+          // Ignore send failures for media acknowledgment
+        }
+      }
+      return;
+    }
 
     const chatId = String(ctx.chat.id);
     const chatType = ctx.chat.type;
@@ -2357,6 +2395,10 @@ async function main(): Promise<void> {
   if (resetCount > 0) {
     logger.info({ resetCount }, 'Reset stalled queue messages to pending');
   }
+  const resetJobCount = resetStalledBackgroundJobs();
+  if (resetJobCount > 0) {
+    logger.info({ count: resetJobCount }, 'Reset stalled background jobs');
+  }
   initMemoryStore();
   startEmbeddingWorker();
   const expiredMemories = cleanupExpiredMemories();
@@ -2402,7 +2444,7 @@ async function main(): Promise<void> {
 
     // Graceful shutdown
     let shuttingDown = false;
-    const gracefulShutdown = (signal: string) => {
+    const gracefulShutdown = async (signal: string) => {
       if (shuttingDown) return;
       shuttingDown = true;
       logger.info({ signal }, 'Graceful shutdown initiated');
@@ -2412,8 +2454,9 @@ async function main(): Promise<void> {
       telegrafBot.stop(signal);
 
       // 2. Stop all loops and watchers
+      clearInterval(rateLimiterInterval);
       stopSchedulerLoop();
-      stopBackgroundJobLoop();
+      await stopBackgroundJobLoop();
       stopIpcWatcher();
       stopMaintenanceLoop();
       stopHeartbeatLoop();
@@ -2424,17 +2467,33 @@ async function main(): Promise<void> {
       stopMetricsServer();
       stopDashboard();
 
-      // 4. Clean up Docker containers for this instance
+      // 4. Abort active agent runs so drain loops can finish quickly
+      for (const [chatId, controller] of activeRuns.entries()) {
+        logger.info({ chatId }, 'Aborting active agent run for shutdown');
+        controller.abort();
+      }
+
+      // Wait for active drain loops to finish
+      const drainDeadline = Date.now() + 30_000;
+      while (activeDrains.size > 0 && Date.now() < drainDeadline) {
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (activeDrains.size > 0) {
+        logger.warn({ count: activeDrains.size }, 'Force-closing with active drains');
+      }
+
+      // 5. Clean up Docker containers for this instance
       cleanupInstanceContainers();
 
-      // 5. Close database
+      // 6. Close databases
+      closeMemoryStore();
       closeDatabase();
 
       logger.info('Shutdown complete');
       process.exit(0);
     };
-    process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-    process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.once('SIGINT', () => void gracefulShutdown('SIGINT'));
+    process.once('SIGTERM', () => void gracefulShutdown('SIGTERM'));
 
     // Start scheduler and IPC watcher
     // Wrapper that matches the scheduler's expected interface (Promise<void>)

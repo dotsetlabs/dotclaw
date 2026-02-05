@@ -190,12 +190,12 @@ function resolvePath(inputPath: string, isMain: boolean, mustExist = false): str
 }
 
 function limitText(text: string, maxBytes: number): { text: string; truncated: boolean } {
-  if (Buffer.byteLength(text, 'utf-8') <= maxBytes) {
-    return { text, truncated: false };
-  }
-  const buffer = Buffer.from(text, 'utf-8');
-  const truncated = buffer.subarray(0, maxBytes).toString('utf-8');
-  return { text: truncated, truncated: true };
+  const buf = Buffer.from(text, 'utf-8');
+  if (buf.length <= maxBytes) return { text, truncated: false };
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 0xC0) === 0x80) end--;
+  const truncated = buf.subarray(0, end).toString('utf-8');
+  return { text: truncated + '\n[OUTPUT TRUNCATED]', truncated: true };
 }
 
 function normalizeDomain(value: string): string {
@@ -298,14 +298,12 @@ function isPrivateIpv4(ip: string): boolean {
 
 function isPrivateIpv6(ip: string): boolean {
   const normalized = ip.toLowerCase();
-  return normalized === '::1'
-    || normalized.startsWith('fc')
-    || normalized.startsWith('fd')
-    || normalized.startsWith('fe80')
-    || normalized.startsWith('::ffff:127.')
-    || normalized.startsWith('::ffff:10.')
-    || normalized.startsWith('::ffff:192.168.')
-    || normalized.startsWith('::ffff:172.');
+  if (normalized === '::1') return true;
+  if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
+  if (normalized.startsWith('fe80')) return true;
+  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPrivateIpv4(mapped[1]);
+  return false;
 }
 
 function isPrivateIp(ip: string): boolean {
@@ -554,32 +552,49 @@ async function runCommand(command: string, timeoutMs: number, outputLimit: numbe
     const start = Date.now();
     const child = spawn('/bin/bash', ['-lc', command], {
       cwd,
-      env: process.env
+      env: process.env,
+      detached: true
     });
 
     let stdout = '';
     let stderr = '';
     let truncated = false;
+    let totalBytes = 0;
     const maxBytes = outputLimit;
+
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch {
+        try { child.kill(signal); } catch { /* process already exited */ }
+      }
+    };
 
     const append = (chunk: Buffer | string, isStdout: boolean) => {
       if (truncated) return;
       const text = chunk.toString();
-      const remaining = maxBytes - Buffer.byteLength(stdout + stderr, 'utf-8');
+      const chunkBytes = Buffer.byteLength(text, 'utf-8');
+      const remaining = maxBytes - totalBytes;
       if (remaining <= 0) {
         truncated = true;
+        killProcessGroup('SIGTERM');
+        setTimeout(() => killProcessGroup('SIGKILL'), 2000);
         return;
       }
-      const toAdd = Buffer.byteLength(text, 'utf-8') > remaining
+      const toAdd = chunkBytes > remaining
         ? Buffer.from(text).subarray(0, remaining).toString('utf-8')
         : text;
+      const addedBytes = chunkBytes > remaining ? remaining : chunkBytes;
       if (isStdout) {
         stdout += toAdd;
       } else {
         stderr += toAdd;
       }
-      if (Buffer.byteLength(stdout + stderr, 'utf-8') >= maxBytes) {
+      totalBytes += addedBytes;
+      if (totalBytes >= maxBytes) {
         truncated = true;
+        killProcessGroup('SIGTERM');
+        setTimeout(() => killProcessGroup('SIGKILL'), 2000);
       }
     };
 
@@ -587,7 +602,8 @@ async function runCommand(command: string, timeoutMs: number, outputLimit: numbe
     child.stderr.on('data', (data) => append(data, false));
 
     const timeout = setTimeout(() => {
-      child.kill('SIGKILL');
+      killProcessGroup('SIGTERM');
+      setTimeout(() => killProcessGroup('SIGKILL'), 5000);
     }, timeoutMs);
 
     child.on('close', (code) => {
@@ -1157,7 +1173,7 @@ export function createTools(
       if (occurrences === 0) {
         return { path: resolved, replaced: false, occurrences: 0 };
       }
-      const updated = content.replace(old_text, new_text);
+      const updated = content.replaceAll(old_text, new_text);
       fs.writeFileSync(resolved, updated);
       return { path: resolved, replaced: true, occurrences };
     })
@@ -1495,7 +1511,11 @@ export function createTools(
           if (!config.command) {
             throw new Error(`Plugin ${config.name} missing command`);
           }
-          const command = interpolateTemplate(config.command, args);
+          const escaped: Record<string, unknown> = {};
+          for (const [key, val] of Object.entries(args)) {
+            escaped[key] = typeof val === 'string' ? shellEscape(val) : val;
+          }
+          const command = interpolateTemplate(config.command, escaped);
           return runCommand(command, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes);
         })
       });

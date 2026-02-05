@@ -18,6 +18,7 @@ export type RuntimeConfig = {
       taskMaxRetries: number;
       taskRetryBaseMs: number;
       taskRetryMaxMs: number;
+      taskTimeoutMs: number;
     };
     ipc: {
       pollIntervalMs: number;
@@ -36,6 +37,11 @@ export type RuntimeConfig = {
       runUid: string;
       runGid: string;
       instanceId: string;
+      daemon: {
+        heartbeatMaxAgeMs: number;
+        healthCheckIntervalMs: number;
+        gracePeriodMs: number;
+      };
     };
     concurrency: {
       maxAgents: number;
@@ -53,6 +59,8 @@ export type RuntimeConfig = {
     };
     messageQueue: {
       batchWindowMs: number;
+      maxBatchSize: number;
+      stalledTimeoutMs: number;
     };
     metrics: {
       port: number;
@@ -120,6 +128,8 @@ export type RuntimeConfig = {
       contextModeDefault: 'group' | 'isolated';
       toolAllow: string[];
       toolDeny: string[];
+      jobRetentionMs: number;
+      taskLogRetentionMs: number;
       progress: {
         enabled: boolean;
         startDelayMs: number;
@@ -332,7 +342,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       pollIntervalMs: 60_000,
       taskMaxRetries: 3,
       taskRetryBaseMs: 60_000,
-      taskRetryMaxMs: 3_600_000
+      taskRetryMaxMs: 3_600_000,
+      taskTimeoutMs: 900_000
     },
     ipc: {
       pollIntervalMs: 1_000
@@ -350,7 +361,12 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       tmpfsSize: '64m',
       runUid: typeof process.getuid === 'function' ? String(process.getuid()) : '',
       runGid: typeof process.getgid === 'function' ? String(process.getgid()) : '',
-      instanceId: ''
+      instanceId: '',
+      daemon: {
+        heartbeatMaxAgeMs: 30_000,
+        healthCheckIntervalMs: 20_000,
+        gracePeriodMs: 10_000,
+      },
     },
     concurrency: {
       maxAgents: 4,
@@ -367,7 +383,9 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       intervalMs: 6 * 60 * 60 * 1000
     },
     messageQueue: {
-      batchWindowMs: 2000
+      batchWindowMs: 2000,
+      maxBatchSize: 50,
+      stalledTimeoutMs: 300_000
     },
     metrics: {
       port: 3001,
@@ -441,6 +459,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         'mcp__dotclaw__resume_task',
         'mcp__dotclaw__cancel_task'
       ],
+      jobRetentionMs: 604_800_000,
+      taskLogRetentionMs: 2_592_000_000,
       progress: {
         enabled: true,
         startDelayMs: 30_000,

@@ -2,6 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
+function atomicWriteFileSync(filePath: string, content: string): void {
+  const tmpPath = filePath + '.tmp';
+  fs.writeFileSync(tmpPath, content);
+  fs.renameSync(tmpPath, filePath);
+}
+
 export interface Message {
   role: 'user' | 'assistant';
   content: string;
@@ -113,7 +119,7 @@ export function saveSessionMeta(ctx: SessionContext): void {
 
 export function saveMemoryState(ctx: SessionContext): void {
   ctx.state.updatedAt = new Date().toISOString();
-  fs.writeFileSync(ctx.statePath, JSON.stringify(ctx.state, null, 2));
+  atomicWriteFileSync(ctx.statePath, JSON.stringify(ctx.state, null, 2));
 }
 
 export function appendHistory(ctx: SessionContext, role: 'user' | 'assistant', content: string): Message {
@@ -153,7 +159,7 @@ export function writeHistory(ctx: SessionContext, messages: Message[]): void {
     return;
   }
   const content = messages.map(m => JSON.stringify(m)).join('\n') + '\n';
-  fs.writeFileSync(ctx.historyPath, content);
+  atomicWriteFileSync(ctx.historyPath, content);
 }
 
 export function splitRecentHistory(messages: Message[], tokenBudget: number, minMessages = 4) {
