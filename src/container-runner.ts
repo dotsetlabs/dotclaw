@@ -29,6 +29,7 @@ import { PACKAGE_ROOT } from './paths.js';
 import { RegisteredGroup } from './types.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { loadRuntimeConfig } from './runtime-config.js';
+import { generateId } from './id.js';
 import { OUTPUT_START_MARKER, OUTPUT_END_MARKER } from './container-protocol.js';
 import type { ContainerInput, ContainerOutput } from './container-protocol.js';
 import { logger } from './logger.js';
@@ -521,7 +522,7 @@ export function warmGroupContainer(group: RegisteredGroup, isMain: boolean): voi
 }
 
 function writeAgentRequest(groupFolder: string, payload: object): { id: string; requestPath: string; responsePath: string } {
-  const id = `agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = generateId('agent');
   const requestsDir = path.join(DATA_DIR, 'ipc', groupFolder, 'agent_requests');
   const responsesDir = path.join(DATA_DIR, 'ipc', groupFolder, 'agent_responses');
   fs.mkdirSync(requestsDir, { recursive: true });
@@ -589,7 +590,7 @@ export async function runContainerAgent(
 
   const mounts = buildVolumeMounts(group, input.isMain);
   fs.mkdirSync(CONTAINER_ID_DIR, { recursive: true });
-  const cidFile = path.join(CONTAINER_ID_DIR, `container-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.cid`);
+  const cidFile = path.join(CONTAINER_ID_DIR, `${generateId('container')}.cid`);
   try {
     fs.rmSync(cidFile, { force: true });
   } catch {
@@ -916,6 +917,48 @@ async function runContainerAgentDaemon(
     if (abortSignal) {
       abortSignal.removeEventListener('abort', abortHandler);
     }
+  }
+}
+
+/**
+ * Stop all Docker containers belonging to this instance.
+ * Uses Docker labels to identify containers.
+ */
+export function cleanupInstanceContainers(): void {
+  try {
+    let filterArgs: string;
+    if (CONTAINER_INSTANCE_ID) {
+      filterArgs = `--filter "label=dotclaw.instance=${CONTAINER_INSTANCE_ID}"`;
+    } else {
+      filterArgs = '--filter "label=dotclaw.group"';
+    }
+
+    const ids = execSync(`docker ps -q ${filterArgs}`, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+    if (!ids) return;
+
+    const containerIds = ids.split('\n').filter(Boolean);
+
+    // For the default instance (no CONTAINER_INSTANCE_ID), exclude containers that have a dotclaw.instance label
+    let toRemove = containerIds;
+    if (!CONTAINER_INSTANCE_ID && containerIds.length > 0) {
+      toRemove = containerIds.filter(id => {
+        try {
+          const label = execSync(`docker inspect --format '{{index .Config.Labels "dotclaw.instance"}}' ${id}`, {
+            encoding: 'utf-8', stdio: 'pipe'
+          }).trim();
+          return !label;
+        } catch {
+          return true;
+        }
+      });
+    }
+
+    if (toRemove.length > 0) {
+      execSync(`docker rm -f ${toRemove.join(' ')}`, { stdio: 'ignore' });
+      logger.info({ count: toRemove.length }, 'Cleaned up instance containers');
+    }
+  } catch {
+    // Docker may not be running or no containers to clean up
   }
 }
 

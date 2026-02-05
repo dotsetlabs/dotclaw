@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { MAINTENANCE_INTERVAL_MS, TRACE_DIR, TRACE_RETENTION_DAYS, DATA_DIR } from './config.js';
 import { runMemoryMaintenance } from './memory-store.js';
+import { cleanupCompletedMessages } from './db.js';
 import { logger } from './logger.js';
 
 const IPC_FILE_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
@@ -130,14 +131,17 @@ export function cleanupIpcErrorFiles(): number {
   return removed;
 }
 
+let maintenanceTimer: NodeJS.Timeout | null = null;
+
 export function startMaintenanceLoop(): void {
   const run = () => {
     const memResult = runMemoryMaintenance();
     const traceRemoved = cleanupTraceFiles(TRACE_RETENTION_DAYS);
     const ipcRemoved = cleanupOrphanedIpcFiles();
     const ipcErrorsRemoved = cleanupIpcErrorFiles();
+    const queuePurged = cleanupCompletedMessages(24 * 60 * 60 * 1000);
 
-    if (memResult.expired > 0 || memResult.pruned > 0 || memResult.decayed > 0 || traceRemoved > 0 || ipcRemoved > 0 || ipcErrorsRemoved > 0) {
+    if (memResult.expired > 0 || memResult.pruned > 0 || memResult.decayed > 0 || traceRemoved > 0 || ipcRemoved > 0 || ipcErrorsRemoved > 0 || queuePurged > 0) {
       logger.info({
         expired: memResult.expired,
         pruned: memResult.pruned,
@@ -145,11 +149,19 @@ export function startMaintenanceLoop(): void {
         vacuumed: memResult.vacuumed,
         traceRemoved,
         ipcRemoved,
-        ipcErrorsRemoved
+        ipcErrorsRemoved,
+        queuePurged
       }, 'Maintenance completed');
     }
   };
 
   run();
-  setInterval(run, MAINTENANCE_INTERVAL_MS);
+  maintenanceTimer = setInterval(run, MAINTENANCE_INTERVAL_MS);
+}
+
+export function stopMaintenanceLoop(): void {
+  if (maintenanceTimer) {
+    clearInterval(maintenanceTimer);
+    maintenanceTimer = null;
+  }
 }

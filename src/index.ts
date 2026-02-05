@@ -11,7 +11,8 @@ import {
   IPC_POLL_INTERVAL,  TIMEZONE,
   CONTAINER_MODE,
   WARM_START_ENABLED,
-  ENV_PATH
+  ENV_PATH,
+  BATCH_WINDOW_MS
 } from './config.js';
 
 // Load .env from the canonical location (~/.dotclaw/.env)
@@ -19,6 +20,7 @@ dotenv.config({ path: ENV_PATH });
 import { RegisteredGroup, Session, BackgroundJobStatus } from './types.js';
 import {
   initDatabase,
+  closeDatabase,
   storeMessage,
   upsertChat,
   getMessagesSinceCursor,
@@ -36,11 +38,18 @@ import {
   getBackgroundJobQueueDepth,
   linkMessageToTrace,
   getTraceIdForMessage,
-  recordUserFeedback
+  recordUserFeedback,
+  enqueueMessageItem,
+  claimBatchForChat,
+  completeQueuedMessages,
+  failQueuedMessages,
+  getChatsWithPendingMessages,
+  resetStalledMessages
 } from './db.js';
-import { startSchedulerLoop, runTaskNow } from './task-scheduler.js';
+import { startSchedulerLoop, stopSchedulerLoop, runTaskNow } from './task-scheduler.js';
 import {
   startBackgroundJobLoop,
+  stopBackgroundJobLoop,
   spawnBackgroundJob,
   getBackgroundJobStatus,
   listBackgroundJobsForGroup,
@@ -64,21 +73,22 @@ import {
   MemoryType,
   MemoryItemInput
 } from './memory-store.js';
-import { startEmbeddingWorker } from './memory-embeddings.js';
+import { startEmbeddingWorker, stopEmbeddingWorker } from './memory-embeddings.js';
 import { createProgressManager, DEFAULT_PROGRESS_MESSAGES, DEFAULT_PROGRESS_STAGES, formatProgressWithPlan, formatPlanStepList } from './progress.js';
 import { parseAdminCommand } from './admin-commands.js';
 import { loadModelRegistry, saveModelRegistry } from './model-registry.js';
-import { startMetricsServer, recordMessage, recordError, recordRoutingDecision, recordStageLatency } from './metrics.js';
-import { startMaintenanceLoop } from './maintenance.js';
-import { warmGroupContainer, startDaemonHealthCheckLoop } from './container-runner.js';
+import { startMetricsServer, stopMetricsServer, recordMessage, recordError, recordRoutingDecision, recordStageLatency } from './metrics.js';
+import { startMaintenanceLoop, stopMaintenanceLoop } from './maintenance.js';
+import { warmGroupContainer, startDaemonHealthCheckLoop, stopDaemonHealthCheckLoop, cleanupInstanceContainers } from './container-runner.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
-import { startDashboard, setTelegramConnected, setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
+import { startDashboard, stopDashboard, setTelegramConnected, setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
 import { humanizeError } from './error-messages.js';
 import { classifyBackgroundJob } from './background-job-classifier.js';
 import { routeRequest, routePrompt } from './request-router.js';
 import { probePlanner } from './planner-probe.js';
+import { generateId } from './id.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -213,9 +223,6 @@ setInterval(cleanupRateLimiter, 60_000);
 const TELEGRAM_HANDLER_TIMEOUT_MS = runtime.host.telegram.handlerTimeoutMs;
 const TELEGRAM_SEND_RETRIES = runtime.host.telegram.sendRetries;
 const TELEGRAM_SEND_RETRY_DELAY_MS = runtime.host.telegram.sendRetryDelayMs;
-const TELEGRAM_STREAM_MODE = runtime.host.telegram.streamMode.toLowerCase();
-const TELEGRAM_STREAM_MIN_INTERVAL_MS = runtime.host.telegram.streamMinIntervalMs;
-const TELEGRAM_STREAM_MIN_CHARS = runtime.host.telegram.streamMinChars;
 const MEMORY_RECALL_MAX_RESULTS = runtime.host.memory.recall.maxResults;
 const MEMORY_RECALL_MAX_TOKENS = runtime.host.memory.recall.maxTokens;
 const INPUT_MESSAGE_MAX_CHARS = runtime.host.telegram.inputMessageMaxChars;
@@ -245,12 +252,7 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
 const TELEGRAM_SEND_DELAY_MS = 250;
 
-type QueueState = {
-  inFlight: boolean;
-  pendingMessage?: TelegramMessage;
-};
-
-const messageQueues = new Map<string, QueueState>();
+const activeDrains = new Set<string>();
 const activeRuns = new Map<string, AbortController>();
 
 function isCancelMessage(content: string): boolean {
@@ -307,72 +309,12 @@ function inferPlanStepIndex(stage: string, totalSteps: number): number | null {
   }
 }
 
-type TelegramStreamMode = 'off' | 'draft' | 'edit' | 'auto';
-
-type DraftSession = {
-  mode: 'draft' | 'edit';
-  messageThreadId?: number;
-  messageId?: number;
-  started: boolean;
-  lastSentAt: number;
-  lastChunk?: string;
-};
-
-const draftSessions = new Map<string, DraftSession>();
-
-function parseTelegramStreamMode(value: string): TelegramStreamMode {
-  const normalized = value.trim().toLowerCase();
-  if (normalized === 'draft' || normalized === 'edit' || normalized === 'auto' || normalized === 'off') {
-    return normalized;
-  }
-  return 'off';
-}
-
-function getDraftKey(chatId: string, draftId: number): string {
-  return `${chatId}:${draftId}`;
-}
-
-function createDraftId(): number {
-  const max = 2_147_483_647;
-  return Math.floor(Math.random() * (max - 1)) + 1;
-}
-
 async function setTyping(chatId: string): Promise<void> {
   try {
     await telegrafBot.telegram.sendChatAction(chatId, 'typing');
   } catch (err) {
     logger.debug({ chatId, err }, 'Failed to set typing indicator');
   }
-}
-
-function canUseTelegramDraft(msg: TelegramMessage): boolean {
-  return msg.chatType === 'private' && Number.isFinite(msg.messageThreadId);
-}
-
-function registerDraftSession(msg: TelegramMessage): { mode: 'draft' | 'edit'; draftId: number } | null {
-  const mode = parseTelegramStreamMode(TELEGRAM_STREAM_MODE);
-  if (mode === 'off') return null;
-  if (msg.chatType !== 'private') return null;
-
-  const supportsDraft = canUseTelegramDraft(msg);
-  const resolvedMode: 'draft' | 'edit' | null = mode === 'auto'
-    ? (supportsDraft ? 'draft' : 'edit')
-    : (mode === 'draft' ? (supportsDraft ? 'draft' : 'edit') : (mode === 'edit' ? 'edit' : null));
-  if (!resolvedMode) return null;
-
-  const draftId = createDraftId();
-  draftSessions.set(getDraftKey(msg.chatId, draftId), {
-    mode: resolvedMode,
-    messageThreadId: msg.messageThreadId,
-    started: false,
-    lastSentAt: 0,
-    lastChunk: undefined
-  });
-  return { mode: resolvedMode, draftId };
-}
-
-function clearDraftSession(chatId: string, draftId: number): void {
-  draftSessions.delete(getDraftKey(chatId, draftId));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -615,119 +557,6 @@ async function sendMessage(
   }
 }
 
-async function sendDraftUpdate(chatId: string, draftId: number, text: string): Promise<void> {
-  const key = getDraftKey(chatId, draftId);
-  const session = draftSessions.get(key);
-  if (!session) return;
-  if (!text || !text.trim()) return;
-
-  const now = Date.now();
-  if (now - session.lastSentAt < TELEGRAM_STREAM_MIN_INTERVAL_MS) return;
-  session.lastSentAt = now;
-
-  const chunk = splitPlainText(text, TELEGRAM_MAX_MESSAGE_LENGTH)[0] ?? '';
-  if (!chunk) return;
-  if (session.lastChunk === chunk) return;
-  session.lastChunk = chunk;
-
-  if (session.mode === 'draft') {
-    try {
-      await (telegrafBot.telegram as unknown as { callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown> })
-        .callApi('sendMessageDraft', {
-          chat_id: chatId,
-          draft_id: draftId,
-          text: chunk,
-          message_thread_id: session.messageThreadId
-        });
-      session.started = true;
-      return;
-    } catch (err) {
-      logger.warn({ chatId, err }, 'sendMessageDraft failed; switching to edit fallback');
-      session.mode = 'edit';
-    }
-  }
-
-  if (!session.messageId) {
-    try {
-      const payload: Record<string, unknown> = {};
-      if (session.messageThreadId) payload.message_thread_id = session.messageThreadId;
-      const sent = await telegrafBot.telegram.sendMessage(chatId, chunk, payload);
-      session.messageId = sent.message_id;
-      session.started = true;
-      return;
-    } catch (err) {
-      logger.warn({ chatId, err }, 'Failed to send draft placeholder');
-      return;
-    }
-  }
-
-  try {
-    await telegrafBot.telegram.editMessageText(chatId, session.messageId, undefined, chunk);
-    session.started = true;
-  } catch (err) {
-    logger.debug({ chatId, err }, 'Failed to edit draft message');
-  }
-}
-
-function isTelegramNotModifiedError(err: unknown): boolean {
-  const description = (err as { response?: { description?: unknown } })?.response?.description;
-  if (typeof description === 'string' && description.toLowerCase().includes('message is not modified')) {
-    return true;
-  }
-  return false;
-}
-
-async function finalizeStreamedMessage(msg: TelegramMessage, draftId: number | null, text: string): Promise<void> {
-  if (!draftId) {
-    await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId });
-    return;
-  }
-  const key = getDraftKey(msg.chatId, draftId);
-  const session = draftSessions.get(key);
-  if (!session) {
-    await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId });
-    return;
-  }
-
-  if (session.mode === 'edit' && session.messageId) {
-    const chunks = formatTelegramMessage(text, TELEGRAM_MAX_MESSAGE_LENGTH);
-    if (chunks.length === 0) {
-      clearDraftSession(msg.chatId, draftId);
-      return;
-    }
-    const firstChunk = chunks[0];
-    const firstChunkMatches = session.lastChunk === firstChunk;
-    try {
-      if (!firstChunkMatches) {
-        await telegrafBot.telegram.editMessageText(
-          msg.chatId,
-          session.messageId,
-          undefined,
-          firstChunk,
-          { parse_mode: TELEGRAM_PARSE_MODE }
-        );
-      }
-      for (let i = firstChunkMatches ? 1 : 1; i < chunks.length; i += 1) {
-        await sendMessage(msg.chatId, chunks[i], { messageThreadId: msg.messageThreadId });
-      }
-      clearDraftSession(msg.chatId, draftId);
-      return;
-    } catch (err) {
-      if (isTelegramNotModifiedError(err)) {
-        for (let i = firstChunkMatches ? 1 : 1; i < chunks.length; i += 1) {
-          await sendMessage(msg.chatId, chunks[i], { messageThreadId: msg.messageThreadId });
-        }
-        clearDraftSession(msg.chatId, draftId);
-        return;
-      }
-      logger.warn({ chatId: msg.chatId, err }, 'Failed to finalize streamed edit; sending new message');
-    }
-  }
-
-  await sendMessage(msg.chatId, text, { messageThreadId: msg.messageThreadId });
-  clearDraftSession(msg.chatId, draftId);
-}
-
 interface TelegramMessage {
   chatId: string;
   messageId: string;
@@ -752,41 +581,56 @@ function enqueueMessage(msg: TelegramMessage): void {
     void sendMessage(msg.chatId, 'There is no active request to cancel.', { messageThreadId: msg.messageThreadId });
     return;
   }
-  const existing = messageQueues.get(msg.chatId);
-  if (existing) {
-    existing.pendingMessage = msg;
-    if (!existing.inFlight) {
-      void drainQueue(msg.chatId);
-    }
-    setMessageQueueDepth(messageQueues.size);
-    return;
+  enqueueMessageItem({
+    chat_jid: msg.chatId,
+    message_id: msg.messageId,
+    sender_id: msg.senderId,
+    sender_name: msg.senderName,
+    content: msg.content,
+    timestamp: msg.timestamp,
+    is_group: msg.isGroup,
+    chat_type: msg.chatType,
+    message_thread_id: msg.messageThreadId
+  });
+  setMessageQueueDepth(activeDrains.size);
+  if (!activeDrains.has(msg.chatId)) {
+    void drainQueue(msg.chatId);
   }
-  messageQueues.set(msg.chatId, { inFlight: false, pendingMessage: msg });
-  setMessageQueueDepth(messageQueues.size);
-  void drainQueue(msg.chatId);
 }
 
 async function drainQueue(chatId: string): Promise<void> {
-  const state = messageQueues.get(chatId);
-  if (!state || state.inFlight) return;
-
-  state.inFlight = true;
+  if (activeDrains.has(chatId)) return;
+  activeDrains.add(chatId);
+  setMessageQueueDepth(activeDrains.size);
   try {
-    while (state.pendingMessage) {
-      const next = state.pendingMessage;
-      state.pendingMessage = undefined;
-      await processMessage(next);
+    while (true) {
+      const batch = claimBatchForChat(chatId, BATCH_WINDOW_MS);
+      if (batch.length === 0) break;
+      const last = batch[batch.length - 1];
+      const triggerMsg: TelegramMessage = {
+        chatId: last.chat_jid,
+        messageId: last.message_id,
+        senderId: last.sender_id,
+        senderName: last.sender_name,
+        content: last.content,
+        timestamp: last.timestamp,
+        isGroup: last.is_group === 1,
+        chatType: last.chat_type,
+        messageThreadId: last.message_thread_id ?? undefined
+      };
+      const batchIds = batch.map(b => b.id);
+      try {
+        await processMessage(triggerMsg);
+        completeQueuedMessages(batchIds);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        failQueuedMessages(batchIds, errMsg);
+        logger.error({ chatId, err }, 'Error processing message batch');
+      }
     }
-  } catch (err) {
-    logger.error({ chatId, err }, 'Error draining message queue');
   } finally {
-    state.inFlight = false;
-    if (state.pendingMessage) {
-      void drainQueue(chatId);
-    } else {
-      messageQueues.delete(chatId);
-    }
-    setMessageQueueDepth(messageQueues.size);
+    activeDrains.delete(chatId);
+    setMessageQueueDepth(activeDrains.size);
   }
 }
 
@@ -799,12 +643,17 @@ async function processMessage(msg: TelegramMessage): Promise<boolean> {
   recordMessage('telegram');
   setLastMessageTime(msg.timestamp);
 
-  // Get all messages since last agent interaction so the session has full context
+  // Get messages since last agent interaction, filtered to only include
+  // messages up to and including the triggering message (not future queued ones)
   const chatState = getChatState(msg.chatId);
   let missedMessages = getMessagesSinceCursor(
     msg.chatId,
     chatState?.last_agent_timestamp || null,
     chatState?.last_agent_message_id || null
+  );
+  missedMessages = missedMessages.filter(m =>
+    m.timestamp < msg.timestamp ||
+    (m.timestamp === msg.timestamp && m.id <= msg.messageId)
   );
   if (missedMessages.length === 0) {
     logger.warn({ chatId: msg.chatId }, 'No missed messages found; falling back to current message');
@@ -860,10 +709,6 @@ ${lines.join('\n')}
 
   await setTyping(msg.chatId);
   const recallQuery = missedMessages.map(entry => entry.content).join('\n');
-
-  const draftSession = registerDraftSession(msg);
-  const draftId = draftSession?.draftId ?? null;
-  const streamingEnabled = Boolean(draftSession && draftId);
 
   let output: ContainerOutput | null = null;
   let context: AgentContext | null = null;
@@ -944,12 +789,7 @@ ${lines.join('\n')}
       { messageThreadId: msg.messageThreadId }
     );
 
-    if (lastMessage) {
-      updateChatState(msg.chatId, lastMessage.timestamp, lastMessage.id);
-    }
-    if (draftId) {
-      clearDraftSession(msg.chatId, draftId);
-    }
+    updateChatState(msg.chatId, msg.timestamp, msg.messageId);
     return true;
   };
 
@@ -1043,7 +883,7 @@ ${lines.join('\n')}
   const planStepIndex = inferPlanStepIndex(predictedStage, plannerProbeSteps.length);
 
   const progressManager = createProgressManager({
-    enabled: routingDecision.progress.enabled && !streamingEnabled,
+    enabled: routingDecision.progress.enabled,
     initialDelayMs: routingDecision.progress.initialMs,
     intervalMs: routingDecision.progress.intervalMs,
     maxUpdates: routingDecision.progress.maxUpdates,
@@ -1057,7 +897,7 @@ ${lines.join('\n')}
   });
   progressManager.start();
   let sentPlan = false;
-  if (predictedMs && predictedMs >= 10_000 && routingDecision.progress.enabled && !streamingEnabled) {
+  if (predictedMs && predictedMs >= 10_000 && routingDecision.progress.enabled) {
     if (plannerProbeSteps.length > 0) {
       const planMessage = formatProgressWithPlan({
         steps: plannerProbeSteps,
@@ -1111,14 +951,6 @@ ${lines.join('\n')}
       toolDeny: routingDecision.toolDeny,
       sessionId: sessions[group.folder],
       onSessionUpdate: (sessionId) => { sessions[group.folder] = sessionId; },
-      streaming: streamingEnabled && draftId
-        ? {
-          enabled: true,
-          draftId,
-          minIntervalMs: TELEGRAM_STREAM_MIN_INTERVAL_MS,
-          minChars: TELEGRAM_STREAM_MIN_CHARS
-        }
-        : undefined,
       availableGroups: buildAvailableGroupsSnapshot(),
       modelOverride: routingDecision.modelOverride,
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
@@ -1195,9 +1027,6 @@ ${lines.join('\n')}
     }
     const userMessage = humanizeError(errorMessage || 'Unknown error');
     await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
-    if (draftId) {
-      clearDraftSession(msg.chatId, draftId);
-    }
     return false;
   }
 
@@ -1224,25 +1053,14 @@ ${lines.join('\n')}
     }
     const userMessage = humanizeError(errorText);
     await sendMessage(msg.chatId, userMessage, { messageThreadId: msg.messageThreadId });
-    if (draftId) {
-      clearDraftSession(msg.chatId, draftId);
-    }
     return false;
   }
 
-  if (lastMessage) {
-    updateChatState(msg.chatId, lastMessage.timestamp, lastMessage.id);
-  }
+  updateChatState(msg.chatId, msg.timestamp, msg.messageId);
 
   if (output.result && output.result.trim()) {
-    let sentMessageId: string | undefined;
-    if (streamingEnabled && draftId) {
-      await finalizeStreamedMessage(msg, draftId, output.result);
-      // Note: streaming doesn't easily give us the message ID
-    } else {
-      const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
-      sentMessageId = sendResult.messageId;
-    }
+    const sendResult = await sendMessage(msg.chatId, output.result, { messageThreadId: msg.messageThreadId });
+    const sentMessageId = sendResult.messageId;
     // Link the sent message to the trace for feedback tracking
     if (sentMessageId) {
       try {
@@ -1274,14 +1092,9 @@ ${lines.join('\n')}
       'I hit my tool-call step limit before I could finish. If you want me to keep going, please narrow the scope or ask for a specific subtask.',
       { messageThreadId: msg.messageThreadId }
     );
-    if (draftId) {
-      clearDraftSession(msg.chatId, draftId);
-    }
   } else {
     logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
-    if (draftId) {
-      clearDraftSession(msg.chatId, draftId);
-    }
+    await sendMessage(msg.chatId, "I wasn't able to generate a response. Please try rephrasing your message.", { messageThreadId: msg.messageThreadId });
   }
 
   if (context) {
@@ -1299,13 +1112,29 @@ ${lines.join('\n')}
 }
 
 
+let ipcWatcher: fs.FSWatcher | null = null;
+let ipcPollingTimer: NodeJS.Timeout | null = null;
+let ipcStopped = false;
+
+function stopIpcWatcher(): void {
+  ipcStopped = true;
+  if (ipcWatcher) {
+    ipcWatcher.close();
+    ipcWatcher = null;
+  }
+  if (ipcPollingTimer) {
+    clearTimeout(ipcPollingTimer);
+    ipcPollingTimer = null;
+  }
+}
+
 function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
+  ipcStopped = false;
   let processing = false;
   let scheduled = false;
-  let pollingTimer: NodeJS.Timeout | null = null;
 
   const processIpcFiles = async () => {
     if (processing) return;
@@ -1338,21 +1167,12 @@ function startIpcWatcher(): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if ((data.type === 'message' || data.type === 'message_draft') && data.chatJid && data.text) {
+              if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-                  if (data.type === 'message_draft') {
-                    const draftId = Number.isFinite(data.draftId) ? Number(data.draftId) : NaN;
-                    if (!Number.isFinite(draftId)) {
-                      logger.warn({ chatJid: data.chatJid, sourceGroup }, 'IPC draft missing draftId');
-                    } else {
-                      await sendDraftUpdate(data.chatJid, draftId, data.text);
-                    }
-                  } else {
-                    await sendMessage(data.chatJid, data.text);
-                    logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
-                  }
+                  await sendMessage(data.chatJid, data.text);
+                  logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
                 } else {
                   logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
                 }
@@ -1425,27 +1245,28 @@ function startIpcWatcher(): void {
   };
 
   const scheduleProcess = () => {
-    if (scheduled) return;
+    if (scheduled || ipcStopped) return;
     scheduled = true;
     setTimeout(async () => {
       scheduled = false;
-      await processIpcFiles();
+      if (!ipcStopped) await processIpcFiles();
     }, 100);
   };
 
   let watcherActive = false;
-  let watcher: fs.FSWatcher | null = null;
   try {
-    watcher = fs.watch(ipcBaseDir, { recursive: true }, () => {
+    ipcWatcher = fs.watch(ipcBaseDir, { recursive: true }, () => {
       scheduleProcess();
     });
-    watcher.on('error', (err) => {
+    ipcWatcher.on('error', (err) => {
       logger.warn({ err }, 'IPC watcher error; falling back to polling');
-      watcher?.close();
-      if (!pollingTimer) {
+      ipcWatcher?.close();
+      ipcWatcher = null;
+      if (!ipcPollingTimer && !ipcStopped) {
         const poll = () => {
+          if (ipcStopped) return;
           scheduleProcess();
-          pollingTimer = setTimeout(poll, IPC_POLL_INTERVAL);
+          ipcPollingTimer = setTimeout(poll, IPC_POLL_INTERVAL);
         };
         poll();
       }
@@ -1457,15 +1278,16 @@ function startIpcWatcher(): void {
 
   if (!watcherActive) {
     const poll = () => {
+      if (ipcStopped) return;
       scheduleProcess();
-      pollingTimer = setTimeout(poll, IPC_POLL_INTERVAL);
+      ipcPollingTimer = setTimeout(poll, IPC_POLL_INTERVAL);
     };
     poll();
   } else {
     scheduleProcess();
   }
 
-  if (pollingTimer) {
+  if (ipcPollingTimer) {
     logger.info('IPC watcher started (polling)');
   } else {
     logger.info('IPC watcher started (fs.watch)');
@@ -1575,15 +1397,25 @@ async function runHeartbeatOnce(): Promise<void> {
 }
 
 
+let heartbeatStopped = false;
+
+function stopHeartbeatLoop(): void {
+  heartbeatStopped = true;
+}
+
 function startHeartbeatLoop(): void {
   if (!HEARTBEAT_ENABLED) return;
+  heartbeatStopped = false;
   const loop = async () => {
+    if (heartbeatStopped) return;
     try {
       await runHeartbeatOnce();
     } catch (err) {
       logger.error({ err }, 'Heartbeat run failed');
     }
-    setTimeout(loop, HEARTBEAT_INTERVAL_MS);
+    if (!heartbeatStopped) {
+      setTimeout(loop, HEARTBEAT_INTERVAL_MS);
+    }
   };
   loop();
 }
@@ -1663,7 +1495,7 @@ async function processTaskIpc(
           nextRun = scheduled.toISOString();
         }
 
-        const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const taskId = generateId('task');
         const contextMode = (data.context_mode === 'group' || data.context_mode === 'isolated')
           ? data.context_mode
           : 'isolated';
@@ -2482,6 +2314,7 @@ function ensureDockerRunning(): void {
     logger.debug('Docker daemon is running');
   } catch {
     logger.error('Docker daemon is not running');
+    // Intentionally using console.error for maximum visibility on fatal exit
     console.error('\n╔════════════════════════════════════════════════════════════════╗');
     console.error('║  FATAL: Docker is not running                                  ║');
     console.error('║                                                                ║');
@@ -2520,6 +2353,10 @@ async function main(): Promise<void> {
 
   ensureDockerRunning();
   initDatabase();
+  const resetCount = resetStalledMessages();
+  if (resetCount > 0) {
+    logger.info({ resetCount }, 'Reset stalled queue messages to pending');
+  }
   initMemoryStore();
   startEmbeddingWorker();
   const expiredMemories = cleanupExpiredMemories();
@@ -2542,6 +2379,15 @@ async function main(): Promise<void> {
     }
   }
 
+  // Resume any pending message queues from before restart
+  const pendingChats = getChatsWithPendingMessages();
+  for (const chatId of pendingChats) {
+    if (registeredGroups[chatId]) {
+      logger.info({ chatId }, 'Resuming message queue drain after restart');
+      void drainQueue(chatId);
+    }
+  }
+
   // Set up Telegram message handlers
   setupTelegramHandlers();
 
@@ -2555,16 +2401,40 @@ async function main(): Promise<void> {
     logger.info('Telegram bot started');
 
     // Graceful shutdown
-    process.once('SIGINT', () => {
-      logger.info('Shutting down Telegram bot');
+    let shuttingDown = false;
+    const gracefulShutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info({ signal }, 'Graceful shutdown initiated');
+
+      // 1. Stop accepting new work
       setTelegramConnected(false);
-      telegrafBot.stop('SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      logger.info('Shutting down Telegram bot');
-      setTelegramConnected(false);
-      telegrafBot.stop('SIGTERM');
-    });
+      telegrafBot.stop(signal);
+
+      // 2. Stop all loops and watchers
+      stopSchedulerLoop();
+      stopBackgroundJobLoop();
+      stopIpcWatcher();
+      stopMaintenanceLoop();
+      stopHeartbeatLoop();
+      stopDaemonHealthCheckLoop();
+      stopEmbeddingWorker();
+
+      // 3. Stop HTTP servers
+      stopMetricsServer();
+      stopDashboard();
+
+      // 4. Clean up Docker containers for this instance
+      cleanupInstanceContainers();
+
+      // 5. Close database
+      closeDatabase();
+
+      logger.info('Shutdown complete');
+      process.exit(0);
+    };
+    process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+    process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
     // Start scheduler and IPC watcher
     // Wrapper that matches the scheduler's expected interface (Promise<void>)

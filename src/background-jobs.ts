@@ -20,6 +20,7 @@ import type { RegisteredGroup, BackgroundJob, BackgroundJobStatus } from './type
 import { recordBackgroundJobRun } from './metrics.js';
 import { loadModelRegistry } from './model-registry.js';
 import { logger } from './logger.js';
+import { generateId } from './id.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -122,7 +123,7 @@ function createSessionSnapshot(groupFolder: string, sessionId?: string): string 
   if (!fs.existsSync(sessionsDir)) return undefined;
   const sourceDir = path.join(sessionsDir, sessionId);
   if (!fs.existsSync(sourceDir)) return undefined;
-  const snapshotId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const snapshotId = generateId('session');
   const destDir = path.join(sessionsDir, snapshotId);
   try {
     fs.mkdirSync(destDir, { recursive: true });
@@ -397,11 +398,15 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
   }
 }
 
+let jobLoopStopped = false;
+
 export function startBackgroundJobLoop(deps: BackgroundJobDependencies): void {
   if (!JOBS_ENABLED || JOBS_MAX_CONCURRENT <= 0) return;
+  jobLoopStopped = false;
   logger.info('Background job loop started');
 
   const loop = async () => {
+    if (jobLoopStopped) return;
     try {
       const now = new Date().toISOString();
       failExpiredBackgroundJobs(now);
@@ -415,10 +420,21 @@ export function startBackgroundJobLoop(deps: BackgroundJobDependencies): void {
       logger.error({ err }, 'Error in background job loop');
     }
 
-    setTimeout(loop, JOBS_POLL_INTERVAL);
+    if (!jobLoopStopped) {
+      setTimeout(loop, JOBS_POLL_INTERVAL);
+    }
   };
 
   loop();
+}
+
+export function stopBackgroundJobLoop(): void {
+  jobLoopStopped = true;
+  // Abort all in-flight jobs
+  for (const [jobId, controller] of inFlightJobs) {
+    controller.abort();
+    logger.info({ jobId }, 'Aborted in-flight background job');
+  }
 }
 
 export function spawnBackgroundJob(params: {
@@ -446,7 +462,7 @@ export function spawnBackgroundJob(params: {
     }
   }
 
-  const jobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const jobId = generateId('job');
   const now = new Date().toISOString();
   const contextMode = params.contextMode || JOBS_CONTEXT_DEFAULT;
   const toolPolicyJson = JSON.stringify({

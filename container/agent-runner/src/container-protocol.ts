@@ -45,12 +45,6 @@ export interface ContainerInput {
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
   disableMemoryExtraction?: boolean;
-  streaming?: {
-    enabled?: boolean;
-    draftId?: number;
-    minIntervalMs?: number;
-    minChars?: number;
-  };
 }
 
 export interface ContainerOutput {

@@ -2,6 +2,7 @@ import { buildAgentContext, AgentContext } from './agent-context.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
 import { getAllTasks, setGroupSession, logToolCalls } from './db.js';
 import { MAIN_GROUP_FOLDER, TIMEZONE } from './config.js';
+import { generateId } from './id.js';
 import { runWithAgentSemaphore } from './agent-semaphore.js';
 import { withGroupLock } from './locks.js';
 import { getModelPricing } from './model-registry.js';
@@ -39,7 +40,7 @@ export function createTraceBase(params: {
   source: string;
 }): TraceBase {
   return {
-    trace_id: `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    trace_id: generateId('trace'),
     timestamp: new Date().toISOString(),
     created_at: Date.now(),
     chat_id: params.chatId,
@@ -94,12 +95,6 @@ export async function executeAgentRun(params: {
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
   disableMemoryExtraction?: boolean;
-  streaming?: {
-    enabled: boolean;
-    draftId: number;
-    minIntervalMs?: number;
-    minChars?: number;
-  };
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   maxToolSteps?: number;
   timeoutMs?: number;
@@ -159,7 +154,6 @@ export async function executeAgentRun(params: {
     disableResponseValidation: params.disableResponseValidation,
     responseValidationMaxRetries: params.responseValidationMaxRetries,
     disableMemoryExtraction: params.disableMemoryExtraction,
-    streaming: params.streaming,
     maxToolSteps: params.maxToolSteps
   }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });
 

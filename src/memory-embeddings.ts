@@ -111,15 +111,25 @@ export async function backfillEmbeddings(): Promise<number> {
   return updated;
 }
 
+let embeddingWorkerStopped = false;
+
 export function startEmbeddingWorker(): void {
   if (!EMBEDDINGS_ENABLED) return;
+  embeddingWorkerStopped = false;
   const loop = async () => {
+    if (embeddingWorkerStopped) return;
     try {
       await backfillEmbeddings();
     } catch {
       // ignore embedding worker errors
     }
-    setTimeout(loop, EMBEDDING_INTERVAL_MS);
+    if (!embeddingWorkerStopped) {
+      setTimeout(loop, EMBEDDING_INTERVAL_MS);
+    }
   };
   loop();
+}
+
+export function stopEmbeddingWorker(): void {
+  embeddingWorkerStopped = true;
 }

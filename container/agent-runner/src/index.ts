@@ -26,7 +26,7 @@ import {
   MemoryConfig,
   Message
 } from './memory.js';
-import { loadPromptPackWithCanary, formatTaskExtractionPack, formatResponseQualityPack, formatToolCallingPack, formatToolOutcomePack, formatMemoryPolicyPack, formatMemoryRecallPack, PromptPack } from './prompt-packs.js';
+import { loadPromptPackWithCanary, formatPromptPack, PromptPack } from './prompt-packs.js';
 
 type OpenRouterResult = ReturnType<OpenRouter['callModel']>;
 
@@ -71,133 +71,168 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-function coerceTextFromContent(content: unknown): string {
-  if (!content) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.map(part => {
-      if (!part) return '';
-      if (typeof part === 'string') return part;
-      if (typeof part === 'object') {
-        const record = part as { text?: unknown; content?: unknown; value?: unknown };
-        if (typeof record.text === 'string') return record.text;
-        if (typeof record.content === 'string') return record.content;
-        if (typeof record.value === 'string') return record.value;
+// ── Response extraction pipeline ─────────────────────────────────────
+// OpenRouter SDK v0.3.x returns raw response IDs (gen-*, resp-*, etc.) instead
+// of text for fast reasoning models (GPT-5-mini/nano). Reasoning tokens consume
+// the output budget, leaving nothing for actual text. This multi-layer pipeline
+// works around that:
+//   1. isLikelyResponseId — detect leaked IDs so we never surface them
+//   2. extractTextFromRawResponse — walk raw response fields ourselves
+//   3. getTextWithFallback — try SDK getText(), fall back to raw extraction
+//   4. chatCompletionsFallback — retry via /chat/completions when all else fails
+// Remove this pipeline once the SDK reliably returns text for reasoning models.
+
+const RESPONSE_ID_PREFIXES = ['gen-', 'resp-', 'resp_', 'chatcmpl-', 'msg_'];
+
+function isLikelyResponseId(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.includes(' ') || trimmed.includes('\n')) return false;
+  return RESPONSE_ID_PREFIXES.some(prefix => trimmed.startsWith(prefix));
+}
+
+function isValidText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && !isLikelyResponseId(value);
+}
+
+function extractTextFromRawResponse(response: unknown): string {
+  if (!response || typeof response !== 'object') return '';
+  const record = response as Record<string, unknown>;
+
+  // 1. SDK-parsed camelCase field
+  if (isValidText(record.outputText)) return record.outputText;
+
+  // 2. Raw API snake_case field
+  if (isValidText(record.output_text)) return record.output_text;
+
+  // 3. Walk response.output[] for message/output_text items
+  if (Array.isArray(record.output)) {
+    const parts: string[] = [];
+    for (const item of record.output) {
+      if (!item || typeof item !== 'object') continue;
+      const typed = item as { type?: string; content?: unknown; text?: string };
+      if (typed.type === 'message' && Array.isArray(typed.content)) {
+        for (const part of typed.content as Array<{ type?: string; text?: string }>) {
+          if (part?.type === 'output_text' && isValidText(part.text)) {
+            parts.push(part.text);
+          }
+        }
+      } else if (typed.type === 'output_text' && isValidText(typed.text)) {
+        parts.push(typed.text);
       }
-      return '';
-    }).join('');
+    }
+    const joined = parts.join('');
+    if (joined.trim()) return joined;
   }
-  if (typeof content === 'object') {
-    const record = content as { text?: unknown; content?: unknown; value?: unknown };
-    if (typeof record.text === 'string') return record.text;
-    if (typeof record.content === 'string') return record.content;
-    if (typeof record.value === 'string') return record.value;
+
+  // 4. OpenAI chat completions compat
+  if (Array.isArray(record.choices) && record.choices.length > 0) {
+    const choice = record.choices[0] as { message?: { content?: unknown } } | null | undefined;
+    if (choice?.message && isValidText(choice.message.content)) {
+      return choice.message.content;
+    }
   }
+
   return '';
 }
 
-function extractTextFallbackFromResponse(response: unknown): string {
-  const seen = new Set<unknown>();
-  const maxDepth = 4;
-
-  const walk = (value: unknown, depth: number): string => {
-    if (!value) return '';
-    if (typeof value === 'string') return value;
-    if (seen.has(value)) return '';
-    if (depth > maxDepth) return '';
-    if (Array.isArray(value)) {
-      const parts: string[] = [];
-      for (const item of value) {
-        const text = walk(item, depth + 1);
-        if (text.trim()) parts.push(text);
-      }
-      return parts.join('');
-    }
-    if (typeof value !== 'object') return '';
-
-    seen.add(value);
-    const record = value as Record<string, unknown>;
-
-    if (typeof record.outputText === 'string' && record.outputText.trim()) {
-      return record.outputText;
-    }
-    if (typeof record.output_text === 'string' && record.output_text.trim()) {
-      return record.output_text;
-    }
-    if (typeof record.text === 'string' && record.text.trim()) {
-      return record.text;
-    }
-
-    if (record.message && typeof record.message === 'object') {
-      const message = record.message as { content?: unknown; text?: unknown };
-      const contentText = coerceTextFromContent(message.content ?? message.text);
-      if (contentText.trim()) return contentText;
-    }
-    if (record.content) {
-      const contentText = coerceTextFromContent(record.content);
-      if (contentText.trim()) return contentText;
-    }
-
-    if (Array.isArray(record.output)) {
-      const outputTexts: string[] = [];
-      for (const item of record.output) {
-        if (!item || typeof item !== 'object') continue;
-        const typed = item as { type?: unknown; content?: unknown; text?: unknown };
-        const type = typeof typed.type === 'string' ? typed.type : '';
-        if (type === 'message') {
-          const text = coerceTextFromContent(typed.content);
-          if (text.trim()) outputTexts.push(text);
-        } else if (type === 'output_text') {
-          const text = coerceTextFromContent(typed.text ?? typed.content);
-          if (text.trim()) outputTexts.push(text);
-        } else {
-          const text = coerceTextFromContent(typed.content ?? typed.text);
-          if (text.trim()) outputTexts.push(text);
-        }
-      }
-      const joined = outputTexts.join('');
-      if (joined.trim()) return joined;
-    }
-
-    if (Array.isArray(record.choices) && record.choices.length > 0) {
-      const choice = record.choices[0] as { message?: { content?: unknown }; text?: unknown } | null | undefined;
-      if (choice?.message) {
-        const text = coerceTextFromContent(choice.message.content);
-        if (text.trim()) return text;
-      }
-      if (typeof choice?.text === 'string' && choice.text.trim()) {
-        return choice.text;
-      }
-    }
-
-    for (const value of Object.values(record)) {
-      const text = walk(value, depth + 1);
-      if (text.trim()) return text;
-    }
-
-    return '';
-  };
-
-  return walk(response, 0);
-}
-
 async function getTextWithFallback(result: OpenRouterResult, context: string): Promise<string> {
+  // 1. Try the SDK's proper getText() first — this handles tool execution and
+  //    extracts text from the final response via the SDK's own logic.
+  try {
+    const text = await result.getText();
+    if (isValidText(text)) {
+      return text;
+    }
+    if (text && isLikelyResponseId(text)) {
+      log(`Ignored response id from getText (${context}): ${String(text).slice(0, 60)}`);
+    }
+  } catch (err) {
+    log(`getText failed (${context}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // 2. Fall back to raw response extraction — walk known fields ourselves
   try {
     const response = await result.getResponse();
-    const fallbackText = extractTextFallbackFromResponse(response);
-    if (fallbackText && fallbackText.trim()) {
-      log(`Recovered empty response text from payload (${context})`);
+    const fallbackText = extractTextFromRawResponse(response);
+    if (fallbackText) {
+      log(`Recovered text from raw response (${context})`);
       return fallbackText;
     }
-    log(`Model returned empty response and fallback extraction failed (${context})`);
+    const r = response as Record<string, unknown>;
+    const outputLen = Array.isArray(r.output) ? (r.output as unknown[]).length : 0;
+    log(`No text in raw response (${context}): id=${String(r.id ?? 'none').slice(0, 40)} status=${String(r.status ?? '?')} outputs=${outputLen}`);
   } catch (err) {
-    log(`Failed to recover empty response text (${context}): ${err instanceof Error ? err.message : String(err)}`);
+    log(`Raw response extraction failed (${context}): ${err instanceof Error ? err.message : String(err)}`);
   }
-  const text = await result.getText();
-  if (text && text.trim()) {
-    return text;
+
+  // 3. Never return a response ID
+  return '';
+}
+
+/**
+ * Direct Chat Completions API fallback.
+ * When the Responses API returns a gen-ID instead of text (common with fast
+ * models like gpt-5-nano/mini via OpenRouter), retry using the standard
+ * /chat/completions endpoint which reliably returns text content.
+ */
+async function chatCompletionsFallback(params: {
+  model: string;
+  instructions: string;
+  messages: Array<{ role: string; content: string }>;
+  maxOutputTokens: number;
+  temperature: number;
+}): Promise<string> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return '';
+
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json'
+  };
+  if (agent.openrouter.siteUrl) {
+    headers['HTTP-Referer'] = agent.openrouter.siteUrl;
   }
-  return text;
+  if (agent.openrouter.siteName) {
+    headers['X-Title'] = agent.openrouter.siteName;
+  }
+
+  const chatMessages = [
+    { role: 'system', content: params.instructions },
+    ...params.messages
+  ];
+
+  log(`Chat Completions fallback: model=${params.model}, messages=${chatMessages.length}`);
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: params.model,
+      messages: chatMessages,
+      max_completion_tokens: params.maxOutputTokens,
+      temperature: params.temperature,
+      reasoning_effort: 'low'
+    }),
+    signal: AbortSignal.timeout(agent.openrouter.timeoutMs)
+  });
+
+  const bodyText = await response.text();
+  if (!response.ok) {
+    log(`Chat Completions fallback HTTP ${response.status}: ${bodyText.slice(0, 300)}`);
+    return '';
+  }
+
+  try {
+    const data = JSON.parse(bodyText);
+    const content = data?.choices?.[0]?.message?.content;
+    if (isValidText(content)) {
+      log(`Chat Completions fallback recovered text (${String(content).length} chars)`);
+      return content;
+    }
+    log(`Chat Completions fallback returned no text: ${JSON.stringify(data).slice(0, 300)}`);
+  } catch (err) {
+    log(`Chat Completions fallback parse error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return '';
 }
 
 function writeOutput(output: ContainerOutput): void {
@@ -574,53 +609,15 @@ function buildSystemInstructions(params: {
     ? `Job artifacts directory: /workspace/group/jobs/${params.jobId}`
     : '';
 
-  const taskExtractionBlock = params.taskExtractionPack
-    ? formatTaskExtractionPack({
-      pack: params.taskExtractionPack,
-      maxDemos: PROMPT_PACKS_MAX_DEMOS,
-      maxChars: PROMPT_PACKS_MAX_CHARS
-    })
-    : '';
+  const fmtPack = (label: string, pack: PromptPack | null | undefined) =>
+    pack ? formatPromptPack({ label, pack, maxDemos: PROMPT_PACKS_MAX_DEMOS, maxChars: PROMPT_PACKS_MAX_CHARS }) : '';
 
-  const responseQualityBlock = params.responseQualityPack
-    ? formatResponseQualityPack({
-      pack: params.responseQualityPack,
-      maxDemos: PROMPT_PACKS_MAX_DEMOS,
-      maxChars: PROMPT_PACKS_MAX_CHARS
-    })
-    : '';
-
-  const toolCallingBlock = params.toolCallingPack
-    ? formatToolCallingPack({
-      pack: params.toolCallingPack,
-      maxDemos: PROMPT_PACKS_MAX_DEMOS,
-      maxChars: PROMPT_PACKS_MAX_CHARS
-    })
-    : '';
-
-  const toolOutcomeBlock = params.toolOutcomePack
-    ? formatToolOutcomePack({
-      pack: params.toolOutcomePack,
-      maxDemos: PROMPT_PACKS_MAX_DEMOS,
-      maxChars: PROMPT_PACKS_MAX_CHARS
-    })
-    : '';
-
-  const memoryPolicyBlock = params.memoryPolicyPack
-    ? formatMemoryPolicyPack({
-      pack: params.memoryPolicyPack,
-      maxDemos: PROMPT_PACKS_MAX_DEMOS,
-      maxChars: PROMPT_PACKS_MAX_CHARS
-    })
-    : '';
-
-  const memoryRecallBlock = params.memoryRecallPack
-    ? formatMemoryRecallPack({
-      pack: params.memoryRecallPack,
-      maxDemos: PROMPT_PACKS_MAX_DEMOS,
-      maxChars: PROMPT_PACKS_MAX_CHARS
-    })
-    : '';
+  const taskExtractionBlock = fmtPack('Task Extraction Guidelines', params.taskExtractionPack);
+  const responseQualityBlock = fmtPack('Response Quality Guidelines', params.responseQualityPack);
+  const toolCallingBlock = fmtPack('Tool Calling Guidelines', params.toolCallingPack);
+  const toolOutcomeBlock = fmtPack('Tool Outcome Guidelines', params.toolOutcomePack);
+  const memoryPolicyBlock = fmtPack('Memory Policy Guidelines', params.memoryPolicyPack);
+  const memoryRecallBlock = fmtPack('Memory Recall Guidelines', params.memoryRecallPack);
 
   return [
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
@@ -750,7 +747,8 @@ async function updateMemorySummary(params: {
     instructions: prompt.instructions,
     input: prompt.input,
     maxOutputTokens: params.maxOutputTokens,
-    temperature: 0.1
+    temperature: 0.1,
+    reasoning: { effort: 'low' as const }
   });
   const text = await getTextWithFallback(result, 'summary');
   return parseSummaryResponse(text);
@@ -764,7 +762,8 @@ function buildMemoryExtractionPrompt(params: {
   memoryPolicyPack?: PromptPack | null;
 }): { instructions: string; input: string } {
   const policyBlock = params.memoryPolicyPack
-    ? formatMemoryPolicyPack({
+    ? formatPromptPack({
+      label: 'Memory Policy Guidelines',
       pack: params.memoryPolicyPack,
       maxDemos: PROMPT_PACKS_MAX_DEMOS,
       maxChars: PROMPT_PACKS_MAX_CHARS
@@ -891,7 +890,8 @@ async function validateResponseQuality(params: {
     instructions: prompt.instructions,
     input: prompt.input,
     maxOutputTokens: params.maxOutputTokens,
-    temperature: params.temperature
+    temperature: params.temperature,
+    reasoning: { effort: 'low' as const }
   });
   const text = await getTextWithFallback(result, 'response_validation');
   return parseResponseValidation(text);
@@ -997,24 +997,6 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const responseValidateMinPromptTokens = agent.responseValidation.minPromptTokens || 0;
   const responseValidateMinResponseTokens = agent.responseValidation.minResponseTokens || 0;
   const maxContextMessageTokens = agent.context.maxContextMessageTokens;
-  const streamingEnabled = Boolean(input.streaming?.enabled && typeof input.streaming?.draftId === 'number');
-  const streamingDraftId = streamingEnabled ? input.streaming?.draftId : undefined;
-  const streamingMinIntervalMs = Math.max(
-    0,
-    Math.floor(
-      typeof input.streaming?.minIntervalMs === 'number'
-        ? input.streaming.minIntervalMs
-        : agent.streaming.minIntervalMs
-    )
-  );
-  const streamingMinChars = Math.max(
-    1,
-    Math.floor(
-      typeof input.streaming?.minChars === 'number'
-        ? input.streaming.minChars
-        : agent.streaming.minChars
-    )
-  );
 
   const openrouter = getCachedOpenRouter(apiKey, openrouterOptions);
   const tokenEstimate = resolveTokenEstimate(input, agentConfig);
@@ -1045,21 +1027,6 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       enabled: Boolean(input.isBackgroundJob)
     }
   });
-
-  let streamLastSentAt = 0;
-  let streamLastSentLength = 0;
-  const sendStreamUpdate = (text: string, force = false) => {
-    if (!streamingEnabled || !streamingDraftId) return;
-    if (!text || !text.trim()) return;
-    const now = Date.now();
-    if (!force) {
-      if (now - streamLastSentAt < streamingMinIntervalMs) return;
-      if (text.length - streamLastSentLength < streamingMinChars) return;
-    }
-    streamLastSentAt = now;
-    streamLastSentLength = text.length;
-    void ipc.sendDraft(text, streamingDraftId).catch(() => undefined);
-  };
 
   if (process.env.DOTCLAW_SELF_CHECK === '1') {
     try {
@@ -1263,7 +1230,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         instructions: plannerPrompt.instructions,
         input: plannerPrompt.input,
         maxOutputTokens: plannerMaxOutputTokens,
-        temperature: plannerTemperature
+        temperature: plannerTemperature,
+        reasoning: { effort: 'low' as const }
       });
       const plannerText = await getTextWithFallback(plannerResult, 'planner');
       const plan = parsePlannerResponse(plannerText);
@@ -1330,47 +1298,39 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       stopWhen: stepCountIs(maxToolSteps),
       maxOutputTokens: config.maxOutputTokens,
       temperature: config.temperature,
-      stream: streamingEnabled
+      reasoning: { effort: 'low' as const }
     };
-    const result = await openrouter.callModel(callParams as Parameters<typeof openrouter.callModel>[0]);
+    const result = await openrouter.callModel(callParams);
     const localLatencyMs = Date.now() - startedAt;
+
+    // Get the complete response text via the SDK's proper getText() path
+    let localResponseText = await getTextWithFallback(result, 'completion');
+
     const toolCallsFromModel = await result.getToolCalls();
     if (toolCallsFromModel.length > 0) {
       log(`Model made ${toolCallsFromModel.length} tool call(s): ${toolCallsFromModel.map(t => t.name).join(', ')}`);
     }
 
-    let localResponseText = '';
-    let streamed = false;
-    if (streamingEnabled && typeof (result as { getTextStream?: () => AsyncIterable<unknown> }).getTextStream === 'function') {
-      try {
-        const stream = (result as { getTextStream: () => AsyncIterable<unknown> }).getTextStream();
-        for await (const chunk of stream) {
-          const delta = typeof chunk === 'string'
-            ? chunk
-            : (typeof (chunk as { text?: unknown })?.text === 'string' ? (chunk as { text?: string }).text || '' : '');
-          if (!delta) continue;
-          localResponseText += delta;
-          sendStreamUpdate(localResponseText);
-        }
-        if (localResponseText) {
-          sendStreamUpdate(localResponseText, true);
-        }
-        streamed = true;
-      } catch (err) {
-        log(`Streaming failed, falling back to full response: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    if (!streamed || !localResponseText || !localResponseText.trim()) {
-      localResponseText = await getTextWithFallback(result, 'completion');
-      if (localResponseText && localResponseText.trim()) {
-        sendStreamUpdate(localResponseText, true);
-      }
-    }
     if (!localResponseText || !localResponseText.trim()) {
       if (toolCallsFromModel.length > 0) {
         localResponseText = 'I started running tool calls but did not get a final response. If you want me to continue, please ask a narrower subtask or say "continue".';
+      } else {
+        // Responses API likely returned a gen-ID; retry with Chat Completions API
+        try {
+          localResponseText = await chatCompletionsFallback({
+            model,
+            instructions: resolvedInstructions,
+            messages: messagesToOpenRouter(contextMessages),
+            maxOutputTokens: config.maxOutputTokens,
+            temperature: config.temperature
+          });
+        } catch (err) {
+          log(`Chat Completions fallback error: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
-      log(`Warning: Model returned empty/whitespace response. Raw length: ${localResponseText?.length ?? 0}, tool calls: ${toolCallsFromModel.length}`);
+      if (!localResponseText || !localResponseText.trim()) {
+        log(`Warning: Model returned empty/whitespace response after all fallbacks. tool calls: ${toolCallsFromModel.length}`);
+      }
     } else {
       log(`Model returned text response (${localResponseText.length} chars)`);
     }
@@ -1430,8 +1390,6 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         }
         retriesLeft -= 1;
         log(`Response validation failed; retrying (${retriesLeft} retries left)`);
-        streamLastSentAt = 0;
-        streamLastSentLength = 0;
         const retryGuidance = buildRetryGuidance(validationResult);
         const retryAttempt = await runCompletion(retryGuidance);
         responseText = retryAttempt.responseText;
@@ -1502,7 +1460,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       instructions: extractionPrompt.instructions,
       input: extractionPrompt.input,
       maxOutputTokens: memoryExtractionMaxOutputTokens,
-      temperature: 0.1
+      temperature: 0.1,
+      reasoning: { effort: 'low' as const }
     });
     const extractionText = await getTextWithFallback(extractionResult, 'memory_extraction');
     const extractedItems = parseMemoryExtraction(extractionText);

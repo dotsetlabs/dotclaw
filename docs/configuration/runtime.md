@@ -68,14 +68,14 @@ title: Runtime Config
         "maxOutputTokens": 120,
         "temperature": 0,
         "minChars": 700,
-        "minSteps": 5,
+        "minSteps": 4,
         "minTools": 3
       },
       "profiles": {
-        "fast": { "model": "openai/gpt-5-nano", "maxOutputTokens": 256, "maxToolSteps": 6, "enablePlanner": false },
-        "standard": { "model": "openai/gpt-5-mini", "maxOutputTokens": 768, "maxToolSteps": 16 },
-        "deep": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 1536, "maxToolSteps": 32 },
-        "background": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 2048, "maxToolSteps": 64 }
+        "fast": { "model": "openai/gpt-5-nano", "maxOutputTokens": 4096, "maxToolSteps": 6, "enablePlanner": false },
+        "standard": { "model": "openai/gpt-5-mini", "maxOutputTokens": 4096, "maxToolSteps": 16 },
+        "deep": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 4096, "maxToolSteps": 32 },
+        "background": { "model": "moonshotai/kimi-k2.5", "maxOutputTokens": 4096, "maxToolSteps": 64 }
       }
     }
   },
@@ -112,7 +112,7 @@ title: Runtime Config
 - `host.container.instanceId` lets you run multiple DotClaw instances on the same machine by
   namespacing daemon container names.
 - `host.metrics.enabled` and `host.metrics.port` expose Prometheus metrics on `http://localhost:<port>/metrics`.
-- `host.dashboard.enabled` serves a basic status page on `http://localhost:<port+1>/`.
+- `host.dashboard.enabled` and `host.dashboard.port` serve a basic status page on `http://localhost:<port>/`.
 - `host.timezone` overrides the scheduler timezone and is passed to the agent so timestamps are interpreted in the correct local time.
 - `host.heartbeat` controls automated heartbeat runs (disable if you don't want background activity).
 - `host.backgroundJobs` controls the background job queue (long-running async work).
@@ -158,7 +158,7 @@ Example:
         "maxUpdates": 3
       },
       "toolAllow": [],
-      "toolDeny": ["mcp__dotclaw__schedule_task"],
+      "toolDeny": ["mcp__dotclaw__schedule_task", "mcp__dotclaw__update_task", "mcp__dotclaw__pause_task", "mcp__dotclaw__resume_task", "mcp__dotclaw__cancel_task"],
       "autoSpawn": {
         "enabled": true,
         "foregroundTimeoutMs": 90000,

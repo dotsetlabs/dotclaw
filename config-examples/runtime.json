@@ -10,7 +10,8 @@
       "enabled": true
     },
     "dashboard": {
-      "enabled": true
+      "enabled": true,
+      "port": 3002
     },
     "memory": {
       "embeddings": {
@@ -54,9 +55,9 @@
       "maxFastChars": 200,
       "maxStandardChars": 1200,
       "backgroundMinChars": 2000,
-      "fastKeywords": ["hi", "hello", "hey", "who are you", "what can you do"],
-      "deepKeywords": ["research", "analysis", "report", "dashboard", "refactor", "architecture", "design"],
-      "backgroundKeywords": ["background", "long-running", "research", "dashboard", "refactor", "report"],
+      "fastKeywords": ["hi", "hello", "hey", "who are you", "what can you do", "help", "thanks", "thank you"],
+      "deepKeywords": ["research", "analysis", "analyze", "report", "dashboard", "vibe", "refactor", "architecture", "design", "spec", "strategy", "migration", "benchmark", "investigate", "evaluate", "summarize", "long-running"],
+      "backgroundKeywords": ["background", "long-running", "research", "deep dive", "multi-step", "multi step", "dashboard", "refactor", "benchmark", "report", "analysis", "survey", "crawl", "scrape", "codebase"],
       "classifierFallback": {
         "enabled": true,
         "minChars": 600
@@ -74,7 +75,7 @@
       "profiles": {
         "fast": {
           "model": "openai/gpt-5-nano",
-          "maxOutputTokens": 256,
+          "maxOutputTokens": 4096,
           "maxToolSteps": 6,
           "recallMaxResults": 0,
           "recallMaxTokens": 0,
@@ -87,7 +88,7 @@
         },
         "standard": {
           "model": "openai/gpt-5-mini",
-          "maxOutputTokens": 768,
+          "maxOutputTokens": 4096,
           "maxToolSteps": 16,
           "recallMaxResults": 6,
           "recallMaxTokens": 1500,
@@ -99,7 +100,7 @@
         },
         "deep": {
           "model": "moonshotai/kimi-k2.5",
-          "maxOutputTokens": 1536,
+          "maxOutputTokens": 4096,
           "maxToolSteps": 32,
           "recallMaxResults": 12,
           "recallMaxTokens": 2500,
@@ -111,7 +112,7 @@
         },
         "background": {
           "model": "moonshotai/kimi-k2.5",
-          "maxOutputTokens": 2048,
+          "maxOutputTokens": 4096,
           "maxToolSteps": 64,
           "recallMaxResults": 16,
           "recallMaxTokens": 4000,

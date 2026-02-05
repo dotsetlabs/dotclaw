@@ -45,12 +45,15 @@ From the main/admin Telegram chat:
 /dotclaw style concise
 /dotclaw style balanced
 /dotclaw style detailed
-/dotclaw tools low       # sets tool_calling_bias to 0.3
-/dotclaw tools high      # sets tool_calling_bias to 0.7
-/dotclaw caution low     # sets caution_bias to 0.3
-/dotclaw caution high    # sets caution_bias to 0.7
-/dotclaw memory strict   # sets memory_importance_threshold to 0.7
-/dotclaw memory loose    # sets memory_importance_threshold to 0.3
+/dotclaw tools conservative   # sets tool_calling_bias to 0.3
+/dotclaw tools balanced       # sets tool_calling_bias to 0.5
+/dotclaw tools proactive      # sets tool_calling_bias to 0.7
+/dotclaw caution low          # sets caution_bias to 0.35
+/dotclaw caution balanced     # sets caution_bias to 0.5
+/dotclaw caution high         # sets caution_bias to 0.7
+/dotclaw memory strict        # sets memory_importance_threshold to 0.7
+/dotclaw memory balanced      # sets memory_importance_threshold to 0.55
+/dotclaw memory loose         # sets memory_importance_threshold to 0.45
 ```
 
 ## Autotune integration

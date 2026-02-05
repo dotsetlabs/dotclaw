@@ -565,7 +565,7 @@ export function startDashboard(): void {
     logger.info('Dashboard disabled');
     return;
   }
-  const port = runtime.host.metrics.port + 1; // Dashboard on metrics port + 1 (default 3002)
+  const port = runtime.host.dashboard.port;
   const bind = runtime.host.bind;
 
   server = http.createServer(async (req, res) => {

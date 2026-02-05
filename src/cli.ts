@@ -215,13 +215,61 @@ async function isPortAvailable(port: number): Promise<boolean> {
   });
 }
 
+function acquirePortLock(): number | null {
+  const lockPath = path.join(getUserHome(), '.dotclaw', '.port-lock');
+  try {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    const fd = fs.openSync(lockPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
+    fs.writeFileSync(lockPath, String(process.pid));
+    return fd;
+  } catch {
+    return null;
+  }
+}
+
+function releasePortLock(fd: number): void {
+  const lockPath = path.join(getUserHome(), '.dotclaw', '.port-lock');
+  try { fs.closeSync(fd); } catch { /* ignore */ }
+  try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+}
+
+async function withPortLock<T>(fn: () => Promise<T>): Promise<T> {
+  const maxWait = 10_000;
+  const pollMs = 200;
+  const start = Date.now();
+  let fd: number | null = null;
+  while (Date.now() - start < maxWait) {
+    fd = acquirePortLock();
+    if (fd !== null) break;
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  if (fd === null) {
+    throw new Error('Could not acquire port lock. Another instance creation may be in progress.');
+  }
+  try {
+    return await fn();
+  } finally {
+    releasePortLock(fd);
+  }
+}
+
 async function findAvailablePort(startPort: number, attempts = 20): Promise<number> {
   let port = startPort;
   for (let i = 0; i < attempts; i += 1) {
     if (await isPortAvailable(port)) return port;
     port += 1;
   }
-  return startPort;
+  throw new Error(`No available port found in range ${startPort}-${startPort + attempts - 1}`);
+}
+
+function getVersion(): string {
+  try {
+    const pkgPath = path.join(PACKAGE_ROOT, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    return pkg.version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 function getNodePath(): string {
@@ -491,48 +539,108 @@ async function cmdStart(foreground = false): Promise<void> {
   }
 }
 
+function cleanupInstanceContainers(): void {
+  try {
+    // Find containers belonging to this instance using Docker labels
+    let filterArgs: string;
+    if (INSTANCE_ID) {
+      filterArgs = `--filter "label=dotclaw.instance=${INSTANCE_ID}"`;
+    } else {
+      // Default instance: containers with dotclaw.group label but WITHOUT dotclaw.instance label
+      filterArgs = '--filter "label=dotclaw.group"';
+    }
+
+    const ids = execSync(`docker ps -q ${filterArgs}`, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+    if (!ids) return;
+
+    const containerIds = ids.split('\n').filter(Boolean);
+
+    // For the default instance, exclude containers that have a dotclaw.instance label
+    let toRemove = containerIds;
+    if (!INSTANCE_ID && containerIds.length > 0) {
+      toRemove = containerIds.filter(id => {
+        try {
+          const labels = execSync(`docker inspect --format '{{index .Config.Labels "dotclaw.instance"}}' ${id}`, {
+            encoding: 'utf-8', stdio: 'pipe'
+          }).trim();
+          return !labels; // Keep only containers without a dotclaw.instance label
+        } catch {
+          return true;
+        }
+      });
+    }
+
+    if (toRemove.length > 0) {
+      execSync(`docker rm -f ${toRemove.join(' ')}`, { stdio: 'ignore' });
+      log(`Cleaned up ${toRemove.length} container(s)`);
+    }
+  } catch {
+    // Docker may not be running or no containers to clean up
+  }
+}
+
 async function cmdStop(): Promise<void> {
+  let serviceStopped = false;
+
   if (IS_MACOS) {
     const plistPath = getLaunchdPlistPath();
     if (!fs.existsSync(plistPath)) {
       log('Service not installed');
-      return;
-    }
-
-    if (!isServiceRunning()) {
+    } else if (!isServiceRunning()) {
       log('Service is not running');
-      return;
-    }
-
-    log('Stopping service...');
-    try {
-      execSync(`launchctl unload "${plistPath}"`, { stdio: 'inherit' });
-      log('Service stopped');
-    } catch {
-      error('Failed to stop service');
-      process.exit(1);
+    } else {
+      log('Stopping service...');
+      try {
+        execSync(`launchctl unload "${plistPath}"`, { stdio: 'inherit' });
+        log('Service stopped');
+        serviceStopped = true;
+      } catch {
+        error('Failed to stop service');
+        process.exit(1);
+      }
     }
   } else if (IS_LINUX) {
     if (!isServiceRunning()) {
       log('Service is not running');
-      return;
-    }
-
-    log('Stopping service...');
-    try {
-      execSync(`sudo systemctl stop ${SYSTEMD_SERVICE_NAME}`, { stdio: 'inherit' });
-      log('Service stopped');
-    } catch {
-      error('Failed to stop service');
-      process.exit(1);
+    } else {
+      log('Stopping service...');
+      try {
+        execSync(`sudo systemctl stop ${SYSTEMD_SERVICE_NAME}`, { stdio: 'inherit' });
+        log('Service stopped');
+        serviceStopped = true;
+      } catch {
+        error('Failed to stop service');
+        process.exit(1);
+      }
     }
   } else {
     warn(`Unsupported platform: ${PLATFORM}`);
   }
+
+  // Give the process a moment to run its graceful shutdown handler
+  if (serviceStopped) {
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  // Clean up any remaining containers for this instance
+  cleanupInstanceContainers();
 }
 
 async function cmdRestart(): Promise<void> {
   await cmdStop();
+
+  // Wait for the old process to fully exit before starting again
+  const maxWaitMs = 10_000;
+  const pollMs = 500;
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    if (!isServiceRunning()) break;
+    await new Promise(r => setTimeout(r, pollMs));
+  }
+  if (isServiceRunning()) {
+    warn('Old service still running after timeout; starting anyway');
+  }
+
   await cmdStart();
 }
 
@@ -737,19 +845,27 @@ async function cmdAddInstance(instanceId: string): Promise<void> {
   container.instanceId = normalized;
   host.container = container;
 
-  const metrics = typeof host.metrics === 'object' && host.metrics ? host.metrics as Record<string, unknown> : {};
-  const metricsEnabled = metrics.enabled !== false;
-  if (metricsEnabled) {
-    const basePort = typeof metrics.port === 'number' ? metrics.port : 3001;
-    const availablePort = await findAvailablePort(basePort + 1);
-    metrics.port = availablePort;
-  }
-  host.metrics = metrics;
-  runtimeConfig.host = host;
+  // Allocate ports under a file lock to prevent race conditions with concurrent instance creation
+  await withPortLock(async () => {
+    const metrics = typeof host.metrics === 'object' && host.metrics ? host.metrics as Record<string, unknown> : {};
+    const dashboard = typeof host.dashboard === 'object' && host.dashboard ? host.dashboard as Record<string, unknown> : {};
+    const metricsEnabled = metrics.enabled !== false;
+    if (metricsEnabled) {
+      const basePort = typeof metrics.port === 'number' ? metrics.port : 3001;
+      const metricsPort = await findAvailablePort(basePort + 1);
+      metrics.port = metricsPort;
+      // Dashboard port follows metrics port; allocate next available after it
+      const dashboardPort = await findAvailablePort(metricsPort + 1);
+      dashboard.port = dashboardPort;
+    }
+    host.metrics = metrics;
+    host.dashboard = dashboard;
+    runtimeConfig.host = host;
 
-  fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
-  fs.writeFileSync(runtimePath, JSON.stringify(runtimeConfig, null, 2));
-  log(`Wrote runtime config: ${runtimePath}`);
+    fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
+    fs.writeFileSync(runtimePath, JSON.stringify(runtimeConfig, null, 2));
+    log(`Wrote runtime config: ${runtimePath}`);
+  });
 
   if (process.env.DOTCLAW_TEST_MODE === '1') {
     log('Test mode enabled: skipping service install/start');
@@ -853,6 +969,130 @@ async function cmdRegister(): Promise<void> {
   }
 }
 
+async function cmdGroups(): Promise<void> {
+  if (!fs.existsSync(REGISTERED_GROUPS_PATH)) {
+    log('No groups registered yet. Run: dotclaw register');
+    return;
+  }
+
+  let groups: Record<string, { name: string; folder: string; added_at?: string }>;
+  try {
+    groups = JSON.parse(fs.readFileSync(REGISTERED_GROUPS_PATH, 'utf-8'));
+  } catch {
+    error('Failed to read registered groups file');
+    process.exit(1);
+  }
+
+  const entries = Object.entries(groups);
+  if (entries.length === 0) {
+    log('No groups registered yet. Run: dotclaw register');
+    return;
+  }
+
+  console.log(`Registered groups (${entries.length}):\n`);
+  for (const [chatId, group] of entries) {
+    console.log(`  ${group.name}`);
+    console.log(`    Chat ID: ${chatId}`);
+    console.log(`    Folder:  ${group.folder}`);
+    if (group.added_at) {
+      console.log(`    Added:   ${group.added_at}`);
+    }
+    console.log('');
+  }
+}
+
+async function cmdUnregister(identifier?: string): Promise<void> {
+  if (!fs.existsSync(REGISTERED_GROUPS_PATH)) {
+    log('No groups registered.');
+    return;
+  }
+
+  let groups: Record<string, { name: string; folder: string; added_at?: string }>;
+  try {
+    groups = JSON.parse(fs.readFileSync(REGISTERED_GROUPS_PATH, 'utf-8'));
+  } catch {
+    error('Failed to read registered groups file');
+    process.exit(1);
+  }
+
+  const entries = Object.entries(groups);
+  if (entries.length === 0) {
+    log('No groups registered.');
+    return;
+  }
+
+  let targetChatId: string | undefined;
+
+  if (identifier) {
+    // Match by chat ID, name, or folder
+    for (const [chatId, group] of entries) {
+      if (chatId === identifier || group.name === identifier || group.folder === identifier) {
+        targetChatId = chatId;
+        break;
+      }
+    }
+    if (!targetChatId) {
+      error(`No group found matching "${identifier}"`);
+      log('Registered groups:');
+      for (const [chatId, group] of entries) {
+        log(`  ${group.name} (${chatId}, folder: ${group.folder})`);
+      }
+      process.exit(1);
+    }
+  } else {
+    // Interactive: list groups and ask
+    console.log('Registered groups:\n');
+    for (let i = 0; i < entries.length; i++) {
+      const [chatId, group] = entries[i];
+      console.log(`  ${i + 1}. ${group.name} (${chatId}, folder: ${group.folder})`);
+    }
+    console.log('');
+
+    const choice = await prompt('Enter number, chat ID, name, or folder to unregister');
+    if (!choice) {
+      log('Cancelled.');
+      return;
+    }
+
+    // Try as a number (1-indexed selection)
+    const num = parseInt(choice, 10);
+    if (!isNaN(num) && num >= 1 && num <= entries.length) {
+      targetChatId = entries[num - 1][0];
+    } else {
+      // Try as chat ID, name, or folder
+      for (const [chatId, group] of entries) {
+        if (chatId === choice || group.name === choice || group.folder === choice) {
+          targetChatId = chatId;
+          break;
+        }
+      }
+    }
+
+    if (!targetChatId) {
+      error(`No group found matching "${choice}"`);
+      process.exit(1);
+    }
+  }
+
+  const group = groups[targetChatId];
+  const confirm = await prompt(`Remove "${group.name}" (${targetChatId})? (yes/no)`, 'no');
+  if (!confirm.toLowerCase().startsWith('y')) {
+    log('Cancelled.');
+    return;
+  }
+
+  delete groups[targetChatId];
+  fs.writeFileSync(REGISTERED_GROUPS_PATH, JSON.stringify(groups, null, 2) + '\n');
+  log(`Unregistered "${group.name}" (${targetChatId})`);
+
+  if (isServiceRunning()) {
+    const restart = await prompt('Restart service to apply changes? (yes/no)', 'yes');
+    if (restart.toLowerCase().startsWith('y')) {
+      await cmdRestart();
+    }
+  }
+}
+
 async function cmdStatus(): Promise<void> {
   console.log(`Platform: ${PLATFORM}`);
   console.log(`DOTCLAW_HOME: ${DOTCLAW_HOME}`);
@@ -896,21 +1136,25 @@ Usage: dotclaw <command> [options]
 Commands:
   setup              Run initial setup (init, configure, build, install service)
   configure          Re-run configuration (change API keys, model, etc.)
-  add-instance       Create and start a new isolated instance
-  instances          List discovered instances
   start              Start the service (or run in foreground with --foreground)
   stop               Stop the service
   restart            Restart the service
   logs               Show recent logs (use --follow to tail)
-  doctor             Run diagnostics
-  build              Build Docker container
-  register           Register a Telegram chat
   status             Show current status
+  doctor             Run diagnostics
+  register           Register a Telegram chat
+  unregister         Remove a registered Telegram chat
+  groups             List registered Telegram chats
+  build              Build Docker container
+  add-instance       Create and start a new isolated instance
+  instances          List discovered instances
   install-service    Install as system service
   uninstall-service  Remove system service
+  version            Show version
   help               Show this help message
 
 Options:
+  --version, -v      Show version
   --foreground, -f   Run in foreground (for 'start' command)
   --follow, -f       Follow log output (for 'logs' command)
   --id <id>          Run command against a specific instance
@@ -922,20 +1166,25 @@ Override with DOTCLAW_HOME environment variable.
 Examples:
   dotclaw setup              # First-time setup
   dotclaw configure          # Change configuration
-  dotclaw add-instance dev    # Create a new instance (~/.dotclaw-dev)
-  dotclaw instances           # List instance homes
-  dotclaw status --id dev     # Status for a specific instance
-  dotclaw restart --all       # Restart all instances
   dotclaw start              # Start as background service
   dotclaw start --foreground # Run in terminal
   dotclaw logs --follow      # Tail logs
   dotclaw doctor             # Check configuration
+  dotclaw groups             # List registered chats
+  dotclaw unregister main    # Remove a group by name/folder/chat ID
+  dotclaw add-instance dev   # Create a new instance (~/.dotclaw-dev)
+  dotclaw restart --all      # Restart all instances
 `);
 }
 
 async function main(): Promise<void> {
   const parsed = parseCliArgs(process.argv.slice(2));
   const command = parsed.command;
+
+  if (command === 'version' || command === '--version' || command === '-v') {
+    console.log(`dotclaw ${getVersion()}`);
+    return;
+  }
 
   try {
     if ((command === 'add-instance' || command === 'instances') && (parsed.flags.id || parsed.flags.all)) {
@@ -1033,6 +1282,12 @@ async function main(): Promise<void> {
       case 'register':
         await cmdRegister();
         break;
+      case 'unregister':
+        await cmdUnregister(parsed.args[0]);
+        break;
+      case 'groups':
+        await cmdGroups();
+        break;
       case 'status':
         await cmdStatus();
         break;
@@ -1041,6 +1296,9 @@ async function main(): Promise<void> {
         break;
       case 'uninstall-service':
         await cmdUninstallService();
+        break;
+      case 'version':
+        console.log(`dotclaw ${getVersion()}`);
         break;
       case 'help':
       case '--help':

@@ -139,3 +139,18 @@ export interface TokenEstimateConfig {
   tokens_per_message: number;
   tokens_per_request: number;
 }
+
+export interface QueuedMessage {
+  id: number;
+  chat_jid: string;
+  message_id: string;
+  sender_id: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_group: number;
+  chat_type: string;
+  message_thread_id: number | null;
+  status: string;
+  created_at: string;
+}

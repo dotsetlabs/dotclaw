@@ -8,12 +8,21 @@ import {
   BackgroundJob,
   BackgroundJobRunLog,
   BackgroundJobEvent,
-  BackgroundJobStatus
+  BackgroundJobStatus,
+  QueuedMessage
 } from './types.js';
 import { STORE_DIR } from './config.js';
+import { generateId } from './id.js';
 
 let db: Database.Database;
 let dbInitialized = false;
+
+export function closeDatabase(): void {
+  if (db && dbInitialized) {
+    db.close();
+    dbInitialized = false;
+  }
+}
 
 export function initDatabase(): void {
   if (dbInitialized) return;
@@ -172,32 +181,44 @@ export function initDatabase(): void {
       PRIMARY KEY (message_id, chat_jid)
     );
     CREATE INDEX IF NOT EXISTS idx_message_traces ON message_traces(trace_id);
+
+    CREATE TABLE IF NOT EXISTS message_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_jid TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      sender_name TEXT NOT NULL,
+      content TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      is_group INTEGER NOT NULL DEFAULT 0,
+      chat_type TEXT NOT NULL DEFAULT 'private',
+      message_thread_id INTEGER,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_mq_chat_status ON message_queue(chat_jid, status);
   `);
 
-  // Add sender_name column if it doesn't exist (migration for existing DBs)
-  try {
-    db.exec(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
-  } catch { /* column already exists */ }
+  // Add columns if they don't exist (migrations for existing DBs).
+  // Only suppress "duplicate column" errors; re-throw anything else.
+  const addColumnIfMissing = (sql: string) => {
+    try {
+      db.exec(sql);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('duplicate column')) throw err;
+    }
+  };
 
-  // Add context_mode column if it doesn't exist (migration for existing DBs)
-  try {
-    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`);
-  } catch { /* column already exists */ }
-
-  try {
-    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN state_json TEXT`);
-  } catch { /* column already exists */ }
-  try {
-    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
-  } catch { /* column already exists */ }
-  try {
-    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
-  } catch { /* column already exists */ }
-
-  // Add user_id column to tool_audit if it doesn't exist
-  try {
-    db.exec(`ALTER TABLE tool_audit ADD COLUMN user_id TEXT`);
-  } catch { /* column already exists */ }
+  addColumnIfMissing(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN state_json TEXT`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
+  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
+  addColumnIfMissing(`ALTER TABLE tool_audit ADD COLUMN user_id TEXT`);
 }
 
 /**
@@ -755,7 +776,7 @@ export function getTraceIdForMessage(messageId: string, chatJid: string): string
  */
 export function recordUserFeedback(feedback: Omit<UserFeedback, 'id' | 'created_at'>): string {
   if (!dbInitialized) initDatabase();
-  const id = `fb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = generateId('fb');
   const now = new Date().toISOString();
   db.prepare(`
     INSERT INTO user_feedback (id, trace_id, message_id, chat_jid, feedback_type, user_id, reason, created_at)
@@ -817,4 +838,117 @@ export function getRecentFeedback(params: {
     LIMIT ?
   `;
   return db.prepare(sql).all(...values, limit) as UserFeedback[];
+}
+
+// ── Message Queue Functions ──────────────────────────────────────────
+
+export function enqueueMessageItem(item: {
+  chat_jid: string;
+  message_id: string;
+  sender_id: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_group: boolean;
+  chat_type: string;
+  message_thread_id?: number;
+}): number {
+  const now = new Date().toISOString();
+  const info = db.prepare(`
+    INSERT INTO message_queue (chat_jid, message_id, sender_id, sender_name, content, timestamp, is_group, chat_type, message_thread_id, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+  `).run(
+    item.chat_jid,
+    item.message_id,
+    item.sender_id,
+    item.sender_name,
+    item.content,
+    item.timestamp,
+    item.is_group ? 1 : 0,
+    item.chat_type,
+    item.message_thread_id ?? null,
+    now
+  );
+  return Number(info.lastInsertRowid);
+}
+
+export function claimBatchForChat(chatJid: string, windowMs: number): QueuedMessage[] {
+  const select = db.prepare(`
+    SELECT * FROM message_queue
+    WHERE chat_jid = ? AND status = 'pending'
+    ORDER BY id ASC
+    LIMIT 1
+  `);
+  const selectWindow = db.prepare(`
+    SELECT * FROM message_queue
+    WHERE chat_jid = ? AND status = 'pending' AND created_at <= ?
+    ORDER BY id ASC
+  `);
+  const update = db.prepare(`
+    UPDATE message_queue
+    SET status = 'processing', started_at = ?
+    WHERE id = ?
+  `);
+
+  const txn = db.transaction(() => {
+    const oldest = select.get(chatJid) as QueuedMessage | undefined;
+    if (!oldest) return [];
+    const cutoff = new Date(new Date(oldest.created_at).getTime() + windowMs).toISOString();
+    const batch = selectWindow.all(chatJid, cutoff) as QueuedMessage[];
+    const now = new Date().toISOString();
+    for (const row of batch) {
+      update.run(now, row.id);
+    }
+    return batch;
+  });
+
+  return txn();
+}
+
+export function completeQueuedMessages(ids: number[]): void {
+  if (ids.length === 0) return;
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`UPDATE message_queue SET status = 'completed', completed_at = ? WHERE id = ?`);
+  const txn = db.transaction((idList: number[]) => {
+    for (const id of idList) {
+      stmt.run(now, id);
+    }
+  });
+  txn(ids);
+}
+
+export function failQueuedMessages(ids: number[], error: string): void {
+  if (ids.length === 0) return;
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`UPDATE message_queue SET status = 'failed', completed_at = ?, error = ? WHERE id = ?`);
+  const txn = db.transaction((idList: number[]) => {
+    for (const id of idList) {
+      stmt.run(now, error, id);
+    }
+  });
+  txn(ids);
+}
+
+export function getChatsWithPendingMessages(): string[] {
+  const rows = db.prepare(`
+    SELECT DISTINCT chat_jid FROM message_queue WHERE status = 'pending'
+  `).all() as Array<{ chat_jid: string }>;
+  return rows.map(r => r.chat_jid);
+}
+
+export function resetStalledMessages(): number {
+  const info = db.prepare(`
+    UPDATE message_queue SET status = 'pending', started_at = NULL
+    WHERE status = 'processing'
+  `).run();
+  return info.changes;
+}
+
+export function cleanupCompletedMessages(olderThanMs: number): number {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const info = db.prepare(`
+    DELETE FROM message_queue
+    WHERE status IN ('completed', 'failed') AND created_at < ?
+  `).run(cutoff);
+  return info.changes;
 }
