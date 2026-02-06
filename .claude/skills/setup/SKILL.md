@@ -5,7 +5,7 @@ description: Run initial DotClaw setup. Use when user wants to install dependenc
 
 # DotClaw Setup
 
-Run all commands automatically. Only pause when user action is required (creating Telegram bot).
+Run all commands automatically. Only pause when user action is required (creating Telegram bot, getting Discord bot token).
 
 ## 1. Install Dependencies
 
@@ -46,50 +46,32 @@ docker run --rm hello-world
 
 **Note:** DotClaw checks that Docker is running when it starts, but does not auto-start Docker. Make sure Docker Desktop is running (macOS) or the docker service is started (Linux).
 
-## 3. Configure Claude Authentication
+## 3. Configure API Keys
+
+### OpenRouter API Key (Required)
 
 Ask the user:
-> Do you want to use your **Claude subscription** (Pro/Max) or an **Anthropic API key**?
+> I need your OpenRouter API key. You can get one from https://openrouter.ai/keys
+>
+> Paste it here and I'll configure it.
 
-### Option 1: Claude Subscription (Recommended)
+Save it to `~/.dotclaw/.env`:
+
+```bash
+mkdir -p ~/.dotclaw
+echo "OPENROUTER_API_KEY=THEIR_KEY_HERE" > ~/.dotclaw/.env
+```
+
+### Brave Search API Key (Optional)
 
 Ask the user:
-> Want me to grab the OAuth token from your current Claude session?
+> Do you have a Brave Search API key? This enables web search capabilities for the agent.
+> You can get one from https://brave.com/search/api/ (optional, skip if you don't have one).
 
-If yes:
+If they provide one, append to `.env`:
+
 ```bash
-TOKEN=$(cat ~/.claude/.credentials.json 2>/dev/null | jq -r '.claudeAiOauth.accessToken // empty')
-if [ -n "$TOKEN" ]; then
-  echo "CLAUDE_CODE_OAUTH_TOKEN=$TOKEN" > .env
-  echo "Token configured: ${TOKEN:0:20}...${TOKEN: -4}"
-else
-  echo "No token found - are you logged in to Claude Code?"
-fi
-```
-
-If the token wasn't found, tell the user:
-> Run `claude` in another terminal and log in first, then come back here.
-
-### Option 2: API Key
-
-Ask if they have an existing key to copy or need to create one.
-
-**Copy existing:**
-```bash
-grep "^ANTHROPIC_API_KEY=" /path/to/source/.env > .env
-```
-
-**Create new:**
-```bash
-echo 'ANTHROPIC_API_KEY=' > .env
-```
-
-Tell the user to add their key from https://console.anthropic.com/
-
-**Verify:**
-```bash
-KEY=$(grep "^ANTHROPIC_API_KEY=" .env | cut -d= -f2)
-[ -n "$KEY" ] && echo "API key configured: ${KEY:0:10}...${KEY: -4}" || echo "Missing"
+echo "BRAVE_SEARCH_API_KEY=THEIR_KEY_HERE" >> ~/.dotclaw/.env
 ```
 
 ## 4. Build Container Image
@@ -100,7 +82,7 @@ Build the DotClaw agent container:
 ./container/build.sh
 ```
 
-This creates the `dotclaw-agent:latest` image with Node.js, Chromium, Claude Code CLI, and agent-browser.
+This creates the `dotclaw-agent:latest` image with Node.js, the agent runner, and browser automation tools.
 
 Verify the build succeeded:
 
@@ -129,24 +111,45 @@ Tell the user:
 When they provide the token, save it to `.env`:
 
 ```bash
-# Add to .env (append if file exists with other vars)
-echo 'TELEGRAM_BOT_TOKEN=YOUR_TOKEN_HERE' >> .env
+echo "TELEGRAM_BOT_TOKEN=YOUR_TOKEN_HERE" >> ~/.dotclaw/.env
 ```
 
 Verify the token:
 
 ```bash
-source .env
+source ~/.dotclaw/.env
 curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" | jq '.result.username'
 ```
 
 If it returns a username, the token is valid. If it returns an error, have the user check their token.
 
-## 6. Get Telegram Chat ID
+## 5b. Discord Bot Setup (Optional)
+
+Ask the user:
+> Do you also want to connect Discord? (optional)
+
+If yes, tell the user:
+> 1. Go to https://discord.com/developers/applications
+> 2. Click **New Application**, give it a name
+> 3. Go to **Bot** tab, click **Reset Token**, and copy the token
+> 4. Under **Privileged Gateway Intents**, enable **Message Content Intent**
+> 5. Go to **OAuth2 → URL Generator**, select `bot` scope with `Send Messages`, `Read Message History`, `Attach Files` permissions
+> 6. Open the generated URL to invite the bot to your server
+>
+> Paste the bot token here.
+
+Save Discord token:
+
+```bash
+echo "DISCORD_BOT_TOKEN=THEIR_TOKEN_HERE" >> ~/.dotclaw/.env
+```
+
+## 6. Get Chat ID and Register Main Channel
 
 Tell the user:
-> Now I need your Telegram chat ID so I can register you as the main channel.
+> Now I need your chat ID so I can register you as the main channel.
 >
+> **For Telegram:**
 > 1. Open Telegram and search for your bot (the username from BotFather)
 > 2. Start a chat with your bot and send any message (e.g., "hello")
 > 3. Let me know when you've done this.
@@ -154,37 +157,24 @@ Tell the user:
 After they confirm, get the chat ID:
 
 ```bash
-source .env
+source ~/.dotclaw/.env
 curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | jq '.result[-1].message.chat'
 ```
 
-Save the chat ID for step 8.
-
-## 7. Configure Assistant Name
-
-Ask the user:
-> What trigger word do you want to use? (default: `Rain`)
->
-> In Telegram groups, messages starting with `@TriggerWord` will be sent to Claude.
-> In your personal chat with the bot, all messages go to Claude.
-
-If they choose something other than `Rain`, update it in these places:
-1. `groups/CLAUDE.md` - Change "# Rain" and "You are Rain" to the new name
-2. `groups/main/CLAUDE.md` - Same changes at the top
-3. `data/registered_groups.json` - Use `@NewName` as the trigger when registering groups
-
-Store their choice - you'll use it when creating the registered_groups.json.
-
-## 8. Register Main Channel
-
-Create/update `data/registered_groups.json` using the chat ID from step 6 and the assistant name from step 7:
+Save the chat ID for registration. Use the `dotclaw register` CLI or the bootstrap command:
 
 ```bash
-mkdir -p data groups/main/logs
+npm run bootstrap
+```
 
-cat > data/registered_groups.json << EOF
+Or manually create `~/.dotclaw/data/registered_groups.json`:
+
+```bash
+mkdir -p ~/.dotclaw/data ~/.dotclaw/groups/main/logs
+
+cat > ~/.dotclaw/data/registered_groups.json << EOF
 {
-  "CHAT_ID_HERE": {
+  "telegram:CHAT_ID_HERE": {
     "name": "main",
     "folder": "main",
     "trigger": "@ASSISTANT_NAME",
@@ -196,16 +186,31 @@ EOF
 
 Replace `CHAT_ID_HERE` with the actual chat ID and `@ASSISTANT_NAME` with the trigger word.
 
-## 9. Configure External Directory Access (Mount Allowlist)
+**Note:** Chat IDs are provider-prefixed (e.g., `telegram:123456789` or `discord:987654321`).
+
+## 7. Configure Assistant Name
+
+Ask the user:
+> What trigger word do you want to use? (default: `Rain`)
+>
+> In group chats, messages starting with `@TriggerWord` will be sent to the agent.
+> In DMs with the bot, all messages go to the agent.
+
+If they choose something other than `Rain`, update it in:
+1. `~/.dotclaw/groups/global/CLAUDE.md` - Change the persona name
+2. `~/.dotclaw/groups/main/CLAUDE.md` - Same changes
+3. `~/.dotclaw/data/registered_groups.json` - Use `@NewName` as the trigger
+
+## 8. Configure External Directory Access (Mount Allowlist)
 
 Ask the user:
 > Do you want the agent to be able to access any directories **outside** the DotClaw project?
 >
-> Examples: Git repositories, project folders, documents you want Claude to work on.
+> Examples: Git repositories, project folders, documents you want the agent to work on.
 >
 > **Note:** This is optional. Without configuration, agents can only access their own group folders.
 
-If **no**, create an empty allowlist to make this explicit:
+If **no**, create an empty allowlist:
 
 ```bash
 mkdir -p ~/.config/dotclaw
@@ -216,96 +221,37 @@ cat > ~/.config/dotclaw/mount-allowlist.json << 'EOF'
   "nonMainReadOnly": true
 }
 EOF
-echo "Mount allowlist created - no external directories allowed"
 ```
 
-Skip to the next step.
+If **yes**, collect directory paths and create the allowlist accordingly.
 
-If **yes**, ask follow-up questions:
+## 9. Initialize Runtime Configuration
 
-### 9a. Collect Directory Paths
-
-Ask the user:
-> Which directories do you want to allow access to?
->
-> You can specify:
-> - A parent folder like `~/projects` (allows access to anything inside)
-> - Specific paths like `~/repos/my-app`
->
-> List them one per line, or give me a comma-separated list.
-
-For each directory they provide, ask:
-> Should `[directory]` be **read-write** (agents can modify files) or **read-only**?
->
-> Read-write is needed for: code changes, creating files, git commits
-> Read-only is safer for: reference docs, config examples, templates
-
-### 9b. Configure Non-Main Group Access
-
-Ask the user:
-> Should **non-main groups** (other Telegram chats you add later) be restricted to **read-only** access even if read-write is allowed for the directory?
->
-> Recommended: **Yes** - this prevents other groups from modifying files even if you grant them access to a directory.
-
-### 9c. Create the Allowlist
-
-Create the allowlist file based on their answers:
+Run the init script to create default config files:
 
 ```bash
-mkdir -p ~/.config/dotclaw
+npm run init
 ```
 
-Then write the JSON file. Example for a user who wants `~/projects` (read-write) and `~/docs` (read-only) with non-main read-only:
+Or use the full interactive bootstrap:
 
 ```bash
-cat > ~/.config/dotclaw/mount-allowlist.json << 'EOF'
-{
-  "allowedRoots": [
-    {
-      "path": "~/projects",
-      "allowReadWrite": true,
-      "description": "Development projects"
-    },
-    {
-      "path": "~/docs",
-      "allowReadWrite": false,
-      "description": "Reference documents"
-    }
-  ],
-  "blockedPatterns": [],
-  "nonMainReadOnly": true
-}
-EOF
+npm run bootstrap
 ```
 
-Verify the file:
+## 10. Build and Start
 
 ```bash
-cat ~/.config/dotclaw/mount-allowlist.json
+npm run build
 ```
 
-Tell the user:
-> Mount allowlist configured. The following directories are now accessible:
-> - `~/projects` (read-write)
-> - `~/docs` (read-only)
->
-> **Security notes:**
-> - Sensitive paths (`.ssh`, `.gnupg`, `.aws`, credentials) are always blocked
-> - This config file is stored outside the project, so agents cannot modify it
-> - Changes require restarting the DotClaw service
->
-> To grant a group access to a directory, add it to their config in `data/registered_groups.json`:
-> ```json
-> "containerConfig": {
->   "additionalMounts": [
->     { "hostPath": "~/projects/my-app", "containerPath": "my-app", "readonly": false }
->   ]
-> }
-> ```
+For macOS (launchd):
 
-## 10. Configure launchd Service
+```bash
+dotclaw setup  # Creates service plist and starts it
+```
 
-Generate the plist file with correct paths automatically:
+Or manually:
 
 ```bash
 NODE_PATH=$(which node)
@@ -338,23 +284,14 @@ cat > ~/Library/LaunchAgents/com.dotclaw.plist << EOF
         <string>${HOME_PATH}</string>
     </dict>
     <key>StandardOutPath</key>
-    <string>${PROJECT_PATH}/logs/dotclaw.log</string>
+    <string>${HOME_PATH}/.dotclaw/logs/dotclaw.log</string>
     <key>StandardErrorPath</key>
-    <string>${PROJECT_PATH}/logs/dotclaw.error.log</string>
+    <string>${HOME_PATH}/.dotclaw/logs/dotclaw.error.log</string>
 </dict>
 </plist>
 EOF
 
-echo "Created launchd plist with:"
-echo "  Node: ${NODE_PATH}"
-echo "  Project: ${PROJECT_PATH}"
-```
-
-Build and start the service:
-
-```bash
-npm run build
-mkdir -p logs
+mkdir -p ~/.dotclaw/logs
 launchctl load ~/Library/LaunchAgents/com.dotclaw.plist
 ```
 
@@ -365,39 +302,41 @@ launchctl list | grep dotclaw
 
 ## 11. Test
 
-Tell the user (using the assistant name they configured):
-> Send a message to your bot in Telegram.
+Tell the user:
+> Send a message to your bot in Telegram (or Discord if configured).
 
 Check the logs:
 ```bash
-tail -f logs/dotclaw.log
+dotclaw logs --follow
+# or: tail -f ~/.dotclaw/logs/dotclaw.log
 ```
 
 The user should receive a response from the bot.
 
 ## Troubleshooting
 
-**Service not starting**: Check `logs/dotclaw.error.log`
+**Service not starting**: Check `~/.dotclaw/logs/dotclaw.error.log`
 
 **Docker not running**:
 - macOS: Start Docker Desktop from Applications
 - Linux: `sudo systemctl start docker`
 - Verify: `docker info`
 
-**Container agent fails with "Claude Code process exited with code 1"**:
-- Check container logs: `cat groups/main/logs/container-*.log | tail -50`
-- Verify authentication: `cat .env` (should have CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)
+**Container agent fails**:
+- Check container logs: `ls -t ~/.dotclaw/groups/main/logs/container-*.log | head -1 | xargs cat | tail -50`
+- Verify API key: `grep OPENROUTER_API_KEY ~/.dotclaw/.env`
 
 **No response to messages**:
-- Verify the chat ID is in `data/registered_groups.json`
-- Check `logs/dotclaw.log` for errors
-- Verify bot token: `curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe"`
-
-**Bot token invalid ("Unauthorized")**:
-- Check TELEGRAM_BOT_TOKEN in .env
-- Get a new token from @BotFather if needed
+- Verify chat ID is in `~/.dotclaw/data/registered_groups.json` (with provider prefix)
+- Check `~/.dotclaw/logs/dotclaw.log` for errors
+- Verify bot token: `source ~/.dotclaw/.env && curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe"`
 
 **Unload service**:
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.dotclaw.plist
+```
+
+**Run diagnostics**:
+```bash
+dotclaw doctor
 ```

@@ -114,7 +114,7 @@ Example:
 
 DotClaw injects MCP tools prefixed with `mcp__dotclaw__...` in addition to standard coding tools.
 
-Telegram output tools:
+Messaging output tools:
 
 - `mcp__dotclaw__send_message`
 - `mcp__dotclaw__send_file`

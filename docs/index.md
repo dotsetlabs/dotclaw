@@ -4,11 +4,11 @@ title: DotClaw
 
 # DotClaw
 
-DotClaw is a personal OpenRouter-based assistant for Telegram. It runs each request inside an isolated Docker container and keeps long-term memory per chat group, with scheduling, tool policies, and observability baked in.
+DotClaw is a personal OpenRouter-based assistant for Telegram and Discord. It runs each request inside an isolated Docker container and keeps long-term memory per chat group, with scheduling, tool policies, and observability baked in.
 
 ## What you get
 
-- Telegram bot interface with per-group isolation
+- Multi-provider messaging (Telegram + Discord) with per-group isolation
 - Containerized agent runtime with strict mounts
 - Long-term memory, scheduled tasks, background jobs, and tool governance
 - Plugin tools and optional Autotune optimization

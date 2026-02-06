@@ -6,7 +6,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { GROUPS_DIR } from './config.js';
+import { GROUPS_DIR, CONTAINER_TIMEOUT } from './config.js';
 import { generateId } from './id.js';
 import { executeAgentRun } from './agent-execution.js';
 import { emitHook } from './hooks.js';
@@ -328,7 +328,7 @@ async function executeWorkflow(
           useGroupLock: true,
           modelOverride: step.model_override,
           toolAllow: step.tools,
-          timeoutMs: step.timeout_ms || 300_000,
+          timeoutMs: step.timeout_ms || CONTAINER_TIMEOUT,
           disableMemoryExtraction: true
         });
 

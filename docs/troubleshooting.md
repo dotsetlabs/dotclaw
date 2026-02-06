@@ -17,6 +17,7 @@ Check `~/.dotclaw/.env` for:
 
 Optional:
 
+- `DISCORD_BOT_TOKEN`
 - `BRAVE_SEARCH_API_KEY`
 
 ## Permission errors on ~/.dotclaw/

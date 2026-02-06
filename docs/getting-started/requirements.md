@@ -16,6 +16,7 @@ DotClaw is designed for macOS and Linux hosts with Docker installed.
 
 - Telegram bot token (create one via @BotFather)
 - OpenRouter API key
+- Discord bot token (optional, enables Discord provider)
 - Brave Search API key (optional, enables WebSearch)
 
 ## Permissions and disk

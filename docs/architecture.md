@@ -7,11 +7,12 @@ title: Architecture
 ## Data flow
 
 ```
-Telegram (Telegraf)
-  -> DotClaw host process
-  -> SQLite (messages.db)
+Messaging providers (Telegram / Discord)
+  -> Provider Registry
+  -> Message Pipeline (SQLite queue + batching)
   -> Docker container (agent runtime)
-  -> Response back to Telegram
+  -> IPC Dispatcher
+  -> Response back to originating provider
 
 Background jobs follow the same path but run asynchronously and report completion when finished.
 ```

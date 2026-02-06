@@ -6,7 +6,7 @@ title: Concepts
 
 ## Groups and chats
 
-DotClaw treats each Telegram chat as a group with its own context and files. Group registration is stored in `~/.dotclaw/data/registered_groups.json`, and each group gets a folder under `~/.dotclaw/groups/<group-folder>`.
+DotClaw treats each messaging chat (Telegram or Discord) as a group with its own context and files. Group registration is stored in `~/.dotclaw/data/registered_groups.json`, and each group gets a folder under `~/.dotclaw/groups/<group-folder>`. Chat IDs are provider-prefixed (e.g., `telegram:123456789` or `discord:987654321`).
 
 ## Memory
 
@@ -34,8 +34,8 @@ Container mode:
 
 Tools are governed by `~/.dotclaw/config/tool-policy.json`. You can allow or deny tools by default and override by group or user. Optional budgets in `~/.dotclaw/config/tool-budgets.json` limit daily tool usage.
 
-In addition to code tools, DotClaw exposes Telegram action tools (send/edit/delete messages, media, polls, buttons, etc.)
-that can be allowed or denied through the same policy file.
+In addition to code tools, DotClaw exposes messaging action tools (send/edit/delete messages, media, polls, buttons, etc.)
+that can be allowed or denied through the same policy file. These tools work across all connected providers (Telegram, Discord).
 
 ## Scheduler
 

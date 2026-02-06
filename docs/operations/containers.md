@@ -59,7 +59,7 @@ You can tune resource limits in `~/.dotclaw/config/runtime.json`:
 
 ## Workspace file exchange
 
-- Incoming Telegram media (photo/document/voice/video/audio) is downloaded to
+- Incoming media (photo/document/voice/video/audio) from any provider is downloaded to
   `~/.dotclaw/groups/<group>/inbox/` and exposed in-container as `/workspace/group/inbox/`.
 - The `mcp__dotclaw__download_url` tool saves files to `/workspace/group/downloads/` by default.
 - Maintenance cleanup prunes inbox files older than 14 days and enforces a 500MB per-group inbox budget.

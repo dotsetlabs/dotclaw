@@ -228,6 +228,42 @@ export function initDatabase(): void {
   addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT`);
   addColumnIfMissing(`ALTER TABLE message_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`);
   addColumnIfMissing(`ALTER TABLE messages ADD COLUMN attachments_json TEXT`);
+
+  // Chat JID prefix migration: add 'telegram:' prefix to all existing unprefixed IDs
+  migrateChatJidPrefixes();
+}
+
+function migrateChatJidPrefixes(): void {
+  // Create migration metadata table if needed
+  db.exec(`CREATE TABLE IF NOT EXISTS _migrations (key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`);
+
+  const row = db.prepare(`SELECT key FROM _migrations WHERE key = 'chat_jid_prefix_v1'`).get();
+  if (row) return; // Already migrated
+
+  // Check if there are any unprefixed chat IDs (IDs that don't contain ':')
+  const unprefixed = db.prepare(`SELECT COUNT(*) as cnt FROM chats WHERE jid NOT LIKE '%:%'`).get() as { cnt: number };
+  if (unprefixed.cnt === 0) {
+    // No unprefixed IDs — mark as done and skip
+    db.prepare(`INSERT INTO _migrations (key, applied_at) VALUES (?, ?)`).run('chat_jid_prefix_v1', new Date().toISOString());
+    return;
+  }
+
+  const migrate = db.transaction(() => {
+    // Prefix all tables with chat_jid / jid columns
+    db.exec(`UPDATE chats SET jid = 'telegram:' || jid WHERE jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE messages SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE chat_state SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE message_queue SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE scheduled_tasks SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE background_jobs SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE tool_audit SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid IS NOT NULL AND chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE user_feedback SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid IS NOT NULL AND chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE message_traces SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+
+    db.prepare(`INSERT INTO _migrations (key, applied_at) VALUES (?, ?)`).run('chat_jid_prefix_v1', new Date().toISOString());
+  });
+
+  migrate();
 }
 
 /**

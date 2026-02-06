@@ -215,7 +215,7 @@ export function recordAgentTelemetry(params: {
   traceBase: TraceBase;
   output: ContainerOutput | null;
   context: AgentContext;
-  metricsSource?: 'telegram' | 'scheduler';
+  metricsSource?: string;
   toolAuditSource: 'message' | 'background' | 'scheduler' | 'heartbeat';
   errorMessage?: string;
   errorType?: string;

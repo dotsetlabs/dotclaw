@@ -1,13 +1,13 @@
 ---
 name: add-gmail
-description: Add Gmail integration to DotClaw. Can be configured as a tool (agent reads/sends emails when triggered from WhatsApp) or as a full channel (emails can trigger the agent, schedule tasks, and receive replies). Guides through GCP OAuth setup and implements the integration.
+description: Add Gmail integration to DotClaw. Can be configured as a tool (agent reads/sends emails when triggered from Telegram) or as a full channel (emails can trigger the agent, schedule tasks, and receive replies). Guides through GCP OAuth setup and implements the integration.
 ---
 
 # Add Gmail Integration
 
 This skill adds Gmail capabilities to DotClaw. It can be configured in two modes:
 
-1. **Tool Mode** - Agent can read/send emails, but only when triggered from WhatsApp
+1. **Tool Mode** - Agent can read/send emails, but only when triggered from Telegram
 2. **Channel Mode** - Emails can trigger the agent, schedule tasks, and receive email replies
 
 ## Initial Questions
@@ -18,13 +18,13 @@ Ask the user:
 >
 > **Option 1: Tool Mode**
 > - Agent can read and send emails when you ask it to
-> - Triggered only from WhatsApp (e.g., "@Rain check my email" or "@Rain send an email to...")
+> - Triggered only from Telegram (e.g., "@Rain check my email" or "@Rain send an email to...")
 > - Simpler setup, no email polling
 >
 > **Option 2: Channel Mode**
 > - Everything in Tool Mode, plus:
 > - Emails to a specific address/label trigger the agent
-> - Agent replies via email (not WhatsApp)
+> - Agent replies via email (not Telegram)
 > - Can schedule tasks via email
 > - Requires email polling infrastructure
 
@@ -211,7 +211,7 @@ if (fs.existsSync(gmailDir)) {
 
 ### Step 3: Update Group Memory
 
-Append to `groups/CLAUDE.md` (the global memory file):
+Append to `~/.dotclaw/groups/global/CLAUDE.md` (the global memory file):
 
 ```markdown
 
@@ -227,7 +227,7 @@ You have access to Gmail via MCP tools:
 Example: "Check my unread emails from today" or "Send an email to john@example.com about the meeting"
 ```
 
-Also append the same section to `groups/main/CLAUDE.md`.
+Also append the same section to `~/.dotclaw/groups/main/CLAUDE.md`.
 
 ### Step 4: Rebuild and Restart
 
@@ -259,7 +259,7 @@ sleep 2 && launchctl list | grep dotclaw
 
 Tell the user:
 
-> Gmail integration is set up! Test it by sending this message in your WhatsApp main channel:
+> Gmail integration is set up! Test it by sending this message in your Telegram main channel:
 >
 > `@Rain check my recent emails`
 >
@@ -335,7 +335,7 @@ export interface EmailChannelConfig {
 }
 ```
 
-Read `src/config.ts` and add this configuration (customize values based on user's earlier answers):
+Read `src/runtime-config.ts` and add this configuration (customize values based on user's earlier answers):
 
 ```typescript
 export const EMAIL_CHANNEL: EmailChannelConfig = {
@@ -525,10 +525,10 @@ Respond to this email. Your response will be sent as an email reply.`;
   }
 }
 
-Then find the `connectWhatsApp` function and add `startEmailLoop()` call after `startMessageLoop()`:
+Then add `startEmailLoop()` call in the main startup sequence after providers are started:
 
 ```typescript
-// In the connection === 'open' block, after startMessageLoop():
+// After providers are started in the main init sequence:
 startEmailLoop();
 ```
 
@@ -715,7 +715,7 @@ To remove Gmail entirely:
 
 4. Delete `src/email-channel.ts` (if created)
 
-5. Remove Gmail sections from `groups/*/CLAUDE.md`
+5. Remove Gmail sections from `~/.dotclaw/groups/*/CLAUDE.md`
 
 6. Rebuild:
    ```bash

@@ -4,13 +4,18 @@ Personal OpenRouter-based assistant. See [README.md](README.md) for philosophy a
 
 ## Quick Context
 
-Single Node.js process that connects to Telegram, routes messages to an OpenRouter agent runtime running in Docker containers. Each group has isolated filesystem and memory.
+Single Node.js process that connects to messaging providers (Telegram + optional Discord), routes messages through a pipeline to an OpenRouter agent runtime running in Docker containers. Each group has isolated filesystem and memory.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Main app: Telegram connection, message routing, IPC |
+| `src/index.ts` | Main app: provider setup, admin commands, wake recovery |
+| `src/message-pipeline.ts` | Message queue, batching, agent invocation |
+| `src/ipc-dispatcher.ts` | Container IPC file watcher and dispatch |
+| `src/providers/registry.ts` | Provider registry (prefix routing) |
+| `src/providers/telegram/telegram-provider.ts` | Telegram provider |
+| `src/providers/discord/discord-provider.ts` | Discord provider |
 | `src/config.ts` | Paths, intervals, routing defaults |
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/agent-execution.ts` | Shared agent run logic (container invocation, telemetry) |
@@ -19,7 +24,7 @@ Single Node.js process that connects to Telegram, routes messages to an OpenRout
 | `src/db.ts` | SQLite operations |
 | `src/memory-store.ts` | Long-term memory storage (SQLite) |
 | `src/error-messages.ts` | User-friendly error mapping |
-| `src/telegram-format.ts` | Markdown-to-Telegram-HTML formatter |
+| `src/runtime-config.ts` | Runtime configuration type and loading |
 
 ## Skills
 

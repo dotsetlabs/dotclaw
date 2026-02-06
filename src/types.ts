@@ -29,7 +29,7 @@ export interface AllowedRoot {
 
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
-  timeout?: number;  // Default: 300000 (5 minutes)
+  timeout?: number;  // Falls back to container.timeoutMs (default: 900000 / 15 minutes)
   env?: Record<string, string>;
 }
 
@@ -47,8 +47,9 @@ export interface Session {
 
 export interface MessageAttachment {
   type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
-  file_id: string;
-  file_unique_id: string;
+  provider_file_ref?: string;   // Opaque file reference (Telegram file_id, Discord URL)
+  file_id?: string;             // Kept for backward compat with stored JSON
+  file_unique_id?: string;      // Kept for backward compat with stored JSON
   file_name?: string;
   mime_type?: string;
   file_size?: number;

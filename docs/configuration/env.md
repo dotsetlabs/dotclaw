@@ -17,6 +17,7 @@ The `.env` file must be placed at `~/.dotclaw/.env` (or `$DOTCLAW_HOME/.env` if 
 
 ## Optional
 
+- `DISCORD_BOT_TOKEN` (enables Discord provider)
 - `BRAVE_SEARCH_API_KEY` (enables WebSearch)
 - `TZ` (override host timezone; affects scheduler timing and agent timestamp interpretation)
 - `DOTCLAW_HOME` (override config/data directory, default: `~/.dotclaw`)
@@ -26,6 +27,7 @@ The `.env` file must be placed at `~/.dotclaw/.env` (or `$DOTCLAW_HOME/.env` if 
 ```bash
 TELEGRAM_BOT_TOKEN=123456789:replace-with-real-token
 OPENROUTER_API_KEY=sk-or-replace-with-real-key
+DISCORD_BOT_TOKEN=replace-with-discord-token
 BRAVE_SEARCH_API_KEY=replace-with-brave-key
 ```
 

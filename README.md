@@ -1,12 +1,12 @@
 # DotClaw
 
-Personal OpenRouter-based assistant for Telegram. Each request runs inside an isolated Docker container with long-term memory, scheduling, and tool governance.
+Personal OpenRouter-based assistant for Telegram and Discord. Each request runs inside an isolated Docker container with long-term memory, scheduling, and tool governance.
 
 ## Features
 
-- Telegram bot interface with per-group isolation
+- Multi-provider messaging (Telegram + Discord) with per-group isolation
 - Containerized agent runtime with strict mounts
-- Rich Telegram I/O tools (file/photo/voice/audio/location/contact/poll/buttons/edit/delete)
+- Rich I/O tools (file/photo/voice/audio/location/contact/poll/buttons/edit/delete)
 - Incoming media ingestion to workspace (`/workspace/group/inbox`) for agent processing
 - Long-term memory with embeddings and semantic search
 - Scheduled tasks (cron and one-off)
@@ -21,6 +21,7 @@ Personal OpenRouter-based assistant for Telegram. Each request runs inside an is
 - Docker (running)
 - Telegram bot token (from @BotFather)
 - OpenRouter API key
+- Discord bot token (optional — for Discord provider)
 
 ## Quick Start
 
@@ -53,9 +54,9 @@ dotclaw restart      # Restart the service
 dotclaw logs         # View logs (add --follow to tail)
 dotclaw status       # Show service status
 dotclaw doctor       # Run diagnostics
-dotclaw register     # Register a new Telegram chat
-dotclaw unregister   # Remove a registered Telegram chat
-dotclaw groups       # List registered Telegram chats
+dotclaw register     # Register a new chat (Telegram or Discord)
+dotclaw unregister   # Remove a registered chat
+dotclaw groups       # List registered chats
 dotclaw build        # Build the Docker container image
 dotclaw add-instance # Create and start an isolated instance
 dotclaw instances    # List discovered instances

@@ -122,10 +122,15 @@ export type RuntimeConfig = {
       };
     };
     telegram: {
+      enabled: boolean;
       handlerTimeoutMs: number;
       sendRetries: number;
       sendRetryDelayMs: number;
-      inputMessageMaxChars: number;
+    };
+    discord: {
+      enabled: boolean;
+      sendRetries: number;
+      sendRetryDelayMs: number;
     };
     progress: {
       enabled: boolean;
@@ -507,10 +512,15 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       }
     },
     telegram: {
+      enabled: true,
       handlerTimeoutMs: DEFAULT_TELEGRAM_HANDLER_TIMEOUT_MS,
       sendRetries: 3,
       sendRetryDelayMs: 1000,
-      inputMessageMaxChars: 4000
+    },
+    discord: {
+      enabled: false,
+      sendRetries: 3,
+      sendRetryDelayMs: 1000,
     },
     progress: {
       enabled: true,
@@ -520,8 +530,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       messages: []
     },
     heartbeat: {
-      enabled: true,
-      intervalMs: 900_000,
+      enabled: false,
+      intervalMs: 3_600_000,
       groupFolder: 'main'
     },
     backgroundJobs: {
@@ -556,7 +566,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         onToolLimit: true,
         classifier: {
           enabled: true,
-          model: 'openai/gpt-5-nano',
+          model: 'deepseek/deepseek-v3.2',
           timeoutMs: 3000,
           maxOutputTokens: 32,
           temperature: 0,
@@ -628,7 +638,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       },
       plannerProbe: {
         enabled: true,
-        model: 'openai/gpt-5-nano',
+        model: 'deepseek/deepseek-v3.2',
         timeoutMs: 3000,
         maxOutputTokens: 120,
         temperature: 0,
@@ -638,13 +648,13 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       },
       toolIntentProbe: {
         enabled: true,
-        model: 'openai/gpt-5-nano',
+        model: 'deepseek/deepseek-v3.2',
         timeoutMs: 2000,
         maxOutputTokens: 8,
       },
       profiles: {
         fast: {
-          model: 'openai/gpt-5-nano',
+          model: 'deepseek/deepseek-v3.2',
           maxOutputTokens: 4096,
           maxToolSteps: 12,
           recallMaxResults: 0,
@@ -661,7 +671,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
           }
         },
         standard: {
-          model: 'openai/gpt-5-mini',
+          model: 'moonshotai/kimi-k2.5',
           maxOutputTokens: 4096,
           maxToolSteps: 48,
           recallMaxResults: 6,
@@ -757,11 +767,11 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       extractScheduled: false
     },
     models: {
-      summary: 'openai/gpt-5-nano',
-      memory: 'openai/gpt-5-mini',
-      planner: 'openai/gpt-5-nano',
-      responseValidation: 'openai/gpt-5-nano',
-      toolSummary: 'openai/gpt-5-nano'
+      summary: 'deepseek/deepseek-v3.2',
+      memory: 'deepseek/deepseek-v3.2',
+      planner: 'deepseek/deepseek-v3.2',
+      responseValidation: 'deepseek/deepseek-v3.2',
+      toolSummary: 'deepseek/deepseek-v3.2'
     },
     planner: {
       enabled: true,
