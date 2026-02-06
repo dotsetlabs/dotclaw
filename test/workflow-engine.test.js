@@ -76,7 +76,7 @@ steps:
       - WebSearch
       - WebFetch
     timeout_ms: 60000
-    model_override: "openai/gpt-5-mini"
+    model_override: "deepseek/deepseek-v3.2"
   - name: summarize
     prompt: "Summarize results"
     condition: "steps.search.result == 'found'"
@@ -88,7 +88,7 @@ steps:
   assert.equal(result.steps.length, 2);
   assert.deepEqual(result.steps[0].tools, ['WebSearch', 'WebFetch']);
   assert.equal(result.steps[0].timeout_ms, 60000);
-  assert.equal(result.steps[0].model_override, 'openai/gpt-5-mini');
+  assert.equal(result.steps[0].model_override, 'deepseek/deepseek-v3.2');
   assert.equal(result.steps[1].condition, "steps.search.result == 'found'");
   assert.deepEqual(result.steps[1].depends_on, ['search']);
 });

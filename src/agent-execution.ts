@@ -97,6 +97,7 @@ export async function executeAgentRun(params: {
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
   disableMemoryExtraction?: boolean;
+  profile?: 'fast' | 'standard' | 'deep' | 'background';
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   maxToolSteps?: number;
   timeoutMs?: number;
@@ -168,6 +169,7 @@ export async function executeAgentRun(params: {
     disableResponseValidation: params.disableResponseValidation,
     responseValidationMaxRetries: params.responseValidationMaxRetries,
     disableMemoryExtraction: params.disableMemoryExtraction,
+    profile: params.profile,
     maxToolSteps: params.maxToolSteps,
     attachments: params.attachments
   }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });

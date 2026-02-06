@@ -46,6 +46,14 @@ function normalizeCommand(tokens: string[]): ParsedCommand | null {
   if (first === 'memory') {
     return { command: 'memory', args: [secondRaw, ...rest].filter(Boolean) as string[] };
   }
+  if (first === 'skill') {
+    const sub = second || '';
+    if (sub === 'install') return { command: 'skill-install', args: rest };
+    if (sub === 'remove' || sub === 'uninstall') return { command: 'skill-remove', args: rest };
+    if (sub === 'list' || sub === 'ls') return { command: 'skill-list', args: rest };
+    if (sub === 'update') return { command: 'skill-update', args: rest };
+    return { command: 'skill-help', args: [] };
+  }
   if (first === 'groups') {
     return { command: 'groups', args: [secondRaw, ...rest].filter(Boolean) as string[] };
   }

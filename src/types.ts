@@ -48,8 +48,6 @@ export interface Session {
 export interface MessageAttachment {
   type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
   provider_file_ref?: string;   // Opaque file reference (Telegram file_id, Discord URL)
-  file_id?: string;             // Kept for backward compat with stored JSON
-  file_unique_id?: string;      // Kept for backward compat with stored JSON
   file_name?: string;
   mime_type?: string;
   file_size?: number;

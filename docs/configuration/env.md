@@ -37,6 +37,7 @@ These are read by `npm run bootstrap` and `npm run configure` when running non-i
 
 - `DOTCLAW_BOOTSTRAP_NONINTERACTIVE=1`
 - `DOTCLAW_CONFIGURE_NONINTERACTIVE=1`
+- `DOTCLAW_BOOTSTRAP_PROVIDER` — `telegram` or `discord` (auto-detected if omitted)
 - `DOTCLAW_BOOTSTRAP_CHAT_ID`
 - `DOTCLAW_BOOTSTRAP_GROUP_NAME`
 - `DOTCLAW_BOOTSTRAP_GROUP_FOLDER`

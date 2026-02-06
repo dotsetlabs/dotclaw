@@ -166,8 +166,6 @@ function inferPlanStepIndex(stage: string, totalSteps: number): number | null {
 export function providerAttachmentToMessageAttachment(pa: ProviderAttachment): MessageAttachment {
   return {
     type: pa.type,
-    file_id: pa.providerFileRef,
-    file_unique_id: pa.providerFileRef,
     provider_file_ref: pa.providerFileRef,
     file_name: pa.fileName,
     mime_type: pa.mimeType,
@@ -544,6 +542,12 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       const computedTimeoutMs = estimatedMs
         ? Math.min(runtime.host.backgroundJobs.maxRuntimeMs, Math.max(5 * 60_000, Math.round(estimatedMs * 2)))
         : undefined;
+      // Always use the background profile's model for background jobs, not the
+      // original routing profile's model (which may be a fast/standard model and
+      // may not even be in the model allowlist).
+      const bgProfile = runtime.host.routing.profiles?.background;
+      const bgModel = overrides?.modelOverride ?? bgProfile?.model ?? routingDecision.modelOverride;
+      const bgMaxToolSteps = overrides?.maxToolSteps ?? bgProfile?.maxToolSteps ?? routingDecision.maxToolSteps;
       const result = spawnBackgroundJob({
         prompt,
         groupFolder: group.folder,
@@ -552,8 +556,8 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         tags,
         parentTraceId: traceBase.trace_id,
         parentMessageId: msg.messageId,
-        modelOverride: overrides?.modelOverride ?? routingDecision.modelOverride,
-        maxToolSteps: overrides?.maxToolSteps ?? routingDecision.maxToolSteps,
+        modelOverride: bgModel,
+        maxToolSteps: bgMaxToolSteps,
         toolAllow: routingDecision.toolAllow,
         toolDeny: routingDecision.toolDeny,
         timeoutMs: overrides?.timeoutMs ?? computedTimeoutMs
@@ -606,11 +610,6 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         const autoSpawned = await maybeAutoSpawn('planner', 'planner probe predicted multi-step work');
         if (autoSpawned) return true;
       }
-    }
-
-    if (routingDecision.shouldBackground) {
-      const autoSpawned = await maybeAutoSpawn('router', routingDecision.reason);
-      if (autoSpawned) return true;
     }
 
     let classifierMs: number | null = null;
@@ -745,6 +744,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         disableResponseValidation: !routingDecision.enableResponseValidation,
         responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
         disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
+        profile: routingDecision.profile as 'fast' | 'standard' | 'deep' | 'background',
         attachments: containerAttachments,
         abortSignal: abortController.signal,
         timeoutMs: AUTO_SPAWN_ENABLED && AUTO_SPAWN_FOREGROUND_TIMEOUT_MS > 0

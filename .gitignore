@@ -29,3 +29,5 @@ agents-sdk-docs
 # VitePress
 docs/.vitepress/dist/
 docs/.vitepress/cache/
+
+.claude/

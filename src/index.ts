@@ -60,6 +60,7 @@ import { transcribeVoice } from './transcription.js';
 import { emitHook } from './hooks.js';
 import { closeWorkflowStore } from './workflow-store.js';
 import { invalidatePersonalizationCache } from './personalization.js';
+import { installSkill, removeSkill, listSkills, updateSkill } from './skill-manager.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
 import { startDashboard, stopDashboard, setTelegramConnected, setLastMessageTime } from './dashboard.js';
@@ -370,6 +371,10 @@ async function handleAdminCommand(params: {
       '- `/dotclaw remove-group <chat_id|name|folder>` (main only)',
       '- `/dotclaw set-model <model> [global|group|user] [target_id]` (main only)',
       '- `/dotclaw remember <fact>` (main only)',
+      '- `/dotclaw skill install <url> [--global]` (main only)',
+      '- `/dotclaw skill remove <name> [--global]` (main only)',
+      '- `/dotclaw skill list [--global]` (main only)',
+      '- `/dotclaw skill update <name> [--global]` (main only)',
       '- `/dotclaw style <concise|balanced|detailed>`',
       '- `/dotclaw tools <conservative|balanced|proactive>`',
       '- `/dotclaw caution <low|balanced|high>`',
@@ -571,6 +576,91 @@ async function handleAdminCommand(params: {
     return true;
   }
 
+  if (command === 'skill-help') {
+    await reply([
+      'Skill commands:',
+      '- `/dotclaw skill install <url> [--global]` — install from git repo or URL',
+      '- `/dotclaw skill remove <name> [--global]` — remove a skill',
+      '- `/dotclaw skill list [--global]` — list installed skills',
+      '- `/dotclaw skill update <name> [--global]` — re-pull from source'
+    ].join('\n'));
+    return true;
+  }
+
+  if (command === 'skill-install') {
+    if (requireMain('Installing skills')) return true;
+    const isGlobal = args.includes('--global');
+    const source = args.filter(a => a !== '--global')[0];
+    if (!source) {
+      await reply('Usage: /dotclaw skill install <url> [--global]');
+      return true;
+    }
+    const scope = isGlobal ? 'global' as const : 'group' as const;
+    const targetDir = path.join(GROUPS_DIR, isGlobal ? 'global' : 'main', 'skills');
+    await reply(`Installing skill from ${source}...`);
+    const result = await installSkill({ source, targetDir, scope });
+    if (!result.ok) {
+      await reply(`Failed to install skill: ${result.error}`);
+    } else {
+      await reply(`Skill "${result.name}" installed (${scope}). Available on next agent run.`);
+    }
+    return true;
+  }
+
+  if (command === 'skill-remove') {
+    if (requireMain('Removing skills')) return true;
+    const isGlobal = args.includes('--global');
+    const name = args.filter(a => a !== '--global')[0];
+    if (!name) {
+      await reply('Usage: /dotclaw skill remove <name> [--global]');
+      return true;
+    }
+    const targetDir = path.join(GROUPS_DIR, isGlobal ? 'global' : 'main', 'skills');
+    const result = removeSkill({ name, targetDir });
+    if (!result.ok) {
+      await reply(`Failed to remove skill: ${result.error}`);
+    } else {
+      await reply(`Skill "${name}" removed.`);
+    }
+    return true;
+  }
+
+  if (command === 'skill-list') {
+    if (requireMain('Listing skills')) return true;
+    const isGlobal = args.includes('--global');
+    const scope = isGlobal ? 'global' as const : 'group' as const;
+    const targetDir = path.join(GROUPS_DIR, isGlobal ? 'global' : 'main', 'skills');
+    const skills = listSkills(targetDir, scope);
+    if (skills.length === 0) {
+      await reply(`No skills installed (${scope}).`);
+    } else {
+      const lines = skills.map(s =>
+        `- ${s.name} (v${s.version}, source: ${s.source === 'local' ? 'local' : 'remote'})`
+      );
+      await reply(`Installed skills (${scope}):\n${lines.join('\n')}`);
+    }
+    return true;
+  }
+
+  if (command === 'skill-update') {
+    if (requireMain('Updating skills')) return true;
+    const isGlobal = args.includes('--global');
+    const name = args.filter(a => a !== '--global')[0];
+    if (!name) {
+      await reply('Usage: /dotclaw skill update <name> [--global]');
+      return true;
+    }
+    const scope = isGlobal ? 'global' as const : 'group' as const;
+    const targetDir = path.join(GROUPS_DIR, isGlobal ? 'global' : 'main', 'skills');
+    const result = await updateSkill({ name, targetDir, scope });
+    if (!result.ok) {
+      await reply(`Failed to update skill: ${result.error}`);
+    } else {
+      await reply(`Skill "${name}" updated.`);
+    }
+    return true;
+  }
+
   await reply('Unknown command. Use `/dotclaw help` for options.');
   return true;
 }
@@ -635,7 +725,8 @@ async function runHeartbeatOnce(): Promise<void> {
       disablePlanner: !routingDecision.enablePlanner,
       disableResponseValidation: !routingDecision.enableResponseValidation,
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
-      disableMemoryExtraction: !routingDecision.enableMemoryExtraction
+      disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
+      profile: routingDecision.profile
     });
     output = execution.output;
     context = execution.context;
@@ -1048,9 +1139,15 @@ async function main(): Promise<void> {
   // ──── Provider Registry ────
   providerRegistry = new ProviderRegistry();
 
-  // Register Telegram provider
-  const telegramProvider = createTelegramProvider(runtime, GROUPS_DIR);
-  providerRegistry.register(telegramProvider);
+  // Register Telegram provider (optional — only when enabled + token present)
+  let telegramProvider: ReturnType<typeof createTelegramProvider> | null = null;
+  if (runtime.host.telegram.enabled && process.env.TELEGRAM_BOT_TOKEN) {
+    telegramProvider = createTelegramProvider(runtime, GROUPS_DIR);
+    providerRegistry.register(telegramProvider);
+    logger.info('Telegram provider registered');
+  } else if (runtime.host.telegram.enabled && !process.env.TELEGRAM_BOT_TOKEN) {
+    logger.warn('Telegram is enabled in config but TELEGRAM_BOT_TOKEN is not set — skipping');
+  }
 
   // Register Discord provider (optional — only when enabled + token present)
   let discordProvider: MessagingProvider | null = null;
@@ -1104,17 +1201,19 @@ async function main(): Promise<void> {
   const handlers = createProviderHandlers(providerRegistry, messagePipeline);
 
   try {
-    if (runtime.host.telegram.enabled) {
+    if (telegramProvider) {
       await telegramProvider.start(handlers);
       setTelegramConnected(true);
       logger.info('Telegram bot started');
-    } else {
-      logger.info('Telegram provider disabled in config');
     }
 
     if (discordProvider) {
       await discordProvider.start(handlers);
       logger.info('Discord bot started');
+    }
+
+    if (!telegramProvider && !discordProvider) {
+      throw new Error('No messaging providers configured. Set TELEGRAM_BOT_TOKEN and/or DISCORD_BOT_TOKEN.');
     }
 
     // Graceful shutdown

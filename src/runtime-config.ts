@@ -188,13 +188,8 @@ export type RuntimeConfig = {
       enabled: boolean;
       maxFastChars: number;
       maxStandardChars: number;
-      backgroundMinChars: number;
-      fastKeywords: string[];
-      deepKeywords: string[];
-      backgroundKeywords: string[];
       classifierFallback: {
         enabled: boolean;
-        minChars: number;
       };
       plannerProbe: {
         enabled: boolean;
@@ -374,6 +369,12 @@ export type RuntimeConfig = {
         env?: Record<string, string>;
       }>;
       connectionTimeoutMs: number;
+    };
+    skills: {
+      enabled: boolean;
+      maxSkills: number;
+      maxSummaryChars: number;
+      installEnabled: boolean;
     };
   };
   hooks: {
@@ -585,56 +586,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       enabled: true,
       maxFastChars: 200,
       maxStandardChars: 1200,
-      backgroundMinChars: 2000,
-      fastKeywords: [
-        'hi',
-        'hello',
-        'hey',
-        'who are you',
-        'what can you do',
-        'help',
-        'thanks',
-        'thank you'
-      ],
-      deepKeywords: [
-        'research',
-        'analysis',
-        'analyze',
-        'report',
-        'dashboard',
-        'vibe',
-        'refactor',
-        'architecture',
-        'design',
-        'spec',
-        'strategy',
-        'migration',
-        'benchmark',
-        'investigate',
-        'evaluate',
-        'summarize',
-        'long-running'
-      ],
-      backgroundKeywords: [
-        'background',
-        'long-running',
-        'research',
-        'deep dive',
-        'multi-step',
-        'multi step',
-        'dashboard',
-        'refactor',
-        'benchmark',
-        'report',
-        'analysis',
-        'survey',
-        'crawl',
-        'scrape',
-        'codebase'
-      ],
       classifierFallback: {
         enabled: true,
-        minChars: 600
       },
       plannerProbe: {
         enabled: true,
@@ -854,6 +807,12 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       enabled: false,
       servers: [],
       connectionTimeoutMs: 10_000
+    },
+    skills: {
+      enabled: true,
+      maxSkills: 32,
+      maxSummaryChars: 4000,
+      installEnabled: true,
     }
   },
   hooks: {

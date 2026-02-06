@@ -266,6 +266,7 @@ ${task.prompt}` : task.prompt;
       disableResponseValidation: !routingDecision.enableResponseValidation,
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
       disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
+      profile: routingDecision.profile,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
       timezone: taskTimezone
@@ -463,6 +464,7 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       disableResponseValidation: !routingDecision.enableResponseValidation,
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
       disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
+      profile: routingDecision.profile,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
       timezone: task.timezone || TIMEZONE

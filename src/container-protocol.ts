@@ -46,6 +46,7 @@ export interface ContainerInput {
   disableResponseValidation?: boolean;
   responseValidationMaxRetries?: number;
   disableMemoryExtraction?: boolean;
+  profile?: 'fast' | 'standard' | 'deep' | 'background';
   attachments?: Array<{
     type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
     path: string;

@@ -136,6 +136,11 @@ export type AgentRuntimeConfig = {
       }>;
       connectionTimeoutMs: number;
     };
+    skills: {
+      enabled: boolean;
+      maxSkills: number;
+      maxSummaryChars: number;
+    };
   };
 };
 
@@ -268,6 +273,11 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     enabled: false,
     servers: [],
     connectionTimeoutMs: 10_000
+  },
+  skills: {
+    enabled: true,
+    maxSkills: 32,
+    maxSummaryChars: 4000,
   }
 };
 

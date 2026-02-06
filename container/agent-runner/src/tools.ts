@@ -7,6 +7,7 @@ import { tool as sdkTool, type Tool } from '@openrouter/sdk';
 import { z } from 'zod';
 import { createIpcHandlers, IpcContext } from './ipc.js';
 import type { AgentRuntimeConfig } from './agent-config.js';
+import { collectSkillPluginDirs } from './skill-loader.js';
 
 type ToolConfig = {
   name: string;
@@ -66,9 +67,14 @@ function buildToolRuntime(config: AgentRuntimeConfig['agent']): ToolRuntime {
   const webfetchBlocklist = (config.tools.webfetch.blocklist || [])
     .map(normalizeDomain)
     .filter(Boolean);
+  const skillPluginDirs = collectSkillPluginDirs({
+    groupDir: WORKSPACE_GROUP,
+    globalDir: WORKSPACE_GLOBAL
+  });
   const pluginDirs = Array.from(new Set([
     ...config.tools.plugin.dirs,
-    ...DEFAULT_PLUGIN_DIRS
+    ...DEFAULT_PLUGIN_DIRS,
+    ...skillPluginDirs
   ]));
   const toolSummaryTools = (config.tools.toolSummary.tools || [])
     .map(toolName => toolName.trim().toLowerCase())
@@ -1542,17 +1548,17 @@ export function createTools(
     return null;
   }).filter(Boolean) as Tool[];
 
-  const requiredTelegramText = z.string().trim().min(1);
-  const requiredTelegramSingleMessageText = z.string().trim().min(1).max(4096);
-  const optionalTelegramCaption = z.string().trim().min(1).max(1024).optional();
+  const requiredMessageText = z.string().trim().min(1);
+  const requiredSingleMessageText = z.string().trim().min(1).max(4096);
+  const optionalCaption = z.string().trim().min(1).max(1024).optional();
   const requiredWorkspacePath = z.string().trim().min(1);
   const optionalNameField = z.string().trim().min(1).max(128).optional();
 
   const sendMessageTool = tool({
     name: 'mcp__dotclaw__send_message',
-    description: 'Send a message to the current Telegram chat.',
+    description: 'Send a message to the current chat.',
     inputSchema: z.object({
-      text: requiredTelegramText.describe('The message text to send'),
+      text: requiredMessageText.describe('The message text to send'),
       reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
     }),
     outputSchema: z.object({
@@ -1565,10 +1571,10 @@ export function createTools(
 
   const sendFileTool = tool({
     name: 'mcp__dotclaw__send_file',
-    description: 'Send a file/document to the current Telegram chat. The file must exist under /workspace/group.',
+    description: 'Send a file/document to the current chat. The file must exist under /workspace/group.',
     inputSchema: z.object({
       path: requiredWorkspacePath.describe('File path (relative to /workspace/group or absolute under /workspace/group)'),
-      caption: optionalTelegramCaption.describe('Optional caption text'),
+      caption: optionalCaption.describe('Optional caption text'),
       reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
     }),
     outputSchema: z.object({
@@ -1584,10 +1590,10 @@ export function createTools(
 
   const sendPhotoTool = tool({
     name: 'mcp__dotclaw__send_photo',
-    description: 'Send a photo/image to the current Telegram chat with compression. The file must exist under /workspace/group.',
+    description: 'Send a photo/image to the current chat with compression. The file must exist under /workspace/group.',
     inputSchema: z.object({
       path: requiredWorkspacePath.describe('Image file path (relative to /workspace/group or absolute under /workspace/group)'),
-      caption: optionalTelegramCaption.describe('Optional caption text'),
+      caption: optionalCaption.describe('Optional caption text'),
       reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
     }),
     outputSchema: z.object({
@@ -1603,10 +1609,10 @@ export function createTools(
 
   const sendVoiceTool = tool({
     name: 'mcp__dotclaw__send_voice',
-    description: 'Send a voice message to the current Telegram chat. File must be .ogg format with Opus codec.',
+    description: 'Send a voice message to the current chat. File must be .ogg format with Opus codec.',
     inputSchema: z.object({
       path: requiredWorkspacePath.describe('Voice file path (relative to /workspace/group or absolute under /workspace/group)'),
-      caption: optionalTelegramCaption.describe('Optional caption text'),
+      caption: optionalCaption.describe('Optional caption text'),
       duration: z.number().int().positive().optional().describe('Duration in seconds'),
       reply_to_message_id: z.number().int().positive().optional().describe('Message ID to reply to')
     }),
@@ -1653,10 +1659,10 @@ export function createTools(
 
   const sendAudioTool = tool({
     name: 'mcp__dotclaw__send_audio',
-    description: 'Send an audio file to the current Telegram chat (mp3, m4a, etc.).',
+    description: 'Send an audio file to the current chat (mp3, m4a, etc.).',
     inputSchema: z.object({
       path: requiredWorkspacePath.describe('Audio file path (relative to /workspace/group or absolute under /workspace/group)'),
-      caption: optionalTelegramCaption.describe('Optional caption text'),
+      caption: optionalCaption.describe('Optional caption text'),
       duration: z.number().int().positive().optional().describe('Duration in seconds'),
       performer: optionalNameField.describe('Audio performer/artist'),
       title: optionalNameField.describe('Audio title'),
@@ -1674,7 +1680,7 @@ export function createTools(
 
   const sendLocationTool = tool({
     name: 'mcp__dotclaw__send_location',
-    description: 'Send a location pin to the current Telegram chat.',
+    description: 'Send a location pin to the current chat.',
     inputSchema: z.object({
       latitude: z.number().min(-90).max(90).describe('Latitude'),
       longitude: z.number().min(-180).max(180).describe('Longitude'),
@@ -1690,7 +1696,7 @@ export function createTools(
 
   const sendContactTool = tool({
     name: 'mcp__dotclaw__send_contact',
-    description: 'Send a contact card to the current Telegram chat.',
+    description: 'Send a contact card to the current chat.',
     inputSchema: z.object({
       phone_number: z.string().trim().min(1).max(64).describe('Phone number with country code'),
       first_name: z.string().trim().min(1).max(64).describe('First name'),
@@ -1707,7 +1713,7 @@ export function createTools(
 
   const sendPollTool = tool({
     name: 'mcp__dotclaw__send_poll',
-    description: 'Create a Telegram poll in the current chat.',
+    description: 'Create a poll in the current chat.',
     inputSchema: z.object({
       question: z.string().trim().min(1).max(300).describe('Poll question'),
       options: z.array(z.string().trim().min(1).max(100)).min(2).max(10).describe('Poll options (2-10)'),
@@ -1766,7 +1772,7 @@ export function createTools(
     name: 'mcp__dotclaw__send_buttons',
     description: 'Send a message with inline keyboard buttons. Each button can be a URL link or a callback button.',
     inputSchema: z.object({
-      text: requiredTelegramSingleMessageText.describe('Message text above the buttons'),
+      text: requiredSingleMessageText.describe('Message text above the buttons'),
       buttons: z.array(z.array(z.object({
         text: z.string().trim().min(1).max(64).describe('Button label'),
         url: z.string().trim().min(1).optional().describe('URL to open (for link buttons)'),
@@ -1816,7 +1822,7 @@ export function createTools(
     description: 'Edit a previously sent message by message ID.',
     inputSchema: z.object({
       message_id: z.number().int().positive().describe('The message ID to edit'),
-      text: requiredTelegramSingleMessageText.describe('New message text'),
+      text: requiredSingleMessageText.describe('New message text'),
       chat_jid: z.string().optional().describe('Target chat ID (defaults to current chat)')
     }),
     outputSchema: z.object({
@@ -2214,7 +2220,7 @@ export function createTools(
 
   const registerGroupTool = tool({
     name: 'mcp__dotclaw__register_group',
-    description: 'Register a new Telegram chat (main group only).',
+    description: 'Register a new chat/channel (main group only).',
     inputSchema: z.object({
       jid: z.string(),
       name: z.string(),
@@ -2231,7 +2237,7 @@ export function createTools(
 
   const removeGroupTool = tool({
     name: 'mcp__dotclaw__remove_group',
-    description: 'Remove a registered Telegram chat by chat id, name, or folder (main group only).',
+    description: 'Remove a registered chat/channel by chat id, name, or folder (main group only).',
     inputSchema: z.object({
       identifier: z.string().describe('Chat id, group name, or folder')
     }),

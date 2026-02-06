@@ -76,5 +76,5 @@ Override the port in `~/.dotclaw/config/runtime.json` with `host.metrics.port`.
 Run the doctor script to check common issues:
 
 ```bash
-npm run doctor
+dotclaw doctor
 ```

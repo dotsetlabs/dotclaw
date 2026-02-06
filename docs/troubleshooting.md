@@ -61,7 +61,7 @@ Then restart DotClaw.
 Run the doctor script to inspect common issues:
 
 ```bash
-npm run doctor
+dotclaw doctor
 ```
 
 ## Scheduler issues

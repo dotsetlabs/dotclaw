@@ -310,6 +310,7 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
         disableResponseValidation,
         responseValidationMaxRetries,
         disableMemoryExtraction,
+        profile: 'background',
         timeoutMs
       });
       output = execution.output;

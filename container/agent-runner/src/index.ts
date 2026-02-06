@@ -27,6 +27,7 @@ import {
   Message
 } from './memory.js';
 import { loadPromptPackWithCanary, formatPromptPack, PromptPack } from './prompt-packs.js';
+import { buildSkillCatalog, formatSkillCatalog, type SkillCatalog } from './skill-loader.js';
 
 type OpenRouterResult = ReturnType<OpenRouter['callModel']>;
 
@@ -40,9 +41,6 @@ const AVAILABLE_GROUPS_PATH = '/workspace/ipc/available_groups.json';
 const GROUP_CLAUDE_PATH = path.join(GROUP_DIR, 'CLAUDE.md');
 const GLOBAL_CLAUDE_PATH = path.join(GLOBAL_DIR, 'CLAUDE.md');
 const CLAUDE_NOTES_MAX_CHARS = 4000;
-const SKILL_NOTES_MAX_FILES = 16;
-const SKILL_NOTES_MAX_CHARS = 3000;
-const SKILL_NOTES_TOTAL_MAX_CHARS = 18_000;
 
 const agentConfig = loadAgentConfig();
 const agent = agentConfig.agent;
@@ -74,166 +72,16 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-// ── Response extraction pipeline ─────────────────────────────────────
-// OpenRouter SDK v0.3.x returns raw response IDs (gen-*, resp-*, etc.) instead
-// of text for fast reasoning models (GPT-5-mini/nano). Reasoning tokens consume
-// the output budget, leaving nothing for actual text. This multi-layer pipeline
-// works around that:
-//   1. isLikelyResponseId — detect leaked IDs so we never surface them
-//   2. extractTextFromRawResponse — walk raw response fields ourselves
-//   3. getTextWithFallback — try SDK getText(), fall back to raw extraction
-//   4. chatCompletionsFallback — retry via /chat/completions when all else fails
-// Remove this pipeline once the SDK reliably returns text for reasoning models.
+// ── Response text extraction ─────────────────────────────────────────
 
-const RESPONSE_ID_PREFIXES = ['gen-', 'resp-', 'resp_', 'chatcmpl-', 'msg_'];
-
-function isLikelyResponseId(value: string): boolean {
-  const trimmed = value.trim();
-  if (!trimmed || trimmed.includes(' ') || trimmed.includes('\n')) return false;
-  return RESPONSE_ID_PREFIXES.some(prefix => trimmed.startsWith(prefix));
-}
-
-function isValidText(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0 && !isLikelyResponseId(value);
-}
-
-function extractTextFromRawResponse(response: unknown): string {
-  if (!response || typeof response !== 'object') return '';
-  const record = response as Record<string, unknown>;
-
-  // 1. SDK-parsed camelCase field
-  if (isValidText(record.outputText)) return record.outputText;
-
-  // 2. Raw API snake_case field
-  if (isValidText(record.output_text)) return record.output_text;
-
-  // 3. Walk response.output[] for message/output_text items
-  if (Array.isArray(record.output)) {
-    const parts: string[] = [];
-    for (const item of record.output) {
-      if (!item || typeof item !== 'object') continue;
-      const typed = item as { type?: string; content?: unknown; text?: string };
-      if (typed.type === 'message' && Array.isArray(typed.content)) {
-        for (const part of typed.content as Array<{ type?: string; text?: string }>) {
-          if (part?.type === 'output_text' && isValidText(part.text)) {
-            parts.push(part.text);
-          }
-        }
-      } else if (typed.type === 'output_text' && isValidText(typed.text)) {
-        parts.push(typed.text);
-      }
-    }
-    const joined = parts.join('');
-    if (joined.trim()) return joined;
-  }
-
-  // 4. OpenAI chat completions compat
-  if (Array.isArray(record.choices) && record.choices.length > 0) {
-    const choice = record.choices[0] as { message?: { content?: unknown } } | null | undefined;
-    if (choice?.message && isValidText(choice.message.content)) {
-      return choice.message.content;
-    }
-  }
-
-  return '';
-}
-
-async function getTextWithFallback(result: OpenRouterResult, context: string): Promise<string> {
-  // 1. Try the SDK's proper getText() first — this handles tool execution and
-  //    extracts text from the final response via the SDK's own logic.
+async function getResponseText(result: OpenRouterResult, context: string): Promise<string> {
   try {
     const text = await result.getText();
-    if (isValidText(text)) {
+    if (typeof text === 'string' && text.trim()) {
       return text;
-    }
-    if (text && isLikelyResponseId(text)) {
-      log(`Ignored response id from getText (${context}): ${String(text).slice(0, 60)}`);
     }
   } catch (err) {
     log(`getText failed (${context}): ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  // 2. Fall back to raw response extraction — walk known fields ourselves
-  try {
-    const response = await result.getResponse();
-    const fallbackText = extractTextFromRawResponse(response);
-    if (fallbackText) {
-      log(`Recovered text from raw response (${context})`);
-      return fallbackText;
-    }
-    const r = response as Record<string, unknown>;
-    const outputLen = Array.isArray(r.output) ? (r.output as unknown[]).length : 0;
-    log(`No text in raw response (${context}): id=${String(r.id ?? 'none').slice(0, 40)} status=${String(r.status ?? '?')} outputs=${outputLen}`);
-  } catch (err) {
-    log(`Raw response extraction failed (${context}): ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  // 3. Never return a response ID
-  return '';
-}
-
-/**
- * Direct Chat Completions API fallback.
- * When the Responses API returns a gen-ID instead of text (common with fast
- * models like gpt-5-nano/mini via OpenRouter), retry using the standard
- * /chat/completions endpoint which reliably returns text content.
- */
-async function chatCompletionsFallback(params: {
-  model: string;
-  instructions: string;
-  messages: Array<{ role: string; content: string }>;
-  maxOutputTokens: number;
-  temperature: number;
-}): Promise<string> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) return '';
-
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json'
-  };
-  if (agent.openrouter.siteUrl) {
-    headers['HTTP-Referer'] = agent.openrouter.siteUrl;
-  }
-  if (agent.openrouter.siteName) {
-    headers['X-Title'] = agent.openrouter.siteName;
-  }
-
-  const chatMessages = [
-    { role: 'system', content: params.instructions },
-    ...params.messages
-  ];
-
-  log(`Chat Completions fallback: model=${params.model}, messages=${chatMessages.length}`);
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: params.model,
-      messages: chatMessages,
-      max_completion_tokens: params.maxOutputTokens,
-      temperature: params.temperature,
-      reasoning_effort: 'low'
-    }),
-    signal: AbortSignal.timeout(agent.openrouter.timeoutMs)
-  });
-
-  const bodyText = await response.text();
-  if (!response.ok) {
-    log(`Chat Completions fallback HTTP ${response.status}: ${bodyText.slice(0, 300)}`);
-    return '';
-  }
-
-  try {
-    const data = JSON.parse(bodyText);
-    const content = data?.choices?.[0]?.message?.content;
-    if (isValidText(content)) {
-      log(`Chat Completions fallback recovered text (${String(content).length} chars)`);
-      return content;
-    }
-    log(`Chat Completions fallback returned no text: ${JSON.stringify(data).slice(0, 300)}`);
-  } catch (err) {
-    log(`Chat Completions fallback parse error: ${err instanceof Error ? err.message : String(err)}`);
   }
   return '';
 }
@@ -469,11 +317,23 @@ function estimateMessagesTokens(messages: Message[], tokensPerChar: number, toke
   return total;
 }
 
+const MEMORY_SUMMARY_MAX_CHARS = 2000;
+
+const compactToolsDoc = [
+  'Tools: Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, GitClone, NpmInstall,',
+  'mcp__dotclaw__send_message, send_file, send_photo, send_voice, send_audio, send_location,',
+  'send_contact, send_poll, send_buttons, edit_message, delete_message, download_url,',
+  'schedule_task, run_task, list_tasks, pause_task, resume_task, cancel_task, update_task,',
+  'spawn_job, job_status, list_jobs, cancel_job, job_update, register_group, remove_group,',
+  'list_groups, set_model, memory_upsert, memory_search, memory_list, memory_forget, memory_stats.',
+  'plugin__* (plugins), mcp_ext__* (external MCP).'
+].join('\n');
+
 function buildSystemInstructions(params: {
   assistantName: string;
   groupNotes?: string | null;
   globalNotes?: string | null;
-  skillNotes?: SkillNote[];
+  skillCatalog?: SkillCatalog | null;
   memorySummary: string;
   memoryFacts: string[];
   sessionRecall: string[];
@@ -490,7 +350,9 @@ function buildSystemInstructions(params: {
   jobId?: string;
   timezone?: string;
   hostPlatform?: string;
+  messagingPlatform?: string;
   planBlock?: string;
+  profile?: 'fast' | 'standard' | 'deep' | 'background';
   taskExtractionPack?: PromptPack | null;
   responseQualityPack?: PromptPack | null;
   toolCallingPack?: PromptPack | null;
@@ -498,153 +360,72 @@ function buildSystemInstructions(params: {
   memoryPolicyPack?: PromptPack | null;
   memoryRecallPack?: PromptPack | null;
 }): string {
-  const toolsDoc = [
-    'Tools available (use with care):',
-    '- `Bash`: run shell commands in `/workspace/group`.',
-    '- `Read`, `Write`, `Edit`, `Glob`, `Grep`: filesystem operations within mounted paths.',
-    '- `WebSearch`: Brave Search API (requires `BRAVE_SEARCH_API_KEY`).',
-    '- `WebFetch`: fetch URLs (limit payload sizes).',
-    '- `GitClone`: clone git repositories into the workspace.',
-    '- `NpmInstall`: install npm dependencies in the workspace.',
-    '- `mcp__dotclaw__send_message`: send Telegram messages.',
-    '- `mcp__dotclaw__send_file`: send a file/document.',
-    '- `mcp__dotclaw__send_photo`: send a photo with compression.',
-    '- `mcp__dotclaw__send_voice`: send a voice message (.ogg format).',
-    '- `mcp__dotclaw__send_audio`: send an audio file (mp3, m4a, etc.).',
-    '- `mcp__dotclaw__send_location`: send a map pin (latitude/longitude).',
-    '- `mcp__dotclaw__send_contact`: send a contact card (phone + name).',
-    '- `mcp__dotclaw__send_poll`: create a Telegram poll.',
-    '- `mcp__dotclaw__send_buttons`: send a message with inline keyboard buttons.',
-    '- `mcp__dotclaw__edit_message`: edit a previously sent message.',
-    '- `mcp__dotclaw__delete_message`: delete a message.',
-    '- `mcp__dotclaw__download_url`: download a URL to the workspace as a file.',
-    '- To send media from the web: (1) download with `mcp__dotclaw__download_url` or `curl`/`wget` via Bash, (2) send with `mcp__dotclaw__send_photo`/`send_file`/`send_voice`/`send_audio`. This is a quick foreground task — do NOT use spawn_job for it.',
-    '- Users may send photos, documents, voice messages, and videos. These are downloaded to `/workspace/group/inbox/` and referenced as `<attachment>` tags in messages. Process them with Read/Bash/Python tools. Use ffmpeg for audio/video transcoding (e.g. voice messages must be .ogg Opus for send_voice).',
-    '- GitHub CLI (`gh`) is available. If GH_TOKEN is set, you can clone repos, create PRs, manage issues, etc. Use `gh auth status` to check authentication.',
-    '- `mcp__dotclaw__schedule_task`: schedule tasks (set `timezone` for locale-specific schedules).',
-    '- `mcp__dotclaw__run_task`: run a scheduled task immediately.',
-    '- `mcp__dotclaw__list_tasks`, `mcp__dotclaw__pause_task`, `mcp__dotclaw__resume_task`, `mcp__dotclaw__cancel_task`.',
-    '- `mcp__dotclaw__update_task`: update a task (state, prompt, schedule, status).',
-    '- `mcp__dotclaw__spawn_job`: start a background job.',
-    '- `mcp__dotclaw__job_status`, `mcp__dotclaw__list_jobs`, `mcp__dotclaw__cancel_job`.',
-    '- `mcp__dotclaw__job_update`: log job progress or notify the user.',
-    'Rule: Use `mcp__dotclaw__spawn_job` ONLY for tasks that genuinely take more than ~2 minutes (cloning large repos, multi-page web research, complex coding projects). Everything else — downloading files, sending media, quick lookups, data analysis, format conversions, chart generation, scheduling reminders, web searches — should be done directly in the foreground. When in doubt, do it in the foreground.',
-    'When you DO spawn a background job, keep your reply to the user minimal — e.g. "Working on it, I\'ll send the results when done." Do not include the job ID, bullet-point plans, next steps, or status monitoring offers. The user will receive the result automatically.',
-    '- `mcp__dotclaw__register_group`: manage chat registrations.',
-    '- `mcp__dotclaw__remove_group`, `mcp__dotclaw__list_groups`: manage registered groups.',
-    '- `mcp__dotclaw__set_model`: change the active model.',
-    '- `mcp__dotclaw__memory_upsert`: store durable memories.',
-    '- `mcp__dotclaw__memory_search`, `mcp__dotclaw__memory_list`, `mcp__dotclaw__memory_forget`, `mcp__dotclaw__memory_stats`.',
-    '- `plugin__*`: dynamically loaded plugin tools (if present and allowed by policy).',
-    '- `mcp_ext__*`: external MCP server tools (if configured).'
+  const profile = params.profile || 'standard';
+  const isFast = profile === 'fast';
+
+  // Tool descriptions are already in each tool's schema — only add essential guidance here
+  const toolGuidance = isFast ? '' : [
+    'Key tool rules:',
+    '- User attachments arrive in /workspace/group/inbox/ (see <attachment> tags). Process with Read/Bash/Python.',
+    '- To send media from the web: download_url → send_photo/send_file/send_audio. Always foreground.',
+    '- Charts/plots: matplotlib → savefig → send_photo. Graphviz → dot -Tpng → send_photo.',
+    '- Voice messages are auto-transcribed (<transcript> in <attachment>). Reply with normal text — the host auto-converts to voice.',
+    '- GitHub CLI (`gh`) is available if GH_TOKEN is set.',
+    '- Use spawn_job ONLY for tasks >2 minutes (deep research, large projects). Everything else: foreground.',
+    '- When you spawn a job, reply minimally (e.g. "Working on it"). No job IDs, bullet plans, or status offers.',
+    '- plugin__* and mcp_ext__* tools may be available if configured.'
   ].join('\n');
-  const browserAutomation = agentConfig.agent.browser.enabled ? [
-    'Browser Tool:',
-    '- Use the `Browser` tool with actions: navigate, snapshot, click, fill, screenshot, extract, evaluate, close.',
-    '- Use snapshot with interactive=true to get clickable element refs (@e1, @e2, etc.).',
-    '- Interact with refs: click ref="@e1", fill ref="@e2" text="value".',
-    '- Screenshots are saved to /workspace/group/screenshots/.'
+
+  const toolsSection = isFast ? compactToolsDoc : toolGuidance;
+
+  const browserAutomation = !isFast && agentConfig.agent.browser.enabled ? [
+    'Browser Tool: actions: navigate, snapshot, click, fill, screenshot, extract, evaluate, close.',
+    'Use snapshot with interactive=true for clickable refs (@e1, @e2). Screenshots → /workspace/group/screenshots/.'
   ].join('\n') : '';
 
-  const commonWorkflows = [
-    'Common workflows (do all of these in the foreground — act immediately, never spawn_job):',
-    '',
-    'Sending media from the web:',
-    '  download_url (or curl/wget) → send_photo / send_file / send_audio.',
-    '  When the user asks for a picture/image/photo of something: WebSearch for it → pick a direct image URL → download_url → send_photo. You CAN and SHOULD do this — it is a core capability.',
-    '',
-    'Charts & plots:',
-    '  Python: matplotlib/pandas .plot() → plt.savefig("/workspace/group/chart.png") → send_photo.',
-    '  Graphviz: write .dot file → Bash `dot -Tpng diagram.dot -o diagram.png` → send_photo.',
-    '  Always save to a file and send — never try to "display" inline.',
-    '',
-    'Processing user attachments:',
-    '  Files arrive in /workspace/group/inbox/. The path is in the <attachment> tag.',
-    '  Spreadsheets (.xlsx/.csv): `pd.read_excel()` or `pd.read_csv()` → analyze → respond.',
-    '  JSON: Read tool or `json.load()` → analyze → respond.',
-    '  Images: Python Pillow for processing, or describe what you see if relevant.',
-    '  PDFs: Python `PyPDF2` (install at runtime if needed), or `pdftotext` via Bash.',
-    '  Archives (.zip/.tar): `unzip -l` or `tar -tf` to list, extract as needed.',
-    '  Unknown types: use `file` command to identify, then process accordingly.',
-    '',
-    'Creating & delivering files:',
-    '  When the user asks you to create a file (report, CSV, spreadsheet, script, etc.):',
-    '  Write/Python to create the file → send_file to deliver it. Do not paste large file content as a message.',
-    '  For Excel: `openpyxl` or `pd.to_excel()`. For CSV: `pd.to_csv()` or Write tool.',
-    '',
-    'Format conversions:',
-    '  Images: Python Pillow `Image.open().save("out.png")` → send_file.',
-    '  Audio/Video: `ffmpeg -i input.ext output.ext` via Bash → send_file / send_audio.',
-    '  Documents: use appropriate Python libraries or CLI tools → send_file.',
-    '',
-    'Voice messages:',
-    '  Received: voice messages are auto-transcribed. The transcript appears as <transcript> inside the <attachment> XML.',
-    '  If no transcript is available, acknowledge to the user that you received a voice message but cannot read it.',
-    '  Replying: when the user sends a voice message, just reply with a normal text message. The host will automatically convert it to a voice reply. Do NOT call text_to_speech for voice message replies.',
-    '  You can also use text_to_speech proactively for any response where a voice reply feels appropriate.',
-    '  To create audio manually instead: generate .ogg Opus file → send_voice.',
-    '',
-    'Quick lookups (one tool call, immediate response):',
-    '  Time zones: `python3 -c "from datetime import datetime; from zoneinfo import ZoneInfo; ..."`',
-    '  Math/conversions: Python one-liner.',
-    '  Unit conversions, currency, percentages: Python one-liner.',
-    '',
-    'Web research:',
-    '  Simple question: WebSearch → summarize in send_message.',
-    '  Summarize a URL: WebFetch → summarize in send_message.',
-    '  Deep research (many sources): this is the one case that may warrant spawn_job.',
-    '',
-    'Reminders & scheduling:',
-    '  "Remind me at 5pm": one schedule_task call with a cron expression. Done.',
-    '  "Every Monday at 9am": one schedule_task call with cron. Done.',
-    '  Do not overthink scheduling — it is a single tool call.',
-    '',
-    'Diagrams & visualizations:',
-    '  Flowcharts/graphs: write Graphviz .dot → `dot -Tpng` → send_photo.',
-    '  Data visualizations: matplotlib/pandas → savefig → send_photo.',
-    '  Tables: use `tabulate` for markdown/ASCII tables in messages, or create an image for complex tables.'
-  ].join('\n');
+  // Memory section: skip for fast profile, consolidate empty placeholders for other profiles
+  const includeMemory = !isFast;
+  const hasAnyMemory = params.memorySummary || params.memoryFacts.length > 0 ||
+    params.longTermRecall.length > 0 || params.userProfile;
 
-  const memorySummary = params.memorySummary ? params.memorySummary : 'None yet.';
+  const memorySummary = params.memorySummary
+    ? params.memorySummary.slice(0, MEMORY_SUMMARY_MAX_CHARS)
+    : '';
   const memoryFacts = params.memoryFacts.length > 0
     ? params.memoryFacts.map(fact => `- ${fact}`).join('\n')
-    : 'None yet.';
+    : '';
   const sessionRecall = params.sessionRecall.length > 0
     ? params.sessionRecall.map(item => `- ${item}`).join('\n')
-    : 'None.';
-
+    : '';
   const longTermRecall = params.longTermRecall.length > 0
     ? params.longTermRecall.map(item => `- ${item}`).join('\n')
-    : 'None.';
-
-  const userProfile = params.userProfile
-    ? params.userProfile
-    : 'None.';
-
+    : '';
+  const userProfile = params.userProfile || '';
   const memoryStats = params.memoryStats
     ? `Total: ${params.memoryStats.total}, User: ${params.memoryStats.user}, Group: ${params.memoryStats.group}, Global: ${params.memoryStats.global}`
-    : 'Unknown.';
+    : '';
 
   const availableGroups = params.availableGroups && params.availableGroups.length > 0
     ? params.availableGroups
       .map(group => `- ${group.name} (chat ${group.jid}, last: ${group.lastActivity})`)
       .join('\n')
-    : 'None.';
+    : '';
 
   const groupNotes = params.groupNotes ? `Group notes:\n${params.groupNotes}` : '';
   const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
-  const skillNotes = formatSkillNotes(params.skillNotes || []);
+  const skillNotes = params.skillCatalog ? formatSkillCatalog(params.skillCatalog) : '';
 
-  const toolReliability = params.toolReliability && params.toolReliability.length > 0
+  const toolReliability = !isFast && params.toolReliability && params.toolReliability.length > 0
     ? params.toolReliability
-      .sort((a, b) => b.success_rate - a.success_rate)
+      .sort((a, b) => a.success_rate - b.success_rate)
+      .slice(0, 20)
       .map(tool => {
         const pct = `${Math.round(tool.success_rate * 100)}%`;
         const avg = Number.isFinite(tool.avg_duration_ms) ? `${Math.round(tool.avg_duration_ms!)}ms` : 'n/a';
         return `- ${tool.name}: success ${pct} over ${tool.count} calls (avg ${avg})`;
       })
       .join('\n')
-    : 'No recent tool reliability data.';
+    : '';
 
   const behaviorNotes: string[] = [];
   const responseStyle = typeof params.behaviorConfig?.response_style === 'string'
@@ -696,23 +477,72 @@ function buildSystemInstructions(params: {
   const fmtPack = (label: string, pack: PromptPack | null | undefined) =>
     pack ? formatPromptPack({ label, pack, maxDemos: PROMPT_PACKS_MAX_DEMOS, maxChars: PROMPT_PACKS_MAX_CHARS }) : '';
 
-  const taskExtractionBlock = fmtPack('Task Extraction Guidelines', params.taskExtractionPack);
-  const responseQualityBlock = fmtPack('Response Quality Guidelines', params.responseQualityPack);
-  const toolCallingBlock = fmtPack('Tool Calling Guidelines', params.toolCallingPack);
-  const toolOutcomeBlock = fmtPack('Tool Outcome Guidelines', params.toolOutcomePack);
-  const memoryPolicyBlock = fmtPack('Memory Policy Guidelines', params.memoryPolicyPack);
-  const memoryRecallBlock = fmtPack('Memory Recall Guidelines', params.memoryRecallPack);
+  // Skip prompt packs for fast profile; enforce aggregate budget for others
+  const PROMPT_PACKS_TOTAL_BUDGET = PROMPT_PACKS_MAX_CHARS * 3; // Aggregate cap across all packs
+  const allPackBlocks: string[] = [];
+  if (!isFast) {
+    const packEntries: Array<[string, PromptPack | null | undefined]> = [
+      ['Tool Calling Guidelines', params.toolCallingPack],
+      ['Tool Outcome Guidelines', params.toolOutcomePack],
+      ['Task Extraction Guidelines', params.taskExtractionPack],
+      ['Response Quality Guidelines', params.responseQualityPack],
+      ['Memory Policy Guidelines', params.memoryPolicyPack],
+      ['Memory Recall Guidelines', params.memoryRecallPack],
+    ];
+    let totalChars = 0;
+    for (const [label, pack] of packEntries) {
+      const block = fmtPack(label, pack);
+      if (!block) continue;
+      if (totalChars + block.length > PROMPT_PACKS_TOTAL_BUDGET) break;
+      allPackBlocks.push(block);
+      totalChars += block.length;
+    }
+  }
+  const taskExtractionBlock = allPackBlocks.find(b => b.includes('Task Extraction')) || '';
+  const responseQualityBlock = allPackBlocks.find(b => b.includes('Response Quality')) || '';
+  const toolCallingBlock = allPackBlocks.find(b => b.includes('Tool Calling')) || '';
+  const toolOutcomeBlock = allPackBlocks.find(b => b.includes('Tool Outcome')) || '';
+  const memoryPolicyBlock = allPackBlocks.find(b => b.includes('Memory Policy')) || '';
+  const memoryRecallBlock = allPackBlocks.find(b => b.includes('Memory Recall')) || '';
+
+  // Build memory sections — omit entirely for fast, consolidate empty placeholders for others
+  const memorySections: string[] = [];
+  if (includeMemory) {
+    if (hasAnyMemory) {
+      if (memorySummary) {
+        memorySections.push('Long-term memory summary:', memorySummary);
+      }
+      if (memoryFacts) {
+        memorySections.push('Long-term facts:', memoryFacts);
+      }
+      if (userProfile) {
+        memorySections.push('User profile (if available):', userProfile);
+      }
+      if (longTermRecall) {
+        memorySections.push('What you remember about the user (long-term):', longTermRecall);
+      }
+      if (memoryStats) {
+        memorySections.push('Memory stats:', memoryStats);
+      }
+    } else {
+      memorySections.push('No long-term memory available yet.');
+    }
+  }
+
+  // Session recall is always included (local context from current conversation)
+  if (sessionRecall) {
+    memorySections.push('Recent conversation context:', sessionRecall);
+  }
 
   return [
-    `You are ${params.assistantName}, a personal assistant running inside DotClaw.`,
+    `You are ${params.assistantName}, a personal assistant running inside DotClaw.${params.messagingPlatform ? ` You are currently connected via ${params.messagingPlatform}.` : ''}`,
     hostPlatformNote,
     scheduledNote,
     backgroundNote,
     jobNote,
     jobArtifactsNote,
-    toolsDoc,
+    toolsSection,
     browserAutomation,
-    commonWorkflows,
     groupNotes,
     globalNotes,
     skillNotes,
@@ -724,22 +554,9 @@ function buildSystemInstructions(params: {
     responseQualityBlock,
     memoryPolicyBlock,
     memoryRecallBlock,
-    'Long-term memory summary:',
-    memorySummary,
-    'Long-term facts:',
-    memoryFacts,
-    'User profile (if available):',
-    userProfile,
-    'What you remember about the user (long-term):',
-    longTermRecall,
-    'Recent conversation context:',
-    sessionRecall,
-    'Memory stats:',
-    memoryStats,
-    'Available groups (main group only):',
-    availableGroups,
-    'Tool reliability (recent):',
-    toolReliability,
+    ...memorySections,
+    availableGroups ? `Available groups (main group only):\n${availableGroups}` : '',
+    toolReliability ? `Tool reliability (recent):\n${toolReliability}` : '',
     behaviorNotes.length > 0 ? `Behavior notes:\n${behaviorNotes.join('\n')}` : '',
     'Be concise and helpful. When you use tools, summarize what happened rather than dumping raw output.'
   ].filter(Boolean).join('\n\n');
@@ -776,122 +593,6 @@ function loadClaudeNotes(): { group: string | null; global: string | null } {
   };
 }
 
-export type SkillNote = {
-  scope: 'group' | 'global';
-  path: string;
-  content: string;
-};
-
-function collectSkillFiles(rootDir: string, maxFiles: number): string[] {
-  const files: string[] = [];
-  const seen = new Set<string>();
-  const addFile = (filePath: string) => {
-    const normalized = path.resolve(filePath);
-    if (seen.has(normalized)) return;
-    if (!fs.existsSync(normalized)) return;
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(normalized);
-    } catch {
-      return;
-    }
-    if (!stat.isFile()) return;
-    if (!normalized.toLowerCase().endsWith('.md')) return;
-    seen.add(normalized);
-    files.push(normalized);
-  };
-
-  addFile(path.join(rootDir, 'SKILL.md'));
-
-  const skillsDir = path.join(rootDir, 'skills');
-  if (fs.existsSync(skillsDir)) {
-    const stack = [skillsDir];
-    while (stack.length > 0 && files.length < maxFiles) {
-      const current = stack.pop();
-      if (!current) continue;
-      let entries: fs.Dirent[];
-      try {
-        entries = fs.readdirSync(current, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      entries.sort((a, b) => a.name.localeCompare(b.name));
-      for (const entry of entries) {
-        const nextPath = path.join(current, entry.name);
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory()) {
-          stack.push(nextPath);
-          continue;
-        }
-        if (entry.isFile()) {
-          addFile(nextPath);
-        }
-        if (files.length >= maxFiles) break;
-      }
-    }
-  }
-
-  files.sort((a, b) => a.localeCompare(b));
-  return files.slice(0, maxFiles);
-}
-
-export function loadSkillNotesFromRoots(params: {
-  groupDir: string;
-  globalDir: string;
-  maxFiles?: number;
-  maxCharsPerFile?: number;
-  maxTotalChars?: number;
-}): SkillNote[] {
-  const maxFiles = Number.isFinite(params.maxFiles) ? Math.max(1, Math.floor(params.maxFiles!)) : SKILL_NOTES_MAX_FILES;
-  const maxCharsPerFile = Number.isFinite(params.maxCharsPerFile)
-    ? Math.max(200, Math.floor(params.maxCharsPerFile!))
-    : SKILL_NOTES_MAX_CHARS;
-  const maxTotalChars = Number.isFinite(params.maxTotalChars)
-    ? Math.max(maxCharsPerFile, Math.floor(params.maxTotalChars!))
-    : SKILL_NOTES_TOTAL_MAX_CHARS;
-
-  const notes: SkillNote[] = [];
-  let consumedChars = 0;
-
-  const appendScopeNotes = (scope: 'group' | 'global', rootDir: string) => {
-    const skillFiles = collectSkillFiles(rootDir, maxFiles);
-    for (const filePath of skillFiles) {
-      if (notes.length >= maxFiles) break;
-      if (consumedChars >= maxTotalChars) break;
-      const content = readTextFileLimited(filePath, maxCharsPerFile);
-      if (!content) continue;
-      const remaining = maxTotalChars - consumedChars;
-      const truncated = content.length > remaining
-        ? `${content.slice(0, remaining)}\n\n[Truncated for total skill budget]`
-        : content;
-      const relativePath = path.relative(rootDir, filePath).split(path.sep).join('/');
-      notes.push({
-        scope,
-        path: relativePath || path.basename(filePath),
-        content: truncated
-      });
-      consumedChars += truncated.length;
-      if (consumedChars >= maxTotalChars) break;
-    }
-  };
-
-  appendScopeNotes('group', params.groupDir);
-  appendScopeNotes('global', params.globalDir);
-  return notes;
-}
-
-function formatSkillNotes(notes: SkillNote[]): string {
-  if (!notes || notes.length === 0) return '';
-  const lines: string[] = [
-    'Skill instructions (loaded from SKILL.md / skills/*.md):',
-    'When a task matches a skill, follow that skill workflow first and keep output concise.'
-  ];
-  for (const note of notes) {
-    lines.push(`[${note.scope}] ${note.path}`);
-    lines.push(note.content);
-  }
-  return lines.join('\n\n');
-}
 
 function extractQueryFromPrompt(prompt: string): string {
   if (!prompt) return '';
@@ -954,7 +655,7 @@ async function updateMemorySummary(params: {
     temperature: 0.1,
     reasoning: { effort: 'low' as const }
   });
-  const text = await getTextWithFallback(result, 'summary');
+  const text = await getResponseText(result, 'summary');
   return parseSummaryResponse(text);
 }
 
@@ -1097,7 +798,7 @@ async function validateResponseQuality(params: {
     temperature: params.temperature,
     reasoning: { effort: 'low' as const }
   });
-  const text = await getTextWithFallback(result, 'response_validation');
+  const text = await getResponseText(result, 'response_validation');
   return parseResponseValidation(text);
 }
 
@@ -1206,7 +907,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const tokenEstimate = resolveTokenEstimate(input, agentConfig);
   const availableGroups = loadAvailableGroups();
   const claudeNotes = loadClaudeNotes();
-  const skillNotes = loadSkillNotesFromRoots({
+  const skillCatalog = buildSkillCatalog({
     groupDir: GROUP_DIR,
     globalDir: GLOBAL_DIR
   });
@@ -1431,7 +1132,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     assistantName,
     groupNotes: claudeNotes.group,
     globalNotes: claudeNotes.global,
-    skillNotes,
+    skillCatalog,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
     sessionRecall,
@@ -1448,7 +1149,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     jobId: input.jobId,
     timezone: typeof input.timezone === 'string' ? input.timezone : undefined,
     hostPlatform: typeof input.hostPlatform === 'string' ? input.hostPlatform : undefined,
+    messagingPlatform: input.chatJid?.includes(':') ? input.chatJid.split(':')[0] : undefined,
     planBlock: planBlockValue,
+    profile: input.profile,
     taskExtractionPack: taskPackResult?.pack || null,
     responseQualityPack: responseQualityResult?.pack || null,
     toolCallingPack: toolCallingResult?.pack || null,
@@ -1484,7 +1187,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         temperature: plannerTemperature,
         reasoning: { effort: 'low' as const }
       });
-      const plannerText = await getTextWithFallback(plannerResult, 'planner');
+      const plannerText = await getResponseText(plannerResult, 'planner');
       const plan = parsePlannerResponse(plannerText);
       if (plan) {
         planBlock = formatPlanBlock(plan);
@@ -1565,7 +1268,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     const localLatencyMs = Date.now() - startedAt;
 
     // Get the complete response text via the SDK's proper getText() path
-    let localResponseText = await getTextWithFallback(result, 'completion');
+    let localResponseText = await getResponseText(result, 'completion');
 
     const toolCallsFromModel = await result.getToolCalls();
     if (toolCallsFromModel.length > 0) {
@@ -1576,21 +1279,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       if (toolCallsFromModel.length > 0) {
         localResponseText = 'I started running tool calls but did not get a final response. If you want me to continue, please ask a narrower subtask or say "continue".';
       } else {
-        // Responses API likely returned a gen-ID; retry with Chat Completions API
-        try {
-          localResponseText = await chatCompletionsFallback({
-            model,
-            instructions: resolvedInstructions,
-            messages: messagesToOpenRouter(contextMessages),
-            maxOutputTokens: config.maxOutputTokens,
-            temperature: config.temperature
-          });
-        } catch (err) {
-          log(`Chat Completions fallback error: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-      if (!localResponseText || !localResponseText.trim()) {
-        log(`Warning: Model returned empty/whitespace response after all fallbacks. tool calls: ${toolCallsFromModel.length}`);
+        log(`Warning: Model returned empty/whitespace response. tool calls: ${toolCallsFromModel.length}`);
       }
     } else {
       log(`Model returned text response (${localResponseText.length} chars)`);
@@ -1725,7 +1414,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       temperature: 0.1,
       reasoning: { effort: 'low' as const }
     });
-    const extractionText = await getTextWithFallback(extractionResult, 'memory_extraction');
+    const extractionText = await getResponseText(extractionResult, 'memory_extraction');
     const extractedItems = parseMemoryExtraction(extractionText);
     if (extractedItems.length === 0) return;
 

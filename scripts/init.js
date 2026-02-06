@@ -59,7 +59,9 @@ function initFiles() {
   ensureDir(STORE_DIR);
   ensureDir(GROUPS_DIR);
   ensureDir(path.join(GROUPS_DIR, 'main'));
+  ensureDir(path.join(GROUPS_DIR, 'main', 'skills'));
   ensureDir(path.join(GROUPS_DIR, 'global'));
+  ensureDir(path.join(GROUPS_DIR, 'global', 'skills'));
   ensureDir(LOGS_DIR);
   ensureDir(TRACES_DIR);
   ensureDir(PROMPTS_DIR);
@@ -99,8 +101,8 @@ function initFiles() {
     model: 'moonshotai/kimi-k2.5',
     allowlist: [
       'moonshotai/kimi-k2.5',
-      'openai/gpt-5-mini',
-      'openai/gpt-5-nano'
+      'deepseek/deepseek-v3.2',
+      'google/gemini-2.5-flash'
     ],
     overrides: {
       'moonshotai/kimi-k2.5': {

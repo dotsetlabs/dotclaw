@@ -33,19 +33,23 @@ test('routeRequest chooses fast for greetings', async () => {
   });
 });
 
-test('routeRequest chooses background for research prompts', async () => {
+test('routeRequest never assigns background — classifier decides that', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-router-'));
   await withTempHome(tempDir, async () => {
     const { routeRequest } = await importFresh(distPath('request-router.js'));
+    // Use a prompt long enough to exceed maxFastChars (200) so it lands in
+    // standard profile where the classifier is eligible to run.
+    const longPrompt = 'Research the latest trends in agent orchestration frameworks, compare the top five options, evaluate their performance characteristics, and summarize the findings in a structured report with recommendations for our team.';
     const decision = routeRequest({
-      prompt: 'Research the latest trends in agent orchestration and summarize.',
-      lastMessage: makeMessage('Research the latest trends in agent orchestration and summarize.'),
-      recentMessages: [makeMessage('Research the latest trends in agent orchestration and summarize.')],
+      prompt: longPrompt,
+      lastMessage: makeMessage(longPrompt),
+      recentMessages: [makeMessage(longPrompt)],
       isGroup: false,
       chatType: 'private'
     });
-    assert.equal(decision.profile, 'background');
-    assert.equal(decision.shouldBackground, true);
+    assert.notEqual(decision.profile, 'background');
+    assert.equal(decision.shouldBackground, false);
+    assert.equal(decision.shouldRunClassifier, true);
   });
 });
 

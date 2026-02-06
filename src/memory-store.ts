@@ -231,15 +231,6 @@ export function initMemoryStore(): void {
     CREATE INDEX IF NOT EXISTS idx_memory_group_scope ON memory_items(group_folder, scope, subject_id);
     CREATE INDEX IF NOT EXISTS idx_memory_updated_at ON memory_items(updated_at);
 
-    CREATE TABLE IF NOT EXISTS memory_sources (
-      id TEXT PRIMARY KEY,
-      group_folder TEXT NOT NULL,
-      source_type TEXT NOT NULL,
-      source_path TEXT NOT NULL,
-      source_hash TEXT,
-      indexed_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_memory_sources_group ON memory_sources(group_folder, source_type);
   `);
 
   try {
@@ -802,26 +793,6 @@ export function decayUnusedMemories(): number {
       AND (priority IS NULL OR priority != 'critical')
   `).run();
   return info.changes;
-}
-
-/**
- * Set priority for a memory item
- * Priority values: 'critical', 'normal', 'low'
- * Critical memories are never pruned
- */
-export function setMemoryPriority(id: string, priority: 'critical' | 'normal' | 'low'): boolean {
-  const db = getDb();
-  const info = db.prepare(`UPDATE memory_items SET priority = ? WHERE id = ?`).run(priority, id);
-  return info.changes > 0;
-}
-
-/**
- * Get memory by ID
- */
-export function getMemoryById(id: string): MemoryItem | null {
-  const db = getDb();
-  const row = db.prepare(`SELECT * FROM memory_items WHERE id = ?`).get(id);
-  return row ? (row as MemoryItem) : null;
 }
 
 export function pruneMemoryOverflow(params: { maxItems: number; importanceThreshold: number }): number {

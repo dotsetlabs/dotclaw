@@ -39,22 +39,24 @@ title: Behavior Config
 
 ## Adjusting via admin commands
 
-From the main/admin Telegram chat:
+Admin commands store preferences as **memory items** (via `upsertMemoryItems`), not in `behavior.json`. The agent recalls these preferences at runtime through its memory system. Run these from any registered chat:
 
 ```
 /dotclaw style concise
 /dotclaw style balanced
 /dotclaw style detailed
-/dotclaw tools conservative   # sets tool_calling_bias to 0.3
-/dotclaw tools balanced       # sets tool_calling_bias to 0.5
-/dotclaw tools proactive      # sets tool_calling_bias to 0.7
-/dotclaw caution low          # sets caution_bias to 0.35
-/dotclaw caution balanced     # sets caution_bias to 0.5
-/dotclaw caution high         # sets caution_bias to 0.7
-/dotclaw memory strict        # sets memory_importance_threshold to 0.7
-/dotclaw memory balanced      # sets memory_importance_threshold to 0.55
-/dotclaw memory loose         # sets memory_importance_threshold to 0.45
+/dotclaw tools conservative
+/dotclaw tools balanced
+/dotclaw tools proactive
+/dotclaw caution low
+/dotclaw caution balanced
+/dotclaw caution high
+/dotclaw memory strict
+/dotclaw memory balanced
+/dotclaw memory loose
 ```
+
+These commands create memory items with conflict keys (`response_style`, `tool_usage`, `caution_level`, `memory_importance_threshold`) so newer preferences replace older ones.
 
 ## Autotune integration
 

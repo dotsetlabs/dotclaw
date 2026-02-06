@@ -95,7 +95,7 @@ Container mount allowlist lives outside the repo:
 
 `~/.config/dotclaw/mount-allowlist.json`
 
-`dotclaw setup` (or `npm run init`) creates a locked-down template with
+`dotclaw setup` creates a locked-down template with
 empty `allowedRoots`. Edit it to enable additional mounts.
 
 Example:

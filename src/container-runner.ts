@@ -974,14 +974,10 @@ export async function runContainerAgent(
         const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
         const endIdx = stdout.lastIndexOf(OUTPUT_END_MARKER);
 
-        let jsonLine: string;
-        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-          jsonLine = stdout.slice(startIdx + OUTPUT_START_MARKER.length, endIdx).trim();
-        } else {
-          // Fallback: last non-empty line (backwards compatibility)
-          const lines = stdout.trim().split('\n');
-          jsonLine = lines[lines.length - 1];
+        if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+          throw new Error('Container output missing sentinel markers');
         }
+        const jsonLine = stdout.slice(startIdx + OUTPUT_START_MARKER.length, endIdx).trim();
 
         let output: ContainerOutput;
         try {
