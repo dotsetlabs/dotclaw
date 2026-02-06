@@ -4,7 +4,7 @@ title: Admin Commands
 
 # Admin Commands
 
-Admin commands are available via `/dotclaw` (or `/dc`). Group management commands only work in the main group.
+Admin commands are available via `/dotclaw` (or the shorthand `/dc`). Group management and skill commands only work in the main group.
 
 ## Commands
 
@@ -18,3 +18,7 @@ Admin commands are available via `/dotclaw` (or `/dc`). Group management command
 - `/dotclaw tools <conservative|balanced|proactive>`
 - `/dotclaw caution <low|balanced|high>`
 - `/dotclaw memory <strict|balanced|loose>`
+- `/dotclaw skill install <url> [--global]` (main only)
+- `/dotclaw skill remove <name> [--global]` (main only)
+- `/dotclaw skill list [--global]` (main only)
+- `/dotclaw skill update <name> [--global]` (main only)

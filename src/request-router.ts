@@ -32,14 +32,6 @@ export type RoutingDecision = {
 
 const GREETING_REGEX = /^(hi|hello|hey|yo|sup|what's up|who are you|what can you do|help|thanks|thank you)[!.?]*$/i;
 
-function normalizeText(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function hasKeyword(text: string, keywords: string[]): boolean {
-  return keywords.some(keyword => keyword && text.includes(keyword.toLowerCase()));
-}
-
 function estimateMinutes(textLength: number, multiplier = 1): number {
   if (!Number.isFinite(textLength) || textLength <= 0) return 1;
   const base = Math.max(1, Math.ceil(textLength / 800));
@@ -109,26 +101,18 @@ export function routeRequest(params: {
   }
   const text = params.lastMessage?.content || params.prompt || '';
   const trimmed = text.trim();
-  const normalized = normalizeText(trimmed);
   const length = trimmed.length;
 
   const isGreeting = GREETING_REGEX.test(trimmed);
-  const fastCue = hasKeyword(normalized, routing.fastKeywords);
-  const deepCue = hasKeyword(normalized, routing.deepKeywords);
-  const backgroundCue = hasKeyword(normalized, routing.backgroundKeywords);
-
   let profile: TaskProfile = 'standard';
   let reason = 'default';
 
-  if (backgroundCue || length >= routing.backgroundMinChars) {
-    profile = 'background';
-    reason = backgroundCue ? 'background keyword' : 'long prompt length';
-  } else if (deepCue || length >= routing.maxStandardChars) {
-    profile = 'deep';
-    reason = deepCue ? 'complexity keyword' : 'prompt length';
-  } else if (isGreeting || fastCue || length <= routing.maxFastChars) {
+  if (isGreeting || length <= routing.maxFastChars) {
     profile = 'fast';
-    reason = isGreeting ? 'greeting' : (fastCue ? 'fast keyword' : 'short prompt');
+    reason = isGreeting ? 'greeting' : 'short prompt';
+  } else if (length >= routing.maxStandardChars) {
+    profile = 'deep';
+    reason = 'prompt length';
   }
 
   const profileConfig = routing.profiles?.[profile] || routing.profiles?.standard;
@@ -146,14 +130,14 @@ export function routeRequest(params: {
     override: profileConfig?.progress
   });
 
-  const shouldBackground = profile === 'background';
-  const shouldRunClassifier = routing.classifierFallback.enabled
-    && !shouldBackground
-    && profile !== 'fast'
-    && length >= routing.classifierFallback.minChars;
+  // Background is never assigned by the router — only the LLM classifier or
+  // planner probe can escalate to background.  Keyword matching was removed
+  // because it produced too many false positives on common words.
+  const shouldBackground = false;
+  const shouldRunClassifier = routing.classifierFallback.enabled && profile !== 'fast';
 
-  const estimatedMinutes = (profile === 'deep' || profile === 'background')
-    ? estimateMinutes(length, profile === 'background' ? 1.5 : 1)
+  const estimatedMinutes = profile === 'deep'
+    ? estimateMinutes(length)
     : undefined;
 
   return {

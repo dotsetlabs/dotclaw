@@ -3,6 +3,7 @@ import path from 'path';
 import { MAINTENANCE_INTERVAL_MS, TRACE_DIR, TRACE_RETENTION_DAYS, DATA_DIR, JOB_RETENTION_MS, TASK_LOG_RETENTION_MS, GROUPS_DIR } from './config.js';
 import { runMemoryMaintenance } from './memory-store.js';
 import { cleanupCompletedMessages, cleanupCompletedBackgroundJobs, cleanupOldTaskRunLogs, cleanupOldToolAudit, cleanupOldMessageTraces, cleanupOldUserFeedback } from './db.js';
+import { cleanupOldWorkflowRuns } from './workflow-store.js';
 import { logger } from './logger.js';
 
 const IPC_FILE_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
@@ -274,6 +275,10 @@ export function startMaintenanceLoop(): void {
       const feedbackPurged = cleanupOldUserFeedback(TRACES_FEEDBACK_RETENTION_MS);
       if (feedbackPurged > 0) logger.info({ count: feedbackPurged }, 'Purged old user feedback');
 
+      const WORKFLOW_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+      const workflowsPurged = cleanupOldWorkflowRuns(WORKFLOW_RETENTION_MS);
+      if (workflowsPurged > 0) logger.info({ count: workflowsPurged }, 'Purged old workflow runs');
+
       const cidRemoved = cleanupStaleCidFiles();
       const sessionSnapRemoved = cleanupStaleSessionSnapshots();
       const inboxCleanup = cleanupInboxFiles();
@@ -282,7 +287,7 @@ export function startMaintenanceLoop(): void {
         logger.info({ removed: inboxCleanup.removed, reclaimedBytes: inboxCleanup.reclaimedBytes }, 'Cleaned up group inbox files');
       }
 
-      if (memResult.expired > 0 || memResult.pruned > 0 || memResult.decayed > 0 || traceRemoved > 0 || ipcRemoved > 0 || ipcErrorsRemoved > 0 || queuePurged > 0 || jobsPurged > 0 || logsPurged > 0 || auditPurged > 0 || tracesPurged > 0 || feedbackPurged > 0 || cidRemoved > 0 || sessionSnapRemoved > 0 || inboxCleanup.removed > 0) {
+      if (memResult.expired > 0 || memResult.pruned > 0 || memResult.decayed > 0 || traceRemoved > 0 || ipcRemoved > 0 || ipcErrorsRemoved > 0 || queuePurged > 0 || jobsPurged > 0 || logsPurged > 0 || auditPurged > 0 || tracesPurged > 0 || feedbackPurged > 0 || workflowsPurged > 0 || cidRemoved > 0 || sessionSnapRemoved > 0 || inboxCleanup.removed > 0) {
         logger.info({
           expired: memResult.expired,
           pruned: memResult.pruned,
@@ -297,6 +302,7 @@ export function startMaintenanceLoop(): void {
           auditPurged,
           tracesPurged,
           feedbackPurged,
+          workflowsPurged,
           cidRemoved,
           sessionSnapRemoved,
           inboxFilesRemoved: inboxCleanup.removed,

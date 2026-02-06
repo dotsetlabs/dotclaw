@@ -59,3 +59,55 @@ test('loadRuntimeConfig allows overriding container privileged mode', async () =
     assert.equal(config.host.container.privileged, false);
   });
 });
+
+test('validation clamps invalid negative timeouts to safe defaults', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-runtime-val-'));
+  const configDir = path.join(tempDir, 'config');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  const runtimePayload = {
+    host: {
+      scheduler: { pollIntervalMs: -100 },
+      container: { timeoutMs: 0 },
+      concurrency: { maxAgents: 0 },
+      maintenance: { intervalMs: -1 },
+      backgroundJobs: { maxConcurrent: -5 }
+    },
+    hooks: { maxConcurrent: 0 }
+  };
+  fs.writeFileSync(path.join(configDir, 'runtime.json'), JSON.stringify(runtimePayload, null, 2));
+
+  await withTempHome(tempDir, async () => {
+    const { loadRuntimeConfig } = await importFresh(distPath('runtime-config.js'));
+    const config = loadRuntimeConfig();
+    assert.ok(config.host.scheduler.pollIntervalMs >= 1000, 'pollIntervalMs should be clamped to >= 1000');
+    assert.ok(config.host.container.timeoutMs >= 1000, 'container timeoutMs should be clamped to >= 1000');
+    assert.ok(config.host.concurrency.maxAgents >= 1, 'maxAgents should be clamped to >= 1');
+    assert.ok(config.host.maintenance.intervalMs >= 60000, 'maintenance intervalMs should be clamped to >= 60000');
+    assert.ok(config.host.backgroundJobs.maxConcurrent >= 1, 'backgroundJobs maxConcurrent should be clamped to >= 1');
+    assert.ok(config.hooks.maxConcurrent >= 1, 'hooks maxConcurrent should be clamped to >= 1');
+  });
+});
+
+test('validation clamps invalid container mode to daemon', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-runtime-mode-'));
+  const configDir = path.join(tempDir, 'config');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  const runtimePayload = {
+    host: {
+      container: {
+        mode: 'invalid'
+      }
+    }
+  };
+  fs.writeFileSync(path.join(configDir, 'runtime.json'), JSON.stringify(runtimePayload, null, 2));
+
+  await withTempHome(tempDir, async () => {
+    const { loadRuntimeConfig } = await importFresh(distPath('runtime-config.js'));
+    const config = loadRuntimeConfig();
+    // mergeDefaults only applies overrides when typeof matches, so 'invalid' is a string
+    // like 'daemon', but validateRuntimeConfig should correct it to 'daemon'
+    assert.equal(config.host.container.mode, 'daemon', 'Invalid container mode should be clamped to daemon');
+  });
+});

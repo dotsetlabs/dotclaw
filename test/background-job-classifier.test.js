@@ -30,7 +30,7 @@ async function withClassifierConfig(tempDir, fn) {
           enabled: true,
           classifier: {
             enabled: true,
-            model: 'openai/gpt-5-nano',
+            model: 'deepseek/deepseek-v3.2',
             timeoutMs: 3000,
             maxOutputTokens: 32,
             temperature: 0,
@@ -182,7 +182,7 @@ test('classifyBackgroundJob adapts threshold based on queue depth', async () => 
           enabled: true,
           classifier: {
             enabled: true,
-            model: 'openai/gpt-5-nano',
+            model: 'deepseek/deepseek-v3.2',
             timeoutMs: 3000,
             maxOutputTokens: 32,
             temperature: 0,

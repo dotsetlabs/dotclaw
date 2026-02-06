@@ -21,6 +21,7 @@ import { recordBackgroundJobRun } from './metrics.js';
 import { loadModelRegistry } from './model-registry.js';
 import { logger } from './logger.js';
 import { generateId } from './id.js';
+import { emitHook } from './hooks.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -309,6 +310,7 @@ async function runBackgroundJob(job: BackgroundJob, deps: BackgroundJobDependenc
         disableResponseValidation,
         responseValidationMaxRetries,
         disableMemoryExtraction,
+        profile: 'background',
         timeoutMs
       });
       output = execution.output;
@@ -565,6 +567,14 @@ export function spawnBackgroundJob(params: {
     level: 'info',
     message: 'Background job queued',
     data_json: null
+  });
+
+  void emitHook('job:spawned', {
+    job_id: jobId,
+    group_folder: params.groupFolder,
+    prompt: params.prompt.slice(0, 200),
+    context_mode: contextMode,
+    model_override: params.modelOverride
   });
 
   return { ok: true, jobId };

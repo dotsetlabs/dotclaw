@@ -115,7 +115,7 @@ registry.registerMetric(responseLatency);
 registry.registerMetric(stageLatency);
 registry.registerMetric(classifierThreshold);
 
-export function recordMessage(source: 'telegram' | 'scheduler'): void {
+export function recordMessage(source: string): void {
   messagesTotal.inc({ source });
 }
 
@@ -144,34 +144,34 @@ export function recordLatency(ms: number): void {
   if (Number.isFinite(ms)) responseLatency.observe(ms);
 }
 
-export function recordStageLatency(stage: string, ms: number, source: 'telegram' | 'scheduler' | 'background' = 'telegram'): void {
+export function recordStageLatency(stage: string, ms: number, source: string = 'telegram'): void {
   if (!stage || !Number.isFinite(ms)) return;
   stageLatency.observe({ stage, source }, ms);
 }
 
-export function recordClassifierThreshold(source: 'telegram' | 'scheduler', threshold: number): void {
+export function recordClassifierThreshold(source: string, threshold: number): void {
   if (!Number.isFinite(threshold)) return;
   classifierThreshold.set({ source }, threshold);
 }
 
-export function recordTokenUsage(model: string, source: 'telegram' | 'scheduler', promptTokens: number, completionTokens: number): void {
+export function recordTokenUsage(model: string, source: string, promptTokens: number, completionTokens: number): void {
   if (Number.isFinite(promptTokens)) tokensPromptTotal.inc({ model, source }, promptTokens);
   if (Number.isFinite(completionTokens)) tokensCompletionTotal.inc({ model, source }, completionTokens);
 }
 
-export function recordCost(model: string, source: 'telegram' | 'scheduler', costUsd: number): void {
+export function recordCost(model: string, source: string, costUsd: number): void {
   if (Number.isFinite(costUsd)) costTotal.inc({ model, source }, costUsd);
 }
 
-export function recordMemoryRecall(source: 'telegram' | 'scheduler', count: number): void {
+export function recordMemoryRecall(source: string, count: number): void {
   if (Number.isFinite(count)) memoryRecallTotal.inc({ source }, count);
 }
 
-export function recordMemoryUpsert(source: 'telegram' | 'scheduler', count: number): void {
+export function recordMemoryUpsert(source: string, count: number): void {
   if (Number.isFinite(count)) memoryUpsertTotal.inc({ source }, count);
 }
 
-export function recordMemoryExtract(source: 'telegram' | 'scheduler', count: number): void {
+export function recordMemoryExtract(source: string, count: number): void {
   if (Number.isFinite(count)) memoryExtractTotal.inc({ source }, count);
 }
 

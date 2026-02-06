@@ -36,39 +36,71 @@ function pruneQueryCache(): void {
   }
 }
 
-async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    throw new Error('OPENROUTER_API_KEY is not set');
-  }
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json'
+// --- Embedding Provider Abstraction ---
+
+interface EmbeddingProvider {
+  embed(texts: string[]): Promise<number[][]>;
+}
+
+let cachedProvider: EmbeddingProvider | null = null;
+
+function getOpenRouterProvider(): EmbeddingProvider {
+  return {
+    async embed(texts: string[]): Promise<number[][]> {
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      if (!apiKey) {
+        throw new Error('OPENROUTER_API_KEY is not set');
+      }
+      const headers: Record<string, string> = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      };
+      if (config.openrouterSiteUrl) {
+        headers['HTTP-Referer'] = config.openrouterSiteUrl;
+      }
+      if (config.openrouterSiteName) {
+        headers['X-Title'] = config.openrouterSiteName;
+      }
+      const response = await fetch(`${config.openrouterBaseUrl}/embeddings`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: EMBEDDING_MODEL,
+          input: texts
+        }),
+        signal: AbortSignal.timeout(30_000)
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        throw new Error(`OpenRouter embeddings error ${response.status}: ${body.slice(0, 300)}`);
+      }
+      const payload = JSON.parse(body) as { data?: Array<{ embedding?: number[] }> };
+      if (!Array.isArray(payload.data)) {
+        throw new Error('OpenRouter embeddings response missing data');
+      }
+      return payload.data.map(item => Array.isArray(item.embedding) ? item.embedding : []);
+    }
   };
-  if (config.openrouterSiteUrl) {
-    headers['HTTP-Referer'] = config.openrouterSiteUrl;
+}
+
+async function getLocalProvider(): Promise<EmbeddingProvider> {
+  const { LocalEmbeddingProvider } = await import('./local-embeddings.js');
+  return new LocalEmbeddingProvider(config.localModel);
+}
+
+async function getProvider(): Promise<EmbeddingProvider> {
+  if (cachedProvider) return cachedProvider;
+  if (config.provider === 'local') {
+    cachedProvider = await getLocalProvider();
+  } else {
+    cachedProvider = getOpenRouterProvider();
   }
-  if (config.openrouterSiteName) {
-    headers['X-Title'] = config.openrouterSiteName;
-  }
-  const response = await fetch(`${config.openrouterBaseUrl}/embeddings`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: EMBEDDING_MODEL,
-      input: texts
-    }),
-    signal: AbortSignal.timeout(30_000)
-  });
-  const body = await response.text();
-  if (!response.ok) {
-    throw new Error(`OpenRouter embeddings error ${response.status}: ${body.slice(0, 300)}`);
-  }
-  const payload = JSON.parse(body) as { data?: Array<{ embedding?: number[] }> };
-  if (!Array.isArray(payload.data)) {
-    throw new Error('OpenRouter embeddings response missing data');
-  }
-  return payload.data.map(item => Array.isArray(item.embedding) ? item.embedding : []);
+  return cachedProvider;
+}
+
+async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
+  const provider = await getProvider();
+  return provider.embed(texts);
 }
 
 async function fetchEmbeddingsWithRetry(texts: string[], maxRetries = 2): Promise<number[][]> {
@@ -148,10 +180,14 @@ export function startEmbeddingWorker(): void {
   loop();
 }
 
-export function stopEmbeddingWorker(): void {
+export async function stopEmbeddingWorker(): Promise<void> {
   embeddingWorkerStopped = true;
   if (embeddingTimer) {
     clearTimeout(embeddingTimer);
     embeddingTimer = null;
   }
+  if (cachedProvider && 'dispose' in cachedProvider && typeof (cachedProvider as { dispose: () => Promise<void> }).dispose === 'function') {
+    await (cachedProvider as { dispose: () => Promise<void> }).dispose();
+  }
+  cachedProvider = null;
 }

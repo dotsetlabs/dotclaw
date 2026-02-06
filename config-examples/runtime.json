@@ -38,7 +38,7 @@
         "onToolLimit": true,
         "classifier": {
           "enabled": true,
-          "model": "openai/gpt-5-nano",
+          "model": "deepseek/deepseek-v3.2",
           "timeoutMs": 3000,
           "maxOutputTokens": 32,
           "temperature": 0,
@@ -67,7 +67,7 @@
       },
       "plannerProbe": {
         "enabled": true,
-        "model": "openai/gpt-5-nano",
+        "model": "deepseek/deepseek-v3.2",
         "timeoutMs": 3000,
         "maxOutputTokens": 120,
         "temperature": 0,
@@ -77,7 +77,7 @@
       },
       "profiles": {
         "fast": {
-          "model": "openai/gpt-5-nano",
+          "model": "deepseek/deepseek-v3.2",
           "maxOutputTokens": 4096,
           "maxToolSteps": 12,
           "recallMaxResults": 0,
@@ -90,7 +90,7 @@
           "progress": { "enabled": false }
         },
         "standard": {
-          "model": "openai/gpt-5-mini",
+          "model": "moonshotai/kimi-k2.5",
           "maxOutputTokens": 4096,
           "maxToolSteps": 48,
           "recallMaxResults": 6,

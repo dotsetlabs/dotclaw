@@ -408,7 +408,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
     },
 
     async runTask(taskId: string) {
-      return requestResponse('run_task', { task_id: taskId }, config);
+      return requestResponse('run_task', { task_id: taskId }, config, 900_000);
     },
 
     async spawnJob(args: {
@@ -500,6 +500,38 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
         userId: args.userId,
         target_group: args.target_group
       }, config);
+    },
+
+    async orchestrate(args: {
+      tasks: Array<{
+        name: string;
+        prompt: string;
+        model_override?: string;
+        timeout_ms?: number;
+        tool_allow?: string[];
+        tool_deny?: string[];
+      }>;
+      max_concurrent?: number;
+      timeout_ms?: number;
+      aggregation_prompt?: string;
+    }) {
+      return requestResponse('orchestrate', args as Record<string, unknown>, config, args.timeout_ms || 600_000);
+    },
+
+    async workflowStart(args: { name: string; params?: Record<string, unknown> }) {
+      return requestResponse('workflow_start', args as Record<string, unknown>, config);
+    },
+
+    async workflowStatus(args: { run_id: string }) {
+      return requestResponse('workflow_status', args as Record<string, unknown>, config);
+    },
+
+    async workflowCancel(args: { run_id: string }) {
+      return requestResponse('workflow_cancel', args as Record<string, unknown>, config);
+    },
+
+    async workflowList(args: { status?: string; limit?: number }) {
+      return requestResponse('workflow_list', args as Record<string, unknown>, config);
     }
   };
 }

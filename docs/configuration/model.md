@@ -13,8 +13,8 @@ Model selection is stored in `~/.dotclaw/config/model.json`.
   "model": "moonshotai/kimi-k2.5",
   "allowlist": [
     "moonshotai/kimi-k2.5",
-    "openai/gpt-5-mini",
-    "openai/gpt-5-nano"
+    "deepseek/deepseek-v3.2",
+    "google/gemini-2.5-flash"
   ],
   "overrides": {
     "moonshotai/kimi-k2.5": {
@@ -23,10 +23,10 @@ Model selection is stored in `~/.dotclaw/config/model.json`.
     }
   },
   "per_group": {
-    "main": { "model": "openai/gpt-5-mini" }
+    "main": { "model": "deepseek/deepseek-v3.2" }
   },
   "per_user": {
-    "123456789": { "model": "openai/gpt-5-nano" }
+    "123456789": { "model": "moonshotai/kimi-k2.5" }
   },
   "updated_at": "2026-02-04T00:00:00.000Z"
 }
@@ -46,8 +46,8 @@ Model selection is stored in `~/.dotclaw/config/model.json`.
 
 ```
 set model to moonshotai/kimi-k2.5
-set model to openai/gpt-5-mini for group main
-set model to openai/gpt-5-nano for user 123456789
+set model to deepseek/deepseek-v3.2 for group main
+set model to moonshotai/kimi-k2.5 for user 123456789
 ```
 
 ## Per-request routing

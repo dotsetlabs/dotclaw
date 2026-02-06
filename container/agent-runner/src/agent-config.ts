@@ -113,6 +113,34 @@ export type AgentRuntimeConfig = {
       tokensPerMessage: number;
       tokensPerRequest: number;
     };
+    tts: {
+      enabled: boolean;
+      model: string;
+      baseUrl: string;
+      defaultVoice: string;
+    };
+    browser: {
+      enabled: boolean;
+      timeoutMs: number;
+      screenshotQuality: number;
+    };
+    mcp: {
+      enabled: boolean;
+      servers: Array<{
+        name: string;
+        transport: 'stdio';
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        url?: string;
+      }>;
+      connectionTimeoutMs: number;
+    };
+    skills: {
+      enabled: boolean;
+      maxSkills: number;
+      maxSummaryChars: number;
+    };
   };
 };
 
@@ -126,8 +154,8 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
   openrouter: {
     timeoutMs: 180_000,
     retry: true,
-    siteUrl: '',
-    siteName: ''
+    siteUrl: 'https://github.com/dotsetlabs/dotclaw',
+    siteName: 'DotClaw'
   },
   promptPacks: {
     enabled: true,
@@ -158,11 +186,11 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     extractScheduled: false
   },
   models: {
-    summary: 'openai/gpt-5-nano',
-    memory: 'openai/gpt-5-mini',
-    planner: 'openai/gpt-5-nano',
-    responseValidation: 'openai/gpt-5-nano',
-    toolSummary: 'openai/gpt-5-nano'
+    summary: 'deepseek/deepseek-v3.2',
+    memory: 'deepseek/deepseek-v3.2',
+    planner: 'deepseek/deepseek-v3.2',
+    responseValidation: 'deepseek/deepseek-v3.2',
+    toolSummary: 'deepseek/deepseek-v3.2'
   },
   planner: {
     enabled: true,
@@ -222,13 +250,34 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     }
   },
   ipc: {
-    requestTimeoutMs: 6000,
+    requestTimeoutMs: 30_000,
     requestPollMs: 150
   },
   tokenEstimate: {
     tokensPerChar: 0.25,
     tokensPerMessage: 3,
     tokensPerRequest: 0
+  },
+  tts: {
+    enabled: true,
+    model: 'edge-tts',
+    baseUrl: '',
+    defaultVoice: 'en-US-AriaNeural'
+  },
+  browser: {
+    enabled: true,
+    timeoutMs: 30_000,
+    screenshotQuality: 80
+  },
+  mcp: {
+    enabled: false,
+    servers: [],
+    connectionTimeoutMs: 10_000
+  },
+  skills: {
+    enabled: true,
+    maxSkills: 32,
+    maxSummaryChars: 4000,
   }
 };
 

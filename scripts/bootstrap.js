@@ -248,23 +248,57 @@ async function main() {
     console.log(`If you encounter permission errors, run: sudo chown -R $USER ${DOTCLAW_HOME}`);
   }
 
-  console.log('\nNow register your main chat.');
-  console.log('If you do not know your Telegram chat ID, use @userinfobot or @get_id_bot in Telegram.\n');
+  // Determine which providers are enabled from runtime config
+  const providerConfig = loadRuntimeConfig();
+  const telegramEnabled = providerConfig?.host?.telegram?.enabled !== false;
+  const discordEnabled = providerConfig?.host?.discord?.enabled === true;
+
+  console.log('\nNow register your main chat.\n');
 
   let chatId = '';
   let name = 'main';
   let folder = 'main';
+  let provider = 'telegram';
 
   if (nonInteractive) {
     chatId = requireEnv('DOTCLAW_BOOTSTRAP_CHAT_ID');
     name = process.env.DOTCLAW_BOOTSTRAP_GROUP_NAME || 'main';
     folder = process.env.DOTCLAW_BOOTSTRAP_GROUP_FOLDER || 'main';
+
+    // Auto-detect provider from env or tokens
+    const explicitProvider = (process.env.DOTCLAW_BOOTSTRAP_PROVIDER || '').toLowerCase();
+    if (explicitProvider === 'discord' || explicitProvider === 'telegram') {
+      provider = explicitProvider;
+    } else if (discordEnabled && !telegramEnabled) {
+      provider = 'discord';
+    } else {
+      provider = 'telegram';
+    }
+
     if (!isSafeFolder(folder)) {
       console.error('DOTCLAW_BOOTSTRAP_GROUP_FOLDER must be lowercase letters, numbers, and hyphens only.');
       process.exit(1);
     }
   } else {
-    chatId = await prompt('Telegram chat ID');
+    // Ask for provider if both are enabled
+    if (telegramEnabled && discordEnabled) {
+      const providerChoice = await prompt('Register a channel for which provider?\n  1. Telegram\n  2. Discord\nChoice', '1');
+      provider = providerChoice === '2' ? 'discord' : 'telegram';
+    } else if (discordEnabled) {
+      provider = 'discord';
+    } else {
+      provider = 'telegram';
+    }
+
+    if (provider === 'discord') {
+      console.log('To find your channel ID: Right-click the channel → Copy Channel ID.');
+      console.log('(Enable Developer Mode in Discord Settings → App Settings → Advanced if needed.)\n');
+      chatId = await prompt('Discord channel ID');
+    } else {
+      console.log('To find your chat ID: Add @userinfobot or @get_id_bot in Telegram.\n');
+      chatId = await prompt('Telegram chat ID');
+    }
+
     if (!chatId) {
       console.error('Chat ID is required to register the main group.');
       process.exit(1);
@@ -276,8 +310,10 @@ async function main() {
       folder = await prompt('Folder name (lowercase, hyphens)', 'main');
     }
   }
+
+  const prefixedId = provider === 'discord' ? `discord:${chatId}` : `telegram:${chatId}`;
   const groups = loadJson(REGISTERED_GROUPS, {});
-  groups[String(chatId)] = {
+  groups[prefixedId] = {
     name,
     folder,
     added_at: new Date().toISOString()

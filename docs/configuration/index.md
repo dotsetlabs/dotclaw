@@ -10,7 +10,7 @@ DotClaw splits configuration between secret environment variables and runtime JS
 
 | File | Purpose |
 | --- | --- |
-| `~/.dotclaw/.env` | Secrets for Telegram, OpenRouter, and optional Brave Search |
+| `~/.dotclaw/.env` | Secrets: Telegram token, Discord token, OpenRouter key, Brave Search key |
 | `~/.dotclaw/config/runtime.json` | Non-secret runtime overrides |
 | `~/.dotclaw/config/model.json` | Active model, allowlist, and overrides |
 | `~/.dotclaw/config/tool-policy.json` | Tool allow/deny rules |

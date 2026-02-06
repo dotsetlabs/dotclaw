@@ -95,7 +95,7 @@ Container mount allowlist lives outside the repo:
 
 `~/.config/dotclaw/mount-allowlist.json`
 
-`dotclaw setup` (or `npm run init`) creates a locked-down template with
+`dotclaw setup` creates a locked-down template with
 empty `allowedRoots`. Edit it to enable additional mounts.
 
 Example:
@@ -110,11 +110,27 @@ Example:
 }
 ```
 
+## Standard coding tools
+
+The agent has access to the following coding tools:
+
+- `Read` — Read file contents
+- `Write` — Write files
+- `Edit` — Replace text in files
+- `Glob` — Search for files by name pattern
+- `Grep` — Search file contents by regex
+- `Bash` — Run shell commands
+- `Python` — Execute Python code (sandboxed inside the container)
+- `WebSearch` — Search the web via Brave Search API
+- `WebFetch` — Fetch and extract content from a URL
+- `GitClone` — Clone a git repository
+- `NpmInstall` — Install npm packages
+
 ## Built-in DotClaw tools
 
 DotClaw injects MCP tools prefixed with `mcp__dotclaw__...` in addition to standard coding tools.
 
-Telegram output tools:
+Messaging output tools:
 
 - `mcp__dotclaw__send_message`
 - `mcp__dotclaw__send_file`
@@ -146,10 +162,31 @@ Background jobs:
 - `mcp__dotclaw__cancel_job`
 - `mcp__dotclaw__job_update`
 
+Orchestration:
+
+- `mcp__dotclaw__orchestrate`
+
+Workflows:
+
+- `mcp__dotclaw__workflow_start`
+- `mcp__dotclaw__workflow_status`
+- `mcp__dotclaw__workflow_cancel`
+- `mcp__dotclaw__workflow_list`
+
 Memory:
 
 - `mcp__dotclaw__memory_upsert`
 - `mcp__dotclaw__memory_search`
+- `mcp__dotclaw__memory_list`
+- `mcp__dotclaw__memory_forget`
+- `mcp__dotclaw__memory_stats`
+
+Group management (main group only):
+
+- `mcp__dotclaw__register_group`
+- `mcp__dotclaw__remove_group`
+- `mcp__dotclaw__list_groups`
+- `mcp__dotclaw__set_model`
 
 Utility:
 

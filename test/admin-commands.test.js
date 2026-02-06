@@ -108,9 +108,9 @@ test('parseAdminCommand returns null for non-command text', async () => {
 test('parseAdminCommand handles model shorthand', async () => {
   const { parseAdminCommand } = await importFresh(distPath('admin-commands.js'));
 
-  const model = parseAdminCommand('/dotclaw model openai/gpt-5-mini', 'dotclaw_bot');
+  const model = parseAdminCommand('/dotclaw model deepseek/deepseek-v3.2', 'dotclaw_bot');
   assert.equal(model.command, 'set-model');
-  assert.deepEqual(model.args, ['openai/gpt-5-mini']);
+  assert.deepEqual(model.args, ['deepseek/deepseek-v3.2']);
 });
 
 test('parseAdminCommand handles add group with natural language', async () => {
@@ -131,7 +131,7 @@ test('parseAdminCommand handles bot mention with @suffix', async () => {
 test('parseAdminCommand handles set-model with scope', async () => {
   const { parseAdminCommand } = await importFresh(distPath('admin-commands.js'));
 
-  const cmd = parseAdminCommand('/dotclaw set-model openai/gpt-5-mini group main', 'dotclaw_bot');
+  const cmd = parseAdminCommand('/dotclaw set-model deepseek/deepseek-v3.2 group main', 'dotclaw_bot');
   assert.equal(cmd.command, 'set-model');
-  assert.deepEqual(cmd.args, ['openai/gpt-5-mini', 'group', 'main']);
+  assert.deepEqual(cmd.args, ['deepseek/deepseek-v3.2', 'group', 'main']);
 });

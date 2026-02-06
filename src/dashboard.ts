@@ -68,13 +68,17 @@ interface CanaryStats {
   status: 'testing' | 'promoted' | 'rolled_back';
 }
 
-let telegramConnected = false;
+const providerStatus = new Map<string, boolean>();
 let lastMessageTime: string | null = null;
 let messageQueueDepth = 0;
 let server: http.Server | null = null;
 
+export function setProviderConnected(name: string, connected: boolean): void {
+  providerStatus.set(name, connected);
+}
+
 export function setTelegramConnected(connected: boolean): void {
-  telegramConnected = connected;
+  setProviderConnected('telegram', connected);
 }
 
 export function setLastMessageTime(time: string): void {
@@ -211,11 +215,15 @@ function checkContainerHealth(): HealthStatus['container'] {
 }
 
 function checkTelegramHealth(): HealthStatus['telegram'] {
-  // This is set by the main process
+  const connected = providerStatus.get('telegram') ?? false;
   return {
-    status: telegramConnected ? 'ok' : 'unknown',
-    connected: telegramConnected
+    status: connected ? 'ok' : 'unknown',
+    connected
   };
+}
+
+export function getProviderHealthStatuses(): Array<{ name: string; connected: boolean }> {
+  return Array.from(providerStatus.entries()).map(([name, connected]) => ({ name, connected }));
 }
 
 async function checkOpenRouterHealth(): Promise<HealthStatus['openrouter']> {

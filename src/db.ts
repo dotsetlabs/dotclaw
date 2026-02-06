@@ -48,6 +48,7 @@ export function initDatabase(): void {
       content TEXT,
       timestamp TEXT,
       is_from_me INTEGER,
+      attachments_json TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -61,12 +62,14 @@ export function initDatabase(): void {
       schedule_type TEXT NOT NULL,
       schedule_value TEXT NOT NULL,
       timezone TEXT,
+      context_mode TEXT DEFAULT 'isolated',
       next_run TEXT,
       last_run TEXT,
       last_result TEXT,
       state_json TEXT,
       retry_count INTEGER DEFAULT 0,
       last_error TEXT,
+      running_since TEXT,
       status TEXT DEFAULT 'active',
       created_at TEXT NOT NULL
     );
@@ -207,27 +210,48 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_mq_chat_status ON message_queue(chat_jid, status);
   `);
 
-  // Add columns if they don't exist (migrations for existing DBs).
-  // Only suppress "duplicate column" errors; re-throw anything else.
-  const addColumnIfMissing = (sql: string) => {
-    try {
-      db.exec(sql);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('duplicate column')) throw err;
-    }
-  };
+  // Chat JID prefix migration: add 'telegram:' prefix to all existing unprefixed IDs
+  migrateChatJidPrefixes();
+}
 
-  addColumnIfMissing(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
-  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`);
-  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN state_json TEXT`);
-  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
-  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
-  addColumnIfMissing(`ALTER TABLE tool_audit ADD COLUMN user_id TEXT`);
-  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN running_since TEXT`);
-  addColumnIfMissing(`ALTER TABLE scheduled_tasks ADD COLUMN timezone TEXT`);
-  addColumnIfMissing(`ALTER TABLE message_queue ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0`);
-  addColumnIfMissing(`ALTER TABLE messages ADD COLUMN attachments_json TEXT`);
+function migrateChatJidPrefixes(): void {
+  // Create migration metadata table if needed
+  db.exec(`CREATE TABLE IF NOT EXISTS _migrations (key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`);
+
+  const row = db.prepare(`SELECT key FROM _migrations WHERE key = 'chat_jid_prefix_v1'`).get();
+  if (row) return; // Already migrated
+
+  // Check if there are any unprefixed chat IDs (IDs that don't contain ':')
+  const unprefixed = db.prepare(`SELECT COUNT(*) as cnt FROM chats WHERE jid NOT LIKE '%:%'`).get() as { cnt: number };
+  if (unprefixed.cnt === 0) {
+    // No unprefixed IDs — mark as done and skip
+    db.prepare(`INSERT INTO _migrations (key, applied_at) VALUES (?, ?)`).run('chat_jid_prefix_v1', new Date().toISOString());
+    return;
+  }
+
+  // Disable FK checks during migration — we're updating both parent (chats.jid)
+  // and child (messages.chat_jid) tables, and SQLite enforces FKs per-statement.
+  db.pragma('foreign_keys = OFF');
+  const migrate = db.transaction(() => {
+    // Prefix all tables with chat_jid / jid columns
+    db.exec(`UPDATE chats SET jid = 'telegram:' || jid WHERE jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE messages SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE chat_state SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE message_queue SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE scheduled_tasks SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE background_jobs SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE tool_audit SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid IS NOT NULL AND chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE user_feedback SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid IS NOT NULL AND chat_jid NOT LIKE '%:%'`);
+    db.exec(`UPDATE message_traces SET chat_jid = 'telegram:' || chat_jid WHERE chat_jid NOT LIKE '%:%'`);
+
+    db.prepare(`INSERT INTO _migrations (key, applied_at) VALUES (?, ?)`).run('chat_jid_prefix_v1', new Date().toISOString());
+  });
+
+  try {
+    migrate();
+  } finally {
+    db.pragma('foreign_keys = ON');
+  }
 }
 
 /**
@@ -406,15 +430,6 @@ export function deleteTask(id: string): void {
     db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
     db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
   })();
-}
-
-export function getDueTasks(): ScheduledTask[] {
-  const now = new Date().toISOString();
-  return db.prepare(`
-    SELECT * FROM scheduled_tasks
-    WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?
-    ORDER BY next_run
-  `).all(now) as ScheduledTask[];
 }
 
 export function claimDueTasks(): ScheduledTask[] {
@@ -861,52 +876,6 @@ export function recordUserFeedback(feedback: Omit<UserFeedback, 'id' | 'created_
     now
   );
   return id;
-}
-
-/**
- * Get feedback for a trace
- */
-export function getFeedbackForTrace(traceId: string): UserFeedback | null {
-  if (!dbInitialized) initDatabase();
-  const row = db.prepare(`
-    SELECT * FROM user_feedback
-    WHERE trace_id = ?
-    ORDER BY created_at DESC
-    LIMIT 1
-  `).get(traceId) as UserFeedback | undefined;
-  return row ?? null;
-}
-
-/**
- * Get recent feedback for analytics
- */
-export function getRecentFeedback(params: {
-  chatJid?: string;
-  limit?: number;
-  since?: string;
-}): UserFeedback[] {
-  if (!dbInitialized) initDatabase();
-  const limit = params.limit || 100;
-  const clauses: string[] = [];
-  const values: unknown[] = [];
-
-  if (params.chatJid) {
-    clauses.push('chat_jid = ?');
-    values.push(params.chatJid);
-  }
-  if (params.since) {
-    clauses.push('created_at >= ?');
-    values.push(params.since);
-  }
-
-  const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-  const sql = `
-    SELECT * FROM user_feedback
-    ${whereClause}
-    ORDER BY created_at DESC
-    LIMIT ?
-  `;
-  return db.prepare(sql).all(...values, limit) as UserFeedback[];
 }
 
 // ── Message Queue Functions ──────────────────────────────────────────

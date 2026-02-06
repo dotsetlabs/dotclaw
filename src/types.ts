@@ -29,7 +29,7 @@ export interface AllowedRoot {
 
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
-  timeout?: number;  // Default: 300000 (5 minutes)
+  timeout?: number;  // Falls back to container.timeoutMs (default: 900000 / 15 minutes)
   env?: Record<string, string>;
 }
 
@@ -47,8 +47,7 @@ export interface Session {
 
 export interface MessageAttachment {
   type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
-  file_id: string;
-  file_unique_id: string;
+  provider_file_ref?: string;   // Opaque file reference (Telegram file_id, Discord URL)
   file_name?: string;
   mime_type?: string;
   file_size?: number;
@@ -56,6 +55,7 @@ export interface MessageAttachment {
   duration?: number;
   width?: number;
   height?: number;
+  transcript?: string;
 }
 
 export interface NewMessage {
@@ -141,14 +141,6 @@ export interface BackgroundJobEvent {
   level: 'info' | 'progress' | 'warn' | 'error';
   message: string;
   data_json?: string | null;
-}
-
-export interface ToolCallRecord {
-  name: string;
-  args?: unknown;
-  ok: boolean;
-  duration_ms?: number;
-  error?: string;
 }
 
 export interface TokenEstimateConfig {

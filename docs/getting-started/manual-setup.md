@@ -57,7 +57,7 @@ Edit `~/.dotclaw/config/runtime.json` to tune container behavior, memory, tools,
 
 ## 6. Register your main chat
 
-Find your Telegram chat ID by messaging your bot and using @userinfobot or @get_id_bot. You can register it using the CLI:
+Find your chat ID. For Telegram, message your bot and use @userinfobot or @get_id_bot. For Discord, enable Developer Mode in settings, then right-click a channel and copy the ID. Register using the CLI:
 
 ```bash
 dotclaw register
@@ -67,7 +67,7 @@ Or manually add it to `~/.dotclaw/data/registered_groups.json`:
 
 ```json
 {
-  "-123456789": {
+  "telegram:-123456789": {
     "name": "family-chat",
     "folder": "family-chat",
     "added_at": "2026-02-04T00:00:00.000Z"

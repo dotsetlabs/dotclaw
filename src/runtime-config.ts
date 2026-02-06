@@ -38,6 +38,7 @@ export type RuntimeConfig = {
       runUid: string;
       runGid: string;
       instanceId: string;
+      daemonHeartbeatIntervalMs: number;
       daemon: {
         heartbeatMaxAgeMs: number;
         healthCheckIntervalMs: number;
@@ -81,7 +82,9 @@ export type RuntimeConfig = {
       };
       embeddings: {
         enabled: boolean;
+        provider: 'openrouter' | 'local';
         model: string;
+        localModel: string;
         batchSize: number;
         minItems: number;
         minQueryChars: number;
@@ -104,11 +107,31 @@ export type RuntimeConfig = {
       };
       personalizationCacheMs: number;
     };
+    voice: {
+      transcription: {
+        enabled: boolean;
+        model: string;
+        baseUrl: string;
+        language: string;
+        maxDurationSec: number;
+      };
+      tts: {
+        enabled: boolean;
+        model: string;
+        baseUrl: string;
+        defaultVoice: string;
+      };
+    };
     telegram: {
+      enabled: boolean;
       handlerTimeoutMs: number;
       sendRetries: number;
       sendRetryDelayMs: number;
-      inputMessageMaxChars: number;
+    };
+    discord: {
+      enabled: boolean;
+      sendRetries: number;
+      sendRetryDelayMs: number;
     };
     progress: {
       enabled: boolean;
@@ -166,13 +189,8 @@ export type RuntimeConfig = {
       enabled: boolean;
       maxFastChars: number;
       maxStandardChars: number;
-      backgroundMinChars: number;
-      fastKeywords: string[];
-      deepKeywords: string[];
-      backgroundKeywords: string[];
       classifierFallback: {
         enabled: boolean;
-        minChars: number;
       };
       plannerProbe: {
         enabled: boolean;
@@ -183,6 +201,12 @@ export type RuntimeConfig = {
         minChars: number;
         minSteps: number;
         minTools: number;
+      };
+      toolIntentProbe: {
+        enabled: boolean;
+        model: string;
+        timeoutMs: number;
+        maxOutputTokens: number;
       };
       profiles: Record<string, {
         model: string;
@@ -325,6 +349,46 @@ export type RuntimeConfig = {
       tokensPerMessage: number;
       tokensPerRequest: number;
     };
+    tts: {
+      enabled: boolean;
+      model: string;
+      baseUrl: string;
+      defaultVoice: string;
+    };
+    browser: {
+      enabled: boolean;
+      timeoutMs: number;
+      screenshotQuality: number;
+    };
+    mcp: {
+      enabled: boolean;
+      servers: Array<{
+        name: string;
+        transport: 'stdio';
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        url?: string;
+      }>;
+      connectionTimeoutMs: number;
+    };
+    skills: {
+      enabled: boolean;
+      maxSkills: number;
+      maxSummaryChars: number;
+      installEnabled: boolean;
+    };
+  };
+  hooks: {
+    enabled: boolean;
+    scripts: Array<{
+      event: string;
+      command: string;
+      blocking: boolean;
+      timeoutMs: number;
+    }>;
+    maxConcurrent: number;
+    defaultTimeoutMs: number;
   };
 };
 
@@ -367,6 +431,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       runUid: typeof process.getuid === 'function' ? String(process.getuid()) : '',
       runGid: typeof process.getgid === 'function' ? String(process.getgid()) : '',
       instanceId: '',
+      daemonHeartbeatIntervalMs: 1_000,
       daemon: {
         heartbeatMaxAgeMs: 30_000,
         healthCheckIntervalMs: 20_000,
@@ -410,7 +475,9 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       },
       embeddings: {
         enabled: true,
+        provider: 'local',
         model: 'openai/text-embedding-3-small',
+        localModel: 'Xenova/all-MiniLM-L6-v2',
         batchSize: 8,
         minItems: 50,
         minQueryChars: 40,
@@ -421,8 +488,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         queryCacheTtlMs: 600_000,
         queryCacheMax: 200,
         openrouterBaseUrl: 'https://openrouter.ai/api/v1',
-        openrouterSiteUrl: '',
-        openrouterSiteName: ''
+        openrouterSiteUrl: 'https://github.com/dotsetlabs/dotclaw',
+        openrouterSiteName: 'DotClaw'
       },
       maintenance: {
         maxItems: 5000,
@@ -433,11 +500,31 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       },
       personalizationCacheMs: 300_000
     },
+    voice: {
+      transcription: {
+        enabled: true,
+        model: 'google/gemini-2.5-flash',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        language: '',
+        maxDurationSec: 300,
+      },
+      tts: {
+        enabled: true,
+        model: 'edge-tts',
+        baseUrl: '',
+        defaultVoice: 'en-US-AriaNeural',
+      }
+    },
     telegram: {
+      enabled: true,
       handlerTimeoutMs: DEFAULT_TELEGRAM_HANDLER_TIMEOUT_MS,
       sendRetries: 3,
       sendRetryDelayMs: 1000,
-      inputMessageMaxChars: 4000
+    },
+    discord: {
+      enabled: false,
+      sendRetries: 3,
+      sendRetryDelayMs: 1000,
     },
     progress: {
       enabled: true,
@@ -447,8 +534,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       messages: []
     },
     heartbeat: {
-      enabled: true,
-      intervalMs: 900_000,
+      enabled: false,
+      intervalMs: 3_600_000,
       groupFolder: 'main'
     },
     backgroundJobs: {
@@ -483,7 +570,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         onToolLimit: true,
         classifier: {
           enabled: true,
-          model: 'openai/gpt-5-nano',
+          model: 'deepseek/deepseek-v3.2',
           timeoutMs: 3000,
           maxOutputTokens: 32,
           temperature: 0,
@@ -502,60 +589,12 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       enabled: true,
       maxFastChars: 200,
       maxStandardChars: 1200,
-      backgroundMinChars: 2000,
-      fastKeywords: [
-        'hi',
-        'hello',
-        'hey',
-        'who are you',
-        'what can you do',
-        'help',
-        'thanks',
-        'thank you'
-      ],
-      deepKeywords: [
-        'research',
-        'analysis',
-        'analyze',
-        'report',
-        'dashboard',
-        'vibe',
-        'refactor',
-        'architecture',
-        'design',
-        'spec',
-        'strategy',
-        'migration',
-        'benchmark',
-        'investigate',
-        'evaluate',
-        'summarize',
-        'long-running'
-      ],
-      backgroundKeywords: [
-        'background',
-        'long-running',
-        'research',
-        'deep dive',
-        'multi-step',
-        'multi step',
-        'dashboard',
-        'refactor',
-        'benchmark',
-        'report',
-        'analysis',
-        'survey',
-        'crawl',
-        'scrape',
-        'codebase'
-      ],
       classifierFallback: {
         enabled: true,
-        minChars: 600
       },
       plannerProbe: {
         enabled: true,
-        model: 'openai/gpt-5-nano',
+        model: 'deepseek/deepseek-v3.2',
         timeoutMs: 3000,
         maxOutputTokens: 120,
         temperature: 0,
@@ -563,9 +602,15 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         minSteps: 4,
         minTools: 3
       },
+      toolIntentProbe: {
+        enabled: true,
+        model: 'deepseek/deepseek-v3.2',
+        timeoutMs: 2000,
+        maxOutputTokens: 8,
+      },
       profiles: {
         fast: {
-          model: 'openai/gpt-5-nano',
+          model: 'deepseek/deepseek-v3.2',
           maxOutputTokens: 4096,
           maxToolSteps: 12,
           recallMaxResults: 0,
@@ -582,7 +627,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
           }
         },
         standard: {
-          model: 'openai/gpt-5-mini',
+          model: 'moonshotai/kimi-k2.5',
           maxOutputTokens: 4096,
           maxToolSteps: 48,
           recallMaxResults: 6,
@@ -646,8 +691,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     openrouter: {
       timeoutMs: 180_000,
       retry: true,
-      siteUrl: '',
-      siteName: ''
+      siteUrl: 'https://github.com/dotsetlabs/dotclaw',
+      siteName: 'DotClaw'
     },
     promptPacks: {
       enabled: true,
@@ -678,11 +723,11 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       extractScheduled: false
     },
     models: {
-      summary: 'openai/gpt-5-nano',
-      memory: 'openai/gpt-5-mini',
-      planner: 'openai/gpt-5-nano',
-      responseValidation: 'openai/gpt-5-nano',
-      toolSummary: 'openai/gpt-5-nano'
+      summary: 'deepseek/deepseek-v3.2',
+      memory: 'deepseek/deepseek-v3.2',
+      planner: 'deepseek/deepseek-v3.2',
+      responseValidation: 'deepseek/deepseek-v3.2',
+      toolSummary: 'deepseek/deepseek-v3.2'
     },
     planner: {
       enabled: true,
@@ -742,16 +787,99 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       }
     },
     ipc: {
-      requestTimeoutMs: 6000,
+      requestTimeoutMs: 30_000,
       requestPollMs: 150
     },
     tokenEstimate: {
       tokensPerChar: 0.25,
       tokensPerMessage: 3,
       tokensPerRequest: 0
+    },
+    tts: {
+      enabled: true,
+      model: 'edge-tts',
+      baseUrl: '',
+      defaultVoice: 'en-US-AriaNeural'
+    },
+    browser: {
+      enabled: true,
+      timeoutMs: 30_000,
+      screenshotQuality: 80
+    },
+    mcp: {
+      enabled: false,
+      servers: [],
+      connectionTimeoutMs: 10_000
+    },
+    skills: {
+      enabled: true,
+      maxSkills: 32,
+      maxSummaryChars: 4000,
+      installEnabled: true,
     }
+  },
+  hooks: {
+    enabled: false,
+    scripts: [],
+    maxConcurrent: 4,
+    defaultTimeoutMs: 5000
   }
 };
+
+function clampMin(value: number, min: number, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min) {
+    console.warn(`[runtime-config] ${label} = ${value} is invalid, clamping to ${min}`);
+    return min;
+  }
+  return value;
+}
+
+function validateRuntimeConfig(config: RuntimeConfig): void {
+  const h = config.host;
+
+  // Scheduler
+  h.scheduler.pollIntervalMs = clampMin(h.scheduler.pollIntervalMs, 1000, 'host.scheduler.pollIntervalMs');
+  h.scheduler.taskMaxRetries = clampMin(h.scheduler.taskMaxRetries, 0, 'host.scheduler.taskMaxRetries');
+  h.scheduler.taskRetryBaseMs = clampMin(h.scheduler.taskRetryBaseMs, 100, 'host.scheduler.taskRetryBaseMs');
+  h.scheduler.taskTimeoutMs = clampMin(h.scheduler.taskTimeoutMs, 1000, 'host.scheduler.taskTimeoutMs');
+
+  // Container
+  h.container.timeoutMs = clampMin(h.container.timeoutMs, 1000, 'host.container.timeoutMs');
+  if (h.container.mode !== 'daemon' && h.container.mode !== 'ephemeral') {
+    console.warn(`[runtime-config] host.container.mode = "${h.container.mode}" is invalid, defaulting to "daemon"`);
+    h.container.mode = 'daemon';
+  }
+  h.container.daemon.heartbeatMaxAgeMs = clampMin(h.container.daemon.heartbeatMaxAgeMs, 1000, 'host.container.daemon.heartbeatMaxAgeMs');
+  h.container.daemon.healthCheckIntervalMs = clampMin(h.container.daemon.healthCheckIntervalMs, 1000, 'host.container.daemon.healthCheckIntervalMs');
+
+  // Concurrency
+  h.concurrency.maxAgents = clampMin(h.concurrency.maxAgents, 1, 'host.concurrency.maxAgents');
+
+  // Maintenance
+  h.maintenance.intervalMs = clampMin(h.maintenance.intervalMs, 60_000, 'host.maintenance.intervalMs');
+
+  // Message queue
+  h.messageQueue.batchWindowMs = clampMin(h.messageQueue.batchWindowMs, 0, 'host.messageQueue.batchWindowMs');
+  h.messageQueue.maxRetries = clampMin(h.messageQueue.maxRetries, 0, 'host.messageQueue.maxRetries');
+
+  // Background jobs
+  h.backgroundJobs.maxConcurrent = clampMin(h.backgroundJobs.maxConcurrent, 1, 'host.backgroundJobs.maxConcurrent');
+  h.backgroundJobs.maxRuntimeMs = clampMin(h.backgroundJobs.maxRuntimeMs, 1000, 'host.backgroundJobs.maxRuntimeMs');
+
+  // Hooks
+  config.hooks.maxConcurrent = clampMin(config.hooks.maxConcurrent, 1, 'hooks.maxConcurrent');
+  config.hooks.defaultTimeoutMs = clampMin(config.hooks.defaultTimeoutMs, 100, 'hooks.defaultTimeoutMs');
+
+  // Model names
+  if (!h.defaultModel || typeof h.defaultModel !== 'string') {
+    console.warn('[runtime-config] host.defaultModel is empty, using default');
+    h.defaultModel = 'moonshotai/kimi-k2.5';
+  }
+
+  // Agent IPC
+  config.agent.ipc.requestTimeoutMs = clampMin(config.agent.ipc.requestTimeoutMs, 1000, 'agent.ipc.requestTimeoutMs');
+  config.agent.ipc.requestPollMs = clampMin(config.agent.ipc.requestPollMs, 10, 'agent.ipc.requestPollMs');
+}
 
 let cachedConfig: RuntimeConfig | null = null;
 let cachedHome: string | null = null;
@@ -817,6 +945,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
   if (!hasTelegramHandlerOverride(fromFile)) {
     merged.host.telegram.handlerTimeoutMs = Math.max(merged.host.container.timeoutMs + 30_000, 120_000);
   }
+  validateRuntimeConfig(merged);
   cachedConfig = merged;
   cachedHome = currentHome;
   return merged;

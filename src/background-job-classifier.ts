@@ -140,7 +140,7 @@ export async function classifyBackgroundJob(params: {
   isGroup: boolean;
   chatType: string;
   queueDepth?: number;
-  metricsSource?: 'telegram' | 'scheduler';
+  metricsSource?: string;
 }): Promise<BackgroundJobClassifierResult> {
   const runtime = loadRuntimeConfig();
   const classifierConfig = runtime.host.backgroundJobs.autoSpawn.classifier;

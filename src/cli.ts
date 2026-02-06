@@ -443,7 +443,7 @@ async function cmdSetup(): Promise<void> {
   log('Setup complete!');
   log('');
   log('Next steps:');
-  log('  1. Register your Telegram chat: dotclaw register');
+  log('  1. Register a chat channel: dotclaw register');
   log('  2. Start the service: dotclaw start');
   log('  3. Check status: dotclaw doctor');
 }
@@ -925,7 +925,7 @@ async function cmdAddInstance(instanceId: string): Promise<void> {
   log(`Instance "${normalized}" started at ${newHome}`);
   log(`Launchd label: ${launchdLabel}`);
   if (fs.existsSync(envPath)) {
-    log(`If you want a different Telegram bot, edit: ${envPath}`);
+    log(`To use a different bot token, edit: ${envPath}`);
   }
 }
 
@@ -942,14 +942,46 @@ async function cmdRegister(): Promise<void> {
     }
   }
 
-  console.log('Register a Telegram chat with DotClaw');
-  console.log('');
-  console.log('To find your chat ID:');
-  console.log('  1. Add @userinfobot or @get_id_bot to your Telegram chat');
-  console.log('  2. The bot will reply with the chat ID (usually a negative number for groups)');
+  // Read provider config
+  let runtimeConfig: Record<string, unknown> = {};
+  if (fs.existsSync(RUNTIME_CONFIG_PATH)) {
+    try {
+      runtimeConfig = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_PATH, 'utf-8'));
+    } catch {
+      // ignore
+    }
+  }
+  const host = runtimeConfig.host as Record<string, unknown> | undefined;
+  const telegramEnabled = (host?.telegram as Record<string, unknown> | undefined)?.enabled !== false;
+  const discordEnabled = (host?.discord as Record<string, unknown> | undefined)?.enabled === true;
+
+  console.log('Register a chat channel with DotClaw');
   console.log('');
 
-  const chatId = await prompt('Telegram chat ID');
+  // Provider selection
+  let provider = 'telegram';
+  if (telegramEnabled && discordEnabled) {
+    const choice = await prompt('Which provider?\n  1. Telegram\n  2. Discord\nChoice', '1');
+    provider = choice === '2' ? 'discord' : 'telegram';
+  } else if (discordEnabled) {
+    provider = 'discord';
+  }
+
+  let chatId: string;
+  if (provider === 'discord') {
+    console.log('To find your channel ID:');
+    console.log('  Right-click the channel → Copy Channel ID.');
+    console.log('  (Enable Developer Mode in Discord Settings → App Settings → Advanced if needed.)');
+    console.log('');
+    chatId = await prompt('Discord channel ID');
+  } else {
+    console.log('To find your chat ID:');
+    console.log('  1. Add @userinfobot or @get_id_bot to your Telegram chat');
+    console.log('  2. The bot will reply with the chat ID (usually a negative number for groups)');
+    console.log('');
+    chatId = await prompt('Telegram chat ID');
+  }
+
   if (!chatId) {
     error('Chat ID is required');
     process.exit(1);
@@ -963,7 +995,8 @@ async function cmdRegister(): Promise<void> {
     process.exit(1);
   }
 
-  groups[chatId] = {
+  const prefixedId = provider === 'discord' ? `discord:${chatId}` : `telegram:${chatId}`;
+  groups[prefixedId] = {
     name,
     folder,
     added_at: new Date().toISOString()
@@ -976,7 +1009,7 @@ async function cmdRegister(): Promise<void> {
   const groupDir = path.join(GROUPS_DIR, folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  log(`Registered chat ${chatId} as "${name}" (folder: ${folder})`);
+  log(`Registered ${provider} channel ${chatId} as "${name}" (folder: ${folder})`);
 
   if (isServiceRunning()) {
     const restart = await prompt('Restart service to apply changes? (yes/no)', 'yes');
@@ -1008,11 +1041,23 @@ async function cmdGroups(): Promise<void> {
 
   console.log(`Registered groups (${entries.length}):\n`);
   for (const [chatId, group] of entries) {
+    // Detect provider from prefix
+    let provider = 'telegram';
+    let displayId = chatId;
+    if (chatId.startsWith('discord:')) {
+      provider = 'discord';
+      displayId = chatId.slice('discord:'.length);
+    } else if (chatId.startsWith('telegram:')) {
+      provider = 'telegram';
+      displayId = chatId.slice('telegram:'.length);
+    }
+
     console.log(`  ${group.name}`);
-    console.log(`    Chat ID: ${chatId}`);
-    console.log(`    Folder:  ${group.folder}`);
+    console.log(`    Provider: ${provider}`);
+    console.log(`    Chat ID:  ${displayId}`);
+    console.log(`    Folder:   ${group.folder}`);
     if (group.added_at) {
-      console.log(`    Added:   ${group.added_at}`);
+      console.log(`    Added:    ${group.added_at}`);
     }
     console.log('');
   }
@@ -1159,9 +1204,9 @@ Commands:
   logs               Show recent logs (use --follow to tail)
   status             Show current status
   doctor             Run diagnostics
-  register           Register a Telegram chat
-  unregister         Remove a registered Telegram chat
-  groups             List registered Telegram chats
+  register           Register a chat channel (Telegram or Discord)
+  unregister         Remove a registered chat channel
+  groups             List registered chat channels
   build              Build Docker container
   add-instance       Create and start a new isolated instance
   instances          List discovered instances

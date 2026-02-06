@@ -14,7 +14,7 @@ import {
 
 const runtime = loadRuntimeConfig();
 
-// Re-export paths for backwards compatibility
+// Re-export paths for convenience
 export {
   CONFIG_DIR,
   DATA_DIR,
@@ -25,7 +25,6 @@ export {
   ENV_PATH,
 };
 
-export const ASSISTANT_NAME = runtime.agent.assistantName;
 export const SCHEDULER_POLL_INTERVAL = runtime.host.scheduler.pollIntervalMs;
 
 export const MAIN_GROUP_FOLDER = 'main';
@@ -63,6 +62,5 @@ export const TRACE_RETENTION_DAYS = runtime.host.trace.retentionDays;
 export const MAINTENANCE_INTERVAL_MS = runtime.host.maintenance.intervalMs;
 export const BATCH_WINDOW_MS = runtime.host.messageQueue.batchWindowMs;
 export const MAX_BATCH_SIZE = runtime.host.messageQueue.maxBatchSize ?? 50;
-export const STALLED_TIMEOUT_MS = runtime.host.messageQueue.stalledTimeoutMs ?? 300_000;
 export const JOB_RETENTION_MS = runtime.host.backgroundJobs.jobRetentionMs ?? 604_800_000;
 export const TASK_LOG_RETENTION_MS = runtime.host.backgroundJobs.taskLogRetentionMs ?? 2_592_000_000;

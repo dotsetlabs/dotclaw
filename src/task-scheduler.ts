@@ -12,6 +12,7 @@ import { writeTrace } from './trace-writer.js';
 import type { AgentContext } from './agent-context.js';
 import type { ContainerOutput } from './container-protocol.js';
 import { logger } from './logger.js';
+import { emitHook } from './hooks.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -165,6 +166,7 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
 
   logger.info({ taskId: task.id, group: task.group_folder }, 'Running scheduled task');
   recordMessage('scheduler');
+  void emitHook('task:fired', { task_id: task.id, group_folder: task.group_folder, prompt: task.prompt.slice(0, 200) });
 
   const abortController = new AbortController();
   const taskTimeout = setTimeout(() => abortController.abort(), TASK_TIMEOUT_MS);
@@ -264,6 +266,7 @@ ${task.prompt}` : task.prompt;
       disableResponseValidation: !routingDecision.enableResponseValidation,
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
       disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
+      profile: routingDecision.profile,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
       timezone: taskTimezone
@@ -461,6 +464,7 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       disableResponseValidation: !routingDecision.enableResponseValidation,
       responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
       disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
+      profile: routingDecision.profile,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
       timezone: task.timezone || TIMEZONE

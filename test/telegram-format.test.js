@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatTelegramMessage, TELEGRAM_PARSE_MODE } from '../dist/telegram-format.js';
+import { formatTelegramMessage, TELEGRAM_PARSE_MODE } from '../dist/providers/telegram/telegram-format.js';
 
 test('TELEGRAM_PARSE_MODE is HTML', () => {
   assert.equal(TELEGRAM_PARSE_MODE, 'HTML');
