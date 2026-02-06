@@ -166,13 +166,18 @@ function initFiles() {
   // Environment file
   const envSample = [
     '# DotClaw Secrets',
-    '# These values are required for DotClaw to function.',
+    '# Set the token for your chosen provider(s).',
     '',
-    'TELEGRAM_BOT_TOKEN=your_bot_token_here',
+    '# Telegram (get from @BotFather)',
+    '# TELEGRAM_BOT_TOKEN=your_bot_token_here',
+    '',
+    '# Discord (get from Discord Developer Portal)',
+    '# DISCORD_BOT_TOKEN=your_discord_bot_token_here',
+    '',
     'OPENROUTER_API_KEY=your_openrouter_api_key',
     '',
     '# Optional: Brave Search for web search capability',
-    'BRAVE_SEARCH_API_KEY=your_brave_search_api_key'
+    '# BRAVE_SEARCH_API_KEY=your_brave_search_api_key'
   ].join('\n');
 
   const createdEnv = ensureFile(ENV_PATH, envSample);
@@ -197,7 +202,7 @@ function initFiles() {
 
 function printNextSteps() {
   log('\nNext steps:');
-  log(`1) Edit ${ENV_PATH} with your Telegram bot token and OpenRouter API key`);
+  log(`1) Run: dotclaw configure  (or edit ${ENV_PATH})`);
   log(`2) (Optional) Edit ${path.join(CONFIG_DIR, 'runtime.json')} for tuning`);
   log('3) Build the container: dotclaw build');
   log('4) Register your chat: dotclaw register');

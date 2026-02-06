@@ -129,10 +129,36 @@ log('.env', fs.existsSync(envPath) ? 'present' : 'missing');
 
 if (fs.existsSync(envPath)) {
   const envContent = fs.readFileSync(envPath, 'utf-8');
-  const hasOpenRouter = envContent.includes('OPENROUTER_API_KEY=');
-  const hasBrave = envContent.includes('BRAVE_SEARCH_API_KEY=');
-  const hasTelegram = envContent.includes('TELEGRAM_BOT_TOKEN=');
-  log('TELEGRAM_BOT_TOKEN', hasTelegram ? 'set' : 'missing');
+  // Parse actual values (not just key presence) to distinguish real tokens from commented/placeholder lines
+  const envLines = envContent.split('\n');
+  const envValues = new Map();
+  for (const line of envLines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx === -1) continue;
+    const key = trimmed.slice(0, idx).trim();
+    const value = trimmed.slice(idx + 1).trim();
+    if (value && !value.startsWith('your_')) envValues.set(key, value);
+  }
+
+  const hasTelegram = envValues.has('TELEGRAM_BOT_TOKEN');
+  const hasDiscord = envValues.has('DISCORD_BOT_TOKEN');
+  const hasOpenRouter = envValues.has('OPENROUTER_API_KEY');
+  const hasBrave = envValues.has('BRAVE_SEARCH_API_KEY');
+
+  // Provider status from runtime config
+  const telegramEnabled = runtimeConfig?.host?.telegram?.enabled !== false;
+  const discordEnabled = runtimeConfig?.host?.discord?.enabled === true;
+
+  log('Telegram', `${telegramEnabled ? 'enabled' : 'disabled'} (token: ${hasTelegram ? 'set' : 'missing'})`);
+  if (telegramEnabled && !hasTelegram) {
+    log('Warning', 'Telegram is enabled but TELEGRAM_BOT_TOKEN is missing');
+  }
+  log('Discord', `${discordEnabled ? 'enabled' : 'disabled'} (token: ${hasDiscord ? 'set' : 'missing'})`);
+  if (discordEnabled && !hasDiscord) {
+    log('Warning', 'Discord is enabled but DISCORD_BOT_TOKEN is missing');
+  }
   log('OPENROUTER_API_KEY', hasOpenRouter ? 'set' : 'missing');
   log('BRAVE_SEARCH_API_KEY', hasBrave ? 'set (optional, enables WebSearch)' : 'missing');
 }

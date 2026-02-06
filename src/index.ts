@@ -1016,7 +1016,7 @@ async function main(): Promise<void> {
   try {
     const envStat = fs.existsSync(ENV_PATH) ? fs.statSync(ENV_PATH) : null;
     if (!envStat || envStat.size === 0) {
-      logger.warn({ envPath: ENV_PATH }, '.env is missing or empty; set TELEGRAM_BOT_TOKEN and OPENROUTER_API_KEY');
+      logger.warn({ envPath: ENV_PATH }, '.env is missing or empty; run "dotclaw configure" to set up provider tokens and API keys');
     }
   } catch (err) {
     logger.warn({ envPath: ENV_PATH, err }, 'Failed to check .env file');

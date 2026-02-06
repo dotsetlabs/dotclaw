@@ -109,24 +109,35 @@ async function main() {
 
   const runtimeAgent = runtimeConfig.agent || {};
   const runtimeOpenrouter = runtimeAgent.openrouter || {};
+  const runtimeHost = runtimeConfig.host || {};
 
   let telegramToken = envMap.get('TELEGRAM_BOT_TOKEN') || '';
+  let discordToken = envMap.get('DISCORD_BOT_TOKEN') || '';
   let openrouterKey = envMap.get('OPENROUTER_API_KEY') || '';
   let openrouterModel = modelConfig.model;
   let openrouterSiteUrl = runtimeOpenrouter.siteUrl || '';
   let openrouterSiteName = runtimeOpenrouter.siteName || '';
   let braveKey = envMap.get('BRAVE_SEARCH_API_KEY') || '';
   let allowlistInput = '';
+  let telegramEnabled = runtimeHost.telegram?.enabled !== false;
+  let discordEnabled = runtimeHost.discord?.enabled === true;
 
   if (nonInteractive) {
     telegramToken = process.env.TELEGRAM_BOT_TOKEN || telegramToken;
+    discordToken = process.env.DISCORD_BOT_TOKEN || discordToken;
     openrouterKey = process.env.OPENROUTER_API_KEY || openrouterKey;
     braveKey = process.env.BRAVE_SEARCH_API_KEY || braveKey;
 
-    if (!telegramToken) {
-      console.error('TELEGRAM_BOT_TOKEN is required for non-interactive configuration.');
+    // Auto-detect provider from tokens
+    const hasTelegram = !!telegramToken;
+    const hasDiscord = !!discordToken;
+    if (!hasTelegram && !hasDiscord) {
+      console.error('At least one provider token is required (TELEGRAM_BOT_TOKEN or DISCORD_BOT_TOKEN).');
       process.exit(1);
     }
+    telegramEnabled = hasTelegram;
+    discordEnabled = hasDiscord;
+
     if (!openrouterKey) {
       console.error('OPENROUTER_API_KEY is required for non-interactive configuration.');
       process.exit(1);
@@ -134,7 +145,30 @@ async function main() {
   } else {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-    telegramToken = await promptForValue(rl, 'TELEGRAM_BOT_TOKEN', telegramToken);
+    // Determine current default for provider selection
+    let currentDefault = '1';
+    if (telegramEnabled && discordEnabled) currentDefault = '3';
+    else if (discordEnabled) currentDefault = '2';
+
+    const providerChoice = await new Promise(resolve => {
+      console.log('\nWhich messaging provider(s) will you use?');
+      console.log('  1. Telegram');
+      console.log('  2. Discord');
+      console.log('  3. Both');
+      rl.question(`Choice [${currentDefault}]: `, answer => {
+        resolve(answer.trim() || currentDefault);
+      });
+    });
+
+    telegramEnabled = providerChoice === '1' || providerChoice === '3';
+    discordEnabled = providerChoice === '2' || providerChoice === '3';
+
+    if (telegramEnabled) {
+      telegramToken = await promptForValue(rl, 'TELEGRAM_BOT_TOKEN', telegramToken);
+    }
+    if (discordEnabled) {
+      discordToken = await promptForValue(rl, 'DISCORD_BOT_TOKEN', discordToken);
+    }
     openrouterKey = await promptForValue(rl, 'OPENROUTER_API_KEY', openrouterKey);
     openrouterModel = await promptForValue(rl, 'OPENROUTER_MODEL', openrouterModel);
     openrouterSiteUrl = await promptForValue(rl, 'OPENROUTER_SITE_URL', openrouterSiteUrl, true);
@@ -150,10 +184,10 @@ async function main() {
     rl.close();
   }
 
-  const updates = {
-    TELEGRAM_BOT_TOKEN: telegramToken,
-    OPENROUTER_API_KEY: openrouterKey
-  };
+  const updates = {};
+  if (telegramEnabled && telegramToken) updates.TELEGRAM_BOT_TOKEN = telegramToken;
+  if (discordEnabled && discordToken) updates.DISCORD_BOT_TOKEN = discordToken;
+  updates.OPENROUTER_API_KEY = openrouterKey;
   if (braveKey) updates.BRAVE_SEARCH_API_KEY = braveKey;
 
   const nextEnv = updateEnvContent(envContent || '', updates);
@@ -184,6 +218,13 @@ async function main() {
   nextRuntimeConfig.agent.openrouter.siteName = openrouterSiteName || '';
 
   if (!nextRuntimeConfig.host) nextRuntimeConfig.host = {};
+
+  // Provider enabled flags
+  if (!nextRuntimeConfig.host.telegram) nextRuntimeConfig.host.telegram = {};
+  nextRuntimeConfig.host.telegram.enabled = telegramEnabled;
+  if (!nextRuntimeConfig.host.discord) nextRuntimeConfig.host.discord = {};
+  nextRuntimeConfig.host.discord.enabled = discordEnabled;
+
   if (!nextRuntimeConfig.host.memory) nextRuntimeConfig.host.memory = {};
   if (!nextRuntimeConfig.host.memory.embeddings) nextRuntimeConfig.host.memory.embeddings = {};
   nextRuntimeConfig.host.memory.embeddings.openrouterSiteUrl = openrouterSiteUrl || '';
