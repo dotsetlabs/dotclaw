@@ -116,7 +116,6 @@ export function routeRequest(params: {
   const fastCue = hasKeyword(normalized, routing.fastKeywords);
   const deepCue = hasKeyword(normalized, routing.deepKeywords);
   const backgroundCue = hasKeyword(normalized, routing.backgroundKeywords);
-
   let profile: TaskProfile = 'standard';
   let reason = 'default';
 

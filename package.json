@@ -65,9 +65,11 @@
   },
   "dependencies": {
     "@dotsetlabs/autotune": "^1.1.0",
+    "@huggingface/transformers": "^3.8.1",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
     "dotenv": "^17.2.3",
+    "node-edge-tts": "^1.2.10",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "prom-client": "^15.1.3",

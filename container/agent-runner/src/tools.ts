@@ -1620,6 +1620,37 @@ export function createTools(
     })
   });
 
+  const textToSpeechTool = tool({
+    name: 'mcp__dotclaw__text_to_speech',
+    description: 'Convert text to speech and send as a voice message. Generates an .ogg voice note from text using TTS.',
+    inputSchema: z.object({
+      text: z.string().min(1).max(4096).describe('Text to convert to speech'),
+      voice: z.string().optional().describe('Voice ID for Edge TTS (e.g., "en-US-AriaNeural", "en-US-GuyNeural", "en-GB-SoniaNeural")'),
+      language: z.string().optional().describe('Language code (e.g., "en", "es", "fr")'),
+      send: z.boolean().optional().describe('Whether to send immediately as voice message (default: true)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      path: z.string().optional(),
+      id: z.string().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__text_to_speech', async ({ text, voice, language, send }: { text: string; voice?: string; language?: string; send?: boolean }) => {
+      try {
+        const { synthesizeSpeech } = await import('./tts.js');
+        const outputPath = await synthesizeSpeech(text, { voice, language });
+        if (send !== false) {
+          const resolved = resolveGroupPath(outputPath, true);
+          await ipc.sendVoice({ path: resolved });
+          return { ok: true, path: outputPath };
+        }
+        return { ok: true, path: outputPath };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    })
+  });
+
   const sendAudioTool = tool({
     name: 'mcp__dotclaw__send_audio',
     description: 'Send an audio file to the current Telegram chat (mp3, m4a, etc.).',
@@ -2089,6 +2120,98 @@ export function createTools(
       ipc.jobUpdate(args))
   });
 
+  const orchestrateTool = tool({
+    name: 'mcp__dotclaw__orchestrate',
+    description: 'Run multiple sub-tasks in parallel and aggregate results. Each task runs as an independent background job. Use for research, analysis, or any task that can be decomposed into parallel parts.',
+    inputSchema: z.object({
+      tasks: z.array(z.object({
+        name: z.string().describe('Short name for this sub-task'),
+        prompt: z.string().describe('Full prompt for the sub-task'),
+        model_override: z.string().optional(),
+        timeout_ms: z.number().optional(),
+        tool_allow: z.array(z.string()).optional(),
+        tool_deny: z.array(z.string()).optional()
+      })).min(1).max(10),
+      max_concurrent: z.number().int().min(1).max(10).optional().describe('Max parallel tasks (default: all)'),
+      timeout_ms: z.number().optional().describe('Overall timeout in ms (default: 600000)'),
+      aggregation_prompt: z.string().optional().describe('Optional prompt to synthesize all results into a final answer')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__orchestrate', async (args: {
+      tasks: Array<{ name: string; prompt: string; model_override?: string; timeout_ms?: number; tool_allow?: string[]; tool_deny?: string[] }>;
+      max_concurrent?: number;
+      timeout_ms?: number;
+      aggregation_prompt?: string;
+    }) => ipc.orchestrate(args))
+  });
+
+  // ─── Workflow Tools ────────────────────────────────────────
+
+  const workflowStartTool = tool({
+    name: 'mcp__dotclaw__workflow_start',
+    description: 'Start a named workflow. Workflows are YAML/JSON definitions in the group workflows/ directory with multi-step execution, dependency graphs, and state passing between steps.',
+    inputSchema: z.object({
+      name: z.string().describe('Workflow name (matches filename without extension in workflows/ directory)'),
+      params: z.record(z.string(), z.any()).optional().describe('Optional parameters to pass to the workflow')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      run_id: z.string().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__workflow_start', async (args: { name: string; params?: Record<string, unknown> }) =>
+      ipc.workflowStart(args))
+  });
+
+  const workflowStatusTool = tool({
+    name: 'mcp__dotclaw__workflow_status',
+    description: 'Get the status of a workflow run including all step results.',
+    inputSchema: z.object({
+      run_id: z.string().describe('Workflow run ID (returned by workflow_start)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__workflow_status', async (args: { run_id: string }) =>
+      ipc.workflowStatus(args))
+  });
+
+  const workflowCancelTool = tool({
+    name: 'mcp__dotclaw__workflow_cancel',
+    description: 'Cancel a running workflow.',
+    inputSchema: z.object({
+      run_id: z.string().describe('Workflow run ID to cancel')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__workflow_cancel', async (args: { run_id: string }) =>
+      ipc.workflowCancel(args))
+  });
+
+  const workflowListTool = tool({
+    name: 'mcp__dotclaw__workflow_list',
+    description: 'List workflow runs for the current group.',
+    inputSchema: z.object({
+      status: z.string().optional().describe('Filter by status: pending, running, completed, failed, canceled'),
+      limit: z.number().int().min(1).max(50).optional().describe('Max results (default: 10)')
+    }),
+    outputSchema: z.object({
+      ok: z.boolean(),
+      result: z.any().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('mcp__dotclaw__workflow_list', async (args: { status?: string; limit?: number }) =>
+      ipc.workflowList(args))
+  });
+
   const registerGroupTool = tool({
     name: 'mcp__dotclaw__register_group',
     description: 'Register a new Telegram chat (main group only).',
@@ -2248,6 +2371,74 @@ export function createTools(
       ipc.memoryStats(args))
   });
 
+  // --- Browser Tool ---
+  const browserTool = tool({
+    name: 'Browser',
+    description: 'Browser automation tool. Navigate pages, take screenshots, click elements, fill forms, extract content, and run JavaScript. Screenshots are saved to /workspace/group/screenshots/.',
+    inputSchema: z.object({
+      action: z.enum(['navigate', 'snapshot', 'click', 'fill', 'screenshot', 'extract', 'evaluate', 'close']).describe('Browser action to perform'),
+      url: z.string().optional().describe('URL to navigate to (for navigate action)'),
+      ref: z.string().optional().describe('Element reference from snapshot (for click/fill actions)'),
+      text: z.string().optional().describe('Text to fill (for fill action)'),
+      selector: z.string().optional().describe('CSS selector (for extract action)'),
+      js: z.string().optional().describe('JavaScript to evaluate (for evaluate action)'),
+      fullPage: z.boolean().optional().describe('Take full-page screenshot (for screenshot action)'),
+      interactive: z.boolean().optional().describe('Show interactive elements only (for snapshot action)')
+    }),
+    outputSchema: z.object({
+      success: z.boolean(),
+      title: z.string().optional(),
+      url: z.string().optional(),
+      elements: z.any().optional(),
+      text: z.string().optional(),
+      html: z.string().optional(),
+      result: z.any().optional(),
+      path: z.string().optional(),
+      error: z.string().optional()
+    }),
+    execute: wrapExecute('Browser', async (args: {
+      action: string;
+      url?: string;
+      ref?: string;
+      text?: string;
+      selector?: string;
+      js?: string;
+      fullPage?: boolean;
+      interactive?: boolean;
+    }) => {
+      const { BrowserSession } = await import('./browser.js');
+      const browserConfig = config.browser;
+      const session = new BrowserSession({
+        timeoutMs: browserConfig.timeoutMs,
+        screenshotQuality: browserConfig.screenshotQuality
+      });
+      switch (args.action) {
+        case 'navigate':
+          if (!args.url) return { success: false, error: 'url is required for navigate action' };
+          return session.navigate(args.url);
+        case 'snapshot':
+          return session.snapshot(args.interactive);
+        case 'click':
+          if (!args.ref) return { success: false, error: 'ref is required for click action' };
+          return session.click(args.ref);
+        case 'fill':
+          if (!args.ref || !args.text) return { success: false, error: 'ref and text are required for fill action' };
+          return session.fill(args.ref, args.text);
+        case 'screenshot':
+          return session.screenshot(args.fullPage);
+        case 'extract':
+          return session.extract(args.selector);
+        case 'evaluate':
+          if (!args.js) return { success: false, error: 'js is required for evaluate action' };
+          return session.evaluate(args.js);
+        case 'close':
+          return session.close();
+        default:
+          return { success: false, error: `Unknown action: ${args.action}` };
+      }
+    })
+  });
+
   const tools: Tool[] = [
     readTool,
     writeTool,
@@ -2260,6 +2451,7 @@ export function createTools(
     sendFileTool,
     sendPhotoTool,
     sendVoiceTool,
+    textToSpeechTool,
     sendAudioTool,
     sendLocationTool,
     sendContactTool,
@@ -2279,6 +2471,11 @@ export function createTools(
     listJobsTool,
     cancelJobTool,
     jobUpdateTool,
+    orchestrateTool,
+    workflowStartTool,
+    workflowStatusTool,
+    workflowCancelTool,
+    workflowListTool,
     memoryUpsertTool,
     memoryForgetTool,
     memoryListTool,
@@ -2291,6 +2488,10 @@ export function createTools(
     ...pluginTools
   ];
 
+  if (config.browser.enabled) {
+    tools.push(browserTool as Tool);
+  }
+
   if (enableBash) {
     tools.push(bashTool as Tool);
     tools.push(pythonTool as Tool);
@@ -2302,4 +2503,25 @@ export function createTools(
   }
 
   return tools;
+}
+
+/**
+ * Discover and merge MCP external tools into the tools array.
+ * Call this after createTools() if MCP is enabled.
+ */
+export async function discoverMcpTools(
+  config: AgentRuntimeConfig['agent'],
+  wrapExecuteFn: <TInput, TOutput>(name: string, execute: (args: TInput) => Promise<TOutput>) => (args: TInput) => Promise<TOutput>
+): Promise<{ tools: Tool[]; cleanup: () => Promise<void> }> {
+  if (!config.mcp.enabled || config.mcp.servers.length === 0) {
+    return { tools: [], cleanup: async () => {} };
+  }
+
+  const { McpToolRegistry } = await import('./mcp-registry.js');
+  const registry = new McpToolRegistry(config.mcp);
+  const mcpTools = await registry.discoverTools(wrapExecuteFn);
+  return {
+    tools: mcpTools,
+    cleanup: () => registry.closeAll()
+  };
 }

@@ -535,20 +535,23 @@ function buildSystemInstructions(params: {
     '- `mcp__dotclaw__set_model`: change the active model.',
     '- `mcp__dotclaw__memory_upsert`: store durable memories.',
     '- `mcp__dotclaw__memory_search`, `mcp__dotclaw__memory_list`, `mcp__dotclaw__memory_forget`, `mcp__dotclaw__memory_stats`.',
-    '- `plugin__*`: dynamically loaded plugin tools (if present and allowed by policy).'
+    '- `plugin__*`: dynamically loaded plugin tools (if present and allowed by policy).',
+    '- `mcp_ext__*`: external MCP server tools (if configured).'
   ].join('\n');
-  const browserAutomation = [
-    'Browser automation (via Bash):',
-    '- Use `agent-browser open <url>` then `agent-browser snapshot -i`.',
-    '- Interact with refs using `agent-browser click @e1`, `fill @e2 "text"`.',
-    '- Capture evidence with `agent-browser screenshot`.'
-  ].join('\n');
+  const browserAutomation = agentConfig.agent.browser.enabled ? [
+    'Browser Tool:',
+    '- Use the `Browser` tool with actions: navigate, snapshot, click, fill, screenshot, extract, evaluate, close.',
+    '- Use snapshot with interactive=true to get clickable element refs (@e1, @e2, etc.).',
+    '- Interact with refs: click ref="@e1", fill ref="@e2" text="value".',
+    '- Screenshots are saved to /workspace/group/screenshots/.'
+  ].join('\n') : '';
 
   const commonWorkflows = [
     'Common workflows (do all of these in the foreground — act immediately, never spawn_job):',
     '',
     'Sending media from the web:',
     '  download_url (or curl/wget) → send_photo / send_file / send_audio.',
+    '  When the user asks for a picture/image/photo of something: WebSearch for it → pick a direct image URL → download_url → send_photo. You CAN and SHOULD do this — it is a core capability.',
     '',
     'Charts & plots:',
     '  Python: matplotlib/pandas .plot() → plt.savefig("/workspace/group/chart.png") → send_photo.',
@@ -575,8 +578,11 @@ function buildSystemInstructions(params: {
     '  Documents: use appropriate Python libraries or CLI tools → send_file.',
     '',
     'Voice messages:',
-    '  Received: arrives as .ogg in inbox. No built-in speech-to-text — acknowledge this to the user.',
-    '  Sending: create/obtain audio → `ffmpeg -i input.mp3 -c:a libopus output.ogg` → send_voice.',
+    '  Received: voice messages are auto-transcribed. The transcript appears as <transcript> inside the <attachment> XML.',
+    '  If no transcript is available, acknowledge to the user that you received a voice message but cannot read it.',
+    '  Replying: when the user sends a voice message, just reply with a normal text message. The host will automatically convert it to a voice reply. Do NOT call text_to_speech for voice message replies.',
+    '  You can also use text_to_speech proactively for any response where a voice reply feels appropriate.',
+    '  To create audio manually instead: generate .ogg Opus file → send_voice.',
     '',
     'Quick lookups (one tool call, immediate response):',
     '  Time zones: `python3 -c "from datetime import datetime; from zoneinfo import ZoneInfo; ..."`',
@@ -1230,6 +1236,37 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     }
   });
 
+  // Discover MCP external tools if enabled
+  let mcpCleanup: (() => Promise<void>) | null = null;
+  if (agent.mcp.enabled && agent.mcp.servers.length > 0) {
+    try {
+      const { discoverMcpTools } = await import('./tools.js');
+      // Build a minimal wrapExecute for MCP tools (policy + logging handled by createTools wrapExecute pattern)
+      const wrapMcp = <TInput, TOutput>(name: string, execute: (args: TInput) => Promise<TOutput>) => {
+        return async (args: TInput): Promise<TOutput> => {
+          const start = Date.now();
+          try {
+            const result = await execute(args);
+            toolCalls.push({ name, ok: true, duration_ms: Date.now() - start });
+            return result;
+          } catch (err) {
+            const error = err instanceof Error ? err.message : String(err);
+            toolCalls.push({ name, ok: false, duration_ms: Date.now() - start, error });
+            throw err;
+          }
+        };
+      };
+      const mcp = await discoverMcpTools(agent, wrapMcp);
+      tools.push(...mcp.tools);
+      mcpCleanup = mcp.cleanup;
+      if (mcp.tools.length > 0) {
+        log(`MCP: discovered ${mcp.tools.length} external tools`);
+      }
+    } catch (err) {
+      log(`MCP discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   if (process.env.DOTCLAW_SELF_CHECK === '1') {
     try {
       const details = await runSelfCheck({ model });
@@ -1752,6 +1789,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     if (totalToolMs > 0) {
       timings.tool_ms = totalToolMs;
     }
+  }
+
+  // Cleanup MCP connections
+  if (mcpCleanup) {
+    try { await mcpCleanup(); } catch { /* ignore cleanup errors */ }
   }
 
   return {

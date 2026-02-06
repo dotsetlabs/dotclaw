@@ -55,6 +55,7 @@ export interface ContainerInput {
     duration?: number;
     width?: number;
     height?: number;
+    transcript?: string;
   }>;
 }
 

@@ -552,6 +552,19 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
   });
 
   transaction(items);
+
+  if (results.length > 0) {
+    // Lazy import to avoid circular dependency
+    import('./hooks.js').then(({ emitHook }) => {
+      void emitHook('memory:upserted', {
+        group_folder: groupFolder,
+        count: results.length,
+        source,
+        types: [...new Set(results.map(r => r.type))]
+      });
+    }).catch(() => undefined);
+  }
+
   return results;
 }
 

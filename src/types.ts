@@ -56,6 +56,7 @@ export interface MessageAttachment {
   duration?: number;
   width?: number;
   height?: number;
+  transcript?: string;
 }
 
 export interface NewMessage {

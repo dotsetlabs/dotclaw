@@ -81,7 +81,9 @@ export type RuntimeConfig = {
       };
       embeddings: {
         enabled: boolean;
+        provider: 'openrouter' | 'local';
         model: string;
+        localModel: string;
         batchSize: number;
         minItems: number;
         minQueryChars: number;
@@ -103,6 +105,21 @@ export type RuntimeConfig = {
         analyzeEnabled: boolean;
       };
       personalizationCacheMs: number;
+    };
+    voice: {
+      transcription: {
+        enabled: boolean;
+        model: string;
+        baseUrl: string;
+        language: string;
+        maxDurationSec: number;
+      };
+      tts: {
+        enabled: boolean;
+        model: string;
+        baseUrl: string;
+        defaultVoice: string;
+      };
     };
     telegram: {
       handlerTimeoutMs: number;
@@ -183,6 +200,12 @@ export type RuntimeConfig = {
         minChars: number;
         minSteps: number;
         minTools: number;
+      };
+      toolIntentProbe: {
+        enabled: boolean;
+        model: string;
+        timeoutMs: number;
+        maxOutputTokens: number;
       };
       profiles: Record<string, {
         model: string;
@@ -325,6 +348,39 @@ export type RuntimeConfig = {
       tokensPerMessage: number;
       tokensPerRequest: number;
     };
+    tts: {
+      enabled: boolean;
+      model: string;
+      baseUrl: string;
+      defaultVoice: string;
+    };
+    browser: {
+      enabled: boolean;
+      timeoutMs: number;
+      screenshotQuality: number;
+    };
+    mcp: {
+      enabled: boolean;
+      servers: Array<{
+        name: string;
+        transport: 'stdio';
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+      }>;
+      connectionTimeoutMs: number;
+    };
+  };
+  hooks: {
+    enabled: boolean;
+    scripts: Array<{
+      event: string;
+      command: string;
+      blocking: boolean;
+      timeoutMs: number;
+    }>;
+    maxConcurrent: number;
+    defaultTimeoutMs: number;
   };
 };
 
@@ -410,7 +466,9 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       },
       embeddings: {
         enabled: true,
+        provider: 'local',
         model: 'openai/text-embedding-3-small',
+        localModel: 'Xenova/all-MiniLM-L6-v2',
         batchSize: 8,
         minItems: 50,
         minQueryChars: 40,
@@ -432,6 +490,21 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         analyzeEnabled: true
       },
       personalizationCacheMs: 300_000
+    },
+    voice: {
+      transcription: {
+        enabled: true,
+        model: 'google/gemini-2.5-flash',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        language: '',
+        maxDurationSec: 300,
+      },
+      tts: {
+        enabled: true,
+        model: 'edge-tts',
+        baseUrl: '',
+        defaultVoice: 'en-US-AriaNeural',
+      }
     },
     telegram: {
       handlerTimeoutMs: DEFAULT_TELEGRAM_HANDLER_TIMEOUT_MS,
@@ -562,6 +635,12 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         minChars: 700,
         minSteps: 4,
         minTools: 3
+      },
+      toolIntentProbe: {
+        enabled: true,
+        model: 'openai/gpt-5-nano',
+        timeoutMs: 2000,
+        maxOutputTokens: 8,
       },
       profiles: {
         fast: {
@@ -749,7 +828,29 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       tokensPerChar: 0.25,
       tokensPerMessage: 3,
       tokensPerRequest: 0
+    },
+    tts: {
+      enabled: true,
+      model: 'edge-tts',
+      baseUrl: '',
+      defaultVoice: 'en-US-AriaNeural'
+    },
+    browser: {
+      enabled: true,
+      timeoutMs: 30_000,
+      screenshotQuality: 80
+    },
+    mcp: {
+      enabled: false,
+      servers: [],
+      connectionTimeoutMs: 10_000
     }
+  },
+  hooks: {
+    enabled: false,
+    scripts: [],
+    maxConcurrent: 4,
+    defaultTimeoutMs: 5000
   }
 };
 

@@ -113,6 +113,29 @@ export type AgentRuntimeConfig = {
       tokensPerMessage: number;
       tokensPerRequest: number;
     };
+    tts: {
+      enabled: boolean;
+      model: string;
+      baseUrl: string;
+      defaultVoice: string;
+    };
+    browser: {
+      enabled: boolean;
+      timeoutMs: number;
+      screenshotQuality: number;
+    };
+    mcp: {
+      enabled: boolean;
+      servers: Array<{
+        name: string;
+        transport: 'stdio';
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        url?: string;
+      }>;
+      connectionTimeoutMs: number;
+    };
   };
 };
 
@@ -229,6 +252,22 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     tokensPerChar: 0.25,
     tokensPerMessage: 3,
     tokensPerRequest: 0
+  },
+  tts: {
+    enabled: true,
+    model: 'edge-tts',
+    baseUrl: '',
+    defaultVoice: 'en-US-AriaNeural'
+  },
+  browser: {
+    enabled: true,
+    timeoutMs: 30_000,
+    screenshotQuality: 80
+  },
+  mcp: {
+    enabled: false,
+    servers: [],
+    connectionTimeoutMs: 10_000
   }
 };
 

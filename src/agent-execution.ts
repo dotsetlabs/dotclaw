@@ -9,6 +9,7 @@ import { getModelPricing } from './model-registry.js';
 import { computeCostUSD } from './cost.js';
 import { writeTrace } from './trace-writer.js';
 import { recordLatency, recordTokenUsage, recordCost, recordMemoryRecall, recordMemoryUpsert, recordMemoryExtract, recordToolCall, recordError, recordStageLatency } from './metrics.js';
+import { emitHook } from './hooks.js';
 import type { ContainerOutput } from './container-protocol.js';
 import type { RegisteredGroup } from './types.js';
 
@@ -171,6 +172,15 @@ export async function executeAgentRun(params: {
     attachments: params.attachments
   }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });
 
+  void emitHook('agent:start', {
+    group_folder: group.folder,
+    chat_jid: params.chatJid,
+    user_id: params.userId ?? undefined,
+    prompt: params.prompt.slice(0, 500),
+    model: params.modelOverride || context.resolvedModel.model,
+    source: params.isBackgroundJob ? 'background' : params.isScheduledTask ? 'scheduler' : 'message'
+  });
+
   let output: ContainerOutput;
   try {
     const runner = () => (useGroupLock ? withGroupLock(group.folder, () => runContainer()) : runContainer());
@@ -181,6 +191,17 @@ export async function executeAgentRun(params: {
     const message = err instanceof Error ? err.message : String(err);
     throw new AgentExecutionError(message, context);
   }
+
+  void emitHook('agent:complete', {
+    group_folder: group.folder,
+    chat_jid: params.chatJid,
+    status: output.status,
+    model: output.model,
+    tokens_prompt: output.tokens_prompt,
+    tokens_completion: output.tokens_completion,
+    latency_ms: output.latency_ms,
+    tool_calls_count: output.tool_calls?.length ?? 0
+  });
 
   if (output.newSessionId && persistSession) {
     params.onSessionUpdate?.(output.newSessionId);

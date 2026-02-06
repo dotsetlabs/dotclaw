@@ -89,6 +89,8 @@ import { startMaintenanceLoop, stopMaintenanceLoop } from './maintenance.js';
 import { warmGroupContainer, startDaemonHealthCheckLoop, stopDaemonHealthCheckLoop, cleanupInstanceContainers, suppressHealthChecks, resetUnhealthyDaemons } from './container-runner.js';
 import { startWakeDetector, stopWakeDetector } from './wake-detector.js';
 import { loadRuntimeConfig } from './runtime-config.js';
+import { transcribeVoice, synthesizeSpeechHost } from './transcription.js';
+import { emitHook } from './hooks.js';
 import { invalidatePersonalizationCache } from './personalization.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
@@ -759,6 +761,9 @@ function buildAttachmentsXml(attachments: MessageAttachment[], groupFolder: stri
     if (a.duration) attrs.push(`duration="${a.duration}"`);
     if (a.width) attrs.push(`width="${a.width}"`);
     if (a.height) attrs.push(`height="${a.height}"`);
+    if (a.transcript) {
+      return `<attachment ${attrs.join(' ')}>\n  <transcript>${escapeXml(a.transcript)}</transcript>\n</attachment>`;
+    }
     return `<attachment ${attrs.join(' ')} />`;
   }).join('\n');
 }
@@ -1218,9 +1223,43 @@ ${lines.join('\n')}
     prompt,
     lastMessage
   });
-  recordRoutingDecision(routingDecision.profile);
   const routerMs = Date.now() - routingStartedAt;
   recordStageLatency('router', routerMs, 'telegram');
+
+  // Smart upgrade: if routed to "fast" by short length (not greeting/keyword),
+  // ask nano if the request actually needs tool orchestration → upgrade to standard
+  if (routingDecision.profile === 'fast' && routingDecision.reason === 'short prompt') {
+    const { probeToolIntent } = await import('./tool-intent-probe.js');
+    const probeResult = await probeToolIntent(lastMessage?.content || prompt);
+    if (probeResult.needsTools) {
+      const standardConfig = runtime.host.routing.profiles?.standard;
+      if (standardConfig) {
+        routingDecision.profile = 'standard';
+        routingDecision.reason = 'tool intent probe';
+        routingDecision.modelOverride = standardConfig.model;
+        routingDecision.maxOutputTokens = standardConfig.maxOutputTokens;
+        routingDecision.maxToolSteps = standardConfig.maxToolSteps;
+        routingDecision.enablePlanner = standardConfig.enablePlanner;
+        routingDecision.enableResponseValidation = standardConfig.enableValidation;
+        routingDecision.enableMemoryRecall = standardConfig.enableMemoryRecall;
+        routingDecision.enableMemoryExtraction = standardConfig.enableMemoryExtraction;
+        if (typeof standardConfig.recallMaxResults === 'number') {
+          routingDecision.recallMaxResults = standardConfig.recallMaxResults;
+        }
+        if (typeof standardConfig.recallMaxTokens === 'number') {
+          routingDecision.recallMaxTokens = standardConfig.recallMaxTokens;
+        }
+        if (typeof standardConfig.responseValidationMaxRetries === 'number') {
+          routingDecision.responseValidationMaxRetries = standardConfig.responseValidationMaxRetries;
+        }
+      }
+      logger.info({ latencyMs: probeResult.latencyMs }, 'Tool intent probe upgraded fast → standard');
+    } else {
+      logger.debug({ latencyMs: probeResult.latencyMs }, 'Tool intent probe: staying fast');
+    }
+  }
+
+  recordRoutingDecision(routingDecision.profile);
   logger.info({
     chatId: msg.chatId,
     profile: routingDecision.profile,
@@ -1237,6 +1276,14 @@ ${lines.join('\n')}
   });
 
   logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
+
+  void emitHook('message:processing', {
+    chat_id: msg.chatId,
+    message_id: msg.messageId,
+    sender_id: msg.senderId,
+    group_folder: group.folder,
+    message_count: missedMessages.length
+  });
 
   await setTyping(msg.chatId);
   const recallQuery = missedMessages.map(entry => entry.content).join('\n');
@@ -1596,14 +1643,41 @@ ${lines.join('\n')}
   updateChatState(msg.chatId, msg.timestamp, msg.messageId);
 
   if (output.result && output.result.trim()) {
-    const sendResult = await sendMessageForQueue(msg.chatId, output.result, { messageThreadId: msg.messageThreadId, replyToMessageId });
-    const sentMessageId = sendResult.messageId;
-    // Link the sent message to the trace for feedback tracking
-    if (sentMessageId) {
+    // Check if the user sent a voice message — if so, reply with voice only (no text)
+    const hasVoiceAttachment = missedMessages.some(m => {
+      if (!m.attachments_json) return false;
       try {
-        linkMessageToTrace(sentMessageId, msg.chatId, traceBase.trace_id);
-      } catch {
-        // Don't fail if linking fails
+        const atts = JSON.parse(m.attachments_json) as MessageAttachment[];
+        return atts.some(a => a.type === 'voice');
+      } catch { return false; }
+    });
+
+    if (hasVoiceAttachment) {
+      const inboxDir = path.join(GROUPS_DIR, group.folder, 'inbox');
+      const voicePath = await synthesizeSpeechHost(output.result, inboxDir);
+      if (voicePath) {
+        try {
+          await sendVoice(msg.chatId, voicePath);
+          fs.unlinkSync(voicePath);
+        } catch (err) {
+          logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'Failed to send TTS voice reply');
+          // Fall back to text if voice fails
+          await sendMessageForQueue(msg.chatId, output.result, { messageThreadId: msg.messageThreadId, replyToMessageId });
+        }
+      } else {
+        // TTS unavailable — fall back to text
+        await sendMessageForQueue(msg.chatId, output.result, { messageThreadId: msg.messageThreadId, replyToMessageId });
+      }
+    } else {
+      const sendResult = await sendMessageForQueue(msg.chatId, output.result, { messageThreadId: msg.messageThreadId, replyToMessageId });
+      const sentMessageId = sendResult.messageId;
+      // Link the sent message to the trace for feedback tracking
+      if (sentMessageId) {
+        try {
+          linkMessageToTrace(sentMessageId, msg.chatId, traceBase.trace_id);
+        } catch {
+          // Don't fail if linking fails
+        }
       }
     }
     if (output.stdoutTruncated) {
@@ -1651,6 +1725,14 @@ ${lines.join('\n')}
       extraTimings
     });
   }
+
+  void emitHook('message:responded', {
+    chat_id: msg.chatId,
+    message_id: msg.messageId,
+    group_folder: group.folder,
+    has_result: !!output.result?.trim(),
+    model: context?.resolvedModel?.model || 'unknown'
+  });
 
   return true;
 }
@@ -2711,6 +2793,63 @@ async function processRequestIpc(
         await telegrafBot.telegram.deleteMessage(chatJid, messageId);
         return { id: requestId, ok: true, result: { deleted: true } };
       }
+      case 'orchestrate': {
+        const tasks = Array.isArray(payload.tasks) ? payload.tasks as Array<{ name: string; prompt: string; model_override?: string; timeout_ms?: number; tool_allow?: string[]; tool_deny?: string[] }> : [];
+        if (tasks.length === 0) {
+          return { id: requestId, ok: false, error: 'tasks array is required.' };
+        }
+        const orchGroupEntry = Object.entries(registeredGroups).find(([, g]) => g.folder === sourceGroup);
+        const orchChatJid = orchGroupEntry ? orchGroupEntry[0] : '';
+        const { runOrchestration } = await import('./orchestration.js');
+        const result = await runOrchestration({
+          tasks,
+          max_concurrent: typeof payload.max_concurrent === 'number' ? payload.max_concurrent : undefined,
+          timeout_ms: typeof payload.timeout_ms === 'number' ? payload.timeout_ms : undefined,
+          aggregation_prompt: typeof payload.aggregation_prompt === 'string' ? payload.aggregation_prompt : undefined,
+          groupFolder: sourceGroup,
+          chatJid: orchChatJid
+        }, {
+          registeredGroups: () => registeredGroups,
+          getSessions: () => sessions,
+          setSession: (gf: string, sid: string) => { sessions[gf] = sid; }
+        });
+        return { id: requestId, ok: result.ok, result, error: result.error };
+      }
+      case 'workflow_start': {
+        const { startWorkflowRun } = await import('./workflow-engine.js');
+        const name = typeof payload.name === 'string' ? payload.name : '';
+        if (!name) return { id: requestId, ok: false, error: 'Workflow name is required.' };
+        const wfGroupEntry = Object.entries(registeredGroups).find(([, g]) => g.folder === sourceGroup);
+        const wfChatJid = wfGroupEntry ? wfGroupEntry[0] : '';
+        const result = await startWorkflowRun(name, sourceGroup, wfChatJid, payload.params as Record<string, unknown> | undefined, {
+          registeredGroups: () => registeredGroups,
+          getSessions: () => sessions,
+          setSession: (gf: string, sid: string) => { sessions[gf] = sid; }
+        });
+        return { id: requestId, ok: result.ok, result, error: result.error };
+      }
+      case 'workflow_status': {
+        const { getWorkflowRunStatus } = await import('./workflow-engine.js');
+        const runId = typeof payload.run_id === 'string' ? payload.run_id : '';
+        if (!runId) return { id: requestId, ok: false, error: 'run_id is required.' };
+        const result = getWorkflowRunStatus(runId);
+        return { id: requestId, ok: !!result, result, error: result ? undefined : 'Run not found.' };
+      }
+      case 'workflow_cancel': {
+        const { cancelWorkflowRun } = await import('./workflow-engine.js');
+        const runId = typeof payload.run_id === 'string' ? payload.run_id : '';
+        if (!runId) return { id: requestId, ok: false, error: 'run_id is required.' };
+        const canceled = cancelWorkflowRun(runId);
+        return { id: requestId, ok: canceled, error: canceled ? undefined : 'Run not found or not running.' };
+      }
+      case 'workflow_list': {
+        const { listWorkflowRuns } = await import('./workflow-engine.js');
+        const runs = listWorkflowRuns(sourceGroup, {
+          status: typeof payload.status === 'string' ? payload.status : undefined,
+          limit: typeof payload.limit === 'number' ? payload.limit : 10
+        });
+        return { id: requestId, ok: true, result: { runs } };
+      }
       default:
         return { id: requestId, ok: false, error: `Unknown request type: ${data.type}` };
     }
@@ -3270,6 +3409,20 @@ function setupTelegramHandlers(): void {
         );
         void sendMessage(chatId, messages.join('\n'), { messageThreadId });
       }
+      // Transcribe voice messages
+      for (const attachment of attachments) {
+        if (attachment.type === 'voice' && attachment.local_path) {
+          try {
+            const transcript = await transcribeVoice(attachment.local_path);
+            if (transcript) {
+              attachment.transcript = transcript;
+            }
+          } catch (err) {
+            logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'Voice transcription failed');
+          }
+        }
+      }
+
       if (downloadedAny) {
         try {
           storeMessage(
@@ -3287,6 +3440,17 @@ function setupTelegramHandlers(): void {
         }
       }
     }
+
+    void emitHook('message:received', {
+      chat_id: chatId,
+      message_id: messageId,
+      sender_id: senderId,
+      sender_name: senderName,
+      content: storedContent.slice(0, 500),
+      is_group: isGroup,
+      has_attachments: attachments.length > 0,
+      has_transcript: attachments.some(a => !!a.transcript)
+    });
 
     enqueueMessage({
       chatId,
@@ -3435,7 +3599,7 @@ async function main(): Promise<void> {
       stopHeartbeatLoop();
       stopDaemonHealthCheckLoop();
       stopWakeDetector();
-      stopEmbeddingWorker();
+      await stopEmbeddingWorker();
 
       // 3. Stop HTTP servers
       stopMetricsServer();
