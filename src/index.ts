@@ -30,13 +30,8 @@ import {
   recordUserFeedback,
   getChatsWithPendingMessages,
   resetStalledMessages,
-  resetStalledBackgroundJobs,
 } from './db.js';
 import { startSchedulerLoop, stopSchedulerLoop } from './task-scheduler.js';
-import {
-  startBackgroundJobLoop,
-  stopBackgroundJobLoop,
-} from './background-jobs.js';
 import type { ContainerOutput } from './container-protocol.js';
 import type { AgentContext } from './agent-context.js';
 import { loadJson, saveJson, isSafeGroupFolder } from './utils.js';
@@ -51,14 +46,13 @@ import {
 import { startEmbeddingWorker, stopEmbeddingWorker } from './memory-embeddings.js';
 import { parseAdminCommand } from './admin-commands.js';
 import { loadModelRegistry, saveModelRegistry } from './model-registry.js';
-import { startMetricsServer, stopMetricsServer, recordMessage, recordRoutingDecision, recordStageLatency } from './metrics.js';
+import { startMetricsServer, stopMetricsServer, recordMessage } from './metrics.js';
 import { startMaintenanceLoop, stopMaintenanceLoop } from './maintenance.js';
 import { warmGroupContainer, startDaemonHealthCheckLoop, stopDaemonHealthCheckLoop, cleanupInstanceContainers, suppressHealthChecks, resetUnhealthyDaemons } from './container-runner.js';
 import { startWakeDetector, stopWakeDetector } from './wake-detector.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { transcribeVoice } from './transcription.js';
 import { emitHook } from './hooks.js';
-import { closeWorkflowStore } from './workflow-store.js';
 import { invalidatePersonalizationCache } from './personalization.js';
 import { installSkill, removeSkill, listSkills, updateSkill } from './skill-manager.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
@@ -146,8 +140,6 @@ const rateLimiterInterval = setInterval(cleanupRateLimiter, 60_000);
 
 // ───────────────────────── Config Constants ─────────────────────────
 
-const MEMORY_RECALL_MAX_RESULTS = runtime.host.memory.recall.maxResults;
-const MEMORY_RECALL_MAX_TOKENS = runtime.host.memory.recall.maxTokens;
 const HEARTBEAT_ENABLED = runtime.host.heartbeat.enabled;
 const HEARTBEAT_INTERVAL_MS = runtime.host.heartbeat.intervalMs;
 const HEARTBEAT_GROUP_FOLDER = (runtime.host.heartbeat.groupFolder || MAIN_GROUP_FOLDER).trim() || MAIN_GROUP_FOLDER;
@@ -691,24 +683,11 @@ async function runHeartbeatOnce(): Promise<void> {
     inputText: prompt,
     source: 'dotclaw-heartbeat'
   });
-  const routingStartedAt = Date.now();
   const routingDecision = routePrompt(prompt);
-  recordRoutingDecision(routingDecision.profile);
-  const routerMs = Date.now() - routingStartedAt;
-  recordStageLatency('router', routerMs, 'scheduler');
 
   let output: ContainerOutput | null = null;
   let context: AgentContext | null = null;
   let errorMessage: string | null = null;
-
-  const baseRecallResults = Number.isFinite(routingDecision.recallMaxResults)
-    ? Math.max(0, Math.floor(routingDecision.recallMaxResults as number))
-    : MEMORY_RECALL_MAX_RESULTS;
-  const baseRecallTokens = Number.isFinite(routingDecision.recallMaxTokens)
-    ? Math.max(0, Math.floor(routingDecision.recallMaxTokens as number))
-    : MEMORY_RECALL_MAX_TOKENS;
-  const recallMaxResults = routingDecision.enableMemoryRecall ? Math.max(4, baseRecallResults - 2) : 0;
-  const recallMaxTokens = routingDecision.enableMemoryRecall ? Math.max(600, baseRecallTokens - 200) : 0;
 
   try {
     const execution = await executeAgentRun({
@@ -717,20 +696,15 @@ async function runHeartbeatOnce(): Promise<void> {
       chatJid: chatId,
       userId: null,
       recallQuery: prompt,
-      recallMaxResults,
-      recallMaxTokens,
+      recallMaxResults: Math.max(4, routingDecision.recallMaxResults - 2),
+      recallMaxTokens: Math.max(600, routingDecision.recallMaxTokens - 200),
       sessionId: sessions[group.folder],
       onSessionUpdate: (sessionId) => { sessions[group.folder] = sessionId; },
       isScheduledTask: true,
       availableGroups: buildAvailableGroupsSnapshot(),
-      modelOverride: routingDecision.modelOverride,
+      modelOverride: routingDecision.model,
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
       maxToolSteps: routingDecision.maxToolSteps,
-      disablePlanner: !routingDecision.enablePlanner,
-      disableResponseValidation: !routingDecision.enableResponseValidation,
-      responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
-      disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
-      profile: routingDecision.profile
     });
     output = execution.output;
     context = execution.context;
@@ -754,7 +728,6 @@ async function runHeartbeatOnce(): Promise<void> {
       context,
       toolAuditSource: 'heartbeat',
       errorMessage: errorMessage ?? undefined,
-      extraTimings: { router_ms: routerMs }
     });
   } else if (errorMessage) {
     writeTrace({
@@ -1048,15 +1021,7 @@ async function onWakeRecovery(sleepDurationMs: number): Promise<void> {
     logger.error({ err }, 'Failed to reset stalled messages after wake');
   }
 
-  // 4. Reset stalled background jobs
-  try {
-    const resetJobCount = resetStalledBackgroundJobs();
-    if (resetJobCount > 0) logger.info({ count: resetJobCount }, 'Re-queued stalled background jobs after wake');
-  } catch (err) {
-    logger.error({ err }, 'Failed to reset stalled background jobs after wake');
-  }
-
-  // 5. Re-drain pending message queues
+  // 4. Re-drain pending message queues
   try {
     const pendingChats = getChatsWithPendingMessages();
     const activeDrains = getActiveDrains();
@@ -1122,10 +1087,6 @@ async function main(): Promise<void> {
   const resetCount = resetStalledMessages();
   if (resetCount > 0) {
     logger.info({ resetCount }, 'Reset stalled queue messages to pending');
-  }
-  const resetJobCount = resetStalledBackgroundJobs();
-  if (resetJobCount > 0) {
-    logger.info({ count: resetJobCount }, 'Re-queued running background jobs after restart');
   }
   initMemoryStore();
   startEmbeddingWorker();
@@ -1236,7 +1197,6 @@ async function main(): Promise<void> {
       // 2. Stop all loops and watchers
       clearInterval(rateLimiterInterval);
       stopSchedulerLoop();
-      await stopBackgroundJobLoop();
       stopIpcWatcher();
       stopMaintenanceLoop();
       stopHeartbeatLoop();
@@ -1269,7 +1229,6 @@ async function main(): Promise<void> {
       cleanupInstanceContainers();
 
       // 6. Close databases
-      closeWorkflowStore();
       closeMemoryStore();
       closeDatabase();
 
@@ -1287,15 +1246,6 @@ async function main(): Promise<void> {
       }
     };
     startSchedulerLoop({
-      sendMessage: sendMessageForScheduler,
-      registeredGroups: () => registeredGroups,
-      getSessions: () => sessions,
-      setSession: (groupFolder, sessionId) => {
-        sessions[groupFolder] = sessionId;
-        setGroupSession(groupFolder, sessionId);
-      }
-    });
-    startBackgroundJobLoop({
       sendMessage: sendMessageForScheduler,
       registeredGroups: () => registeredGroups,
       getSessions: () => sessions,

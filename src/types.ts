@@ -98,51 +98,6 @@ export interface TaskRunLog {
   error: string | null;
 }
 
-export type BackgroundJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled' | 'timed_out';
-
-export interface BackgroundJob {
-  id: string;
-  group_folder: string;
-  chat_jid: string;
-  prompt: string;
-  context_mode: 'group' | 'isolated';
-  status: BackgroundJobStatus;
-  created_at: string;
-  updated_at: string;
-  started_at: string | null;
-  finished_at: string | null;
-  timeout_ms: number | null;
-  max_tool_steps: number | null;
-  tool_policy_json?: string | null;
-  model_override?: string | null;
-  priority?: number | null;
-  tags?: string | null;
-  parent_trace_id?: string | null;
-  parent_message_id?: string | null;
-  result_summary?: string | null;
-  output_path?: string | null;
-  output_truncated?: number | null;
-  last_error?: string | null;
-  lease_expires_at?: string | null;
-}
-
-export interface BackgroundJobRunLog {
-  job_id: string;
-  run_at: string;
-  duration_ms: number;
-  status: 'success' | 'error' | 'canceled' | 'timed_out';
-  result_summary: string | null;
-  error: string | null;
-}
-
-export interface BackgroundJobEvent {
-  job_id: string;
-  created_at: string;
-  level: 'info' | 'progress' | 'warn' | 'error';
-  message: string;
-  data_json?: string | null;
-}
-
 export interface TokenEstimateConfig {
   tokens_per_char: number;
   tokens_per_message: number;

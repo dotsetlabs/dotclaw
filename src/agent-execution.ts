@@ -2,7 +2,6 @@ import { buildAgentContext, AgentContext } from './agent-context.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
 import { getAllTasks, setGroupSession, logToolCalls } from './db.js';
 import { MAIN_GROUP_FOLDER, TIMEZONE } from './config.js';
-import type { TaskProfile } from './request-router.js';
 import { generateId } from './id.js';
 import { runWithAgentSemaphore } from './agent-semaphore.js';
 import { withGroupLock } from './locks.js';
@@ -13,6 +12,7 @@ import { recordLatency, recordTokenUsage, recordCost, recordMemoryRecall, record
 import { emitHook } from './hooks.js';
 import type { ContainerOutput } from './container-protocol.js';
 import type { RegisteredGroup } from './types.js';
+import { logger } from './logger.js';
 
 export type TraceBase = {
   trace_id: string;
@@ -88,21 +88,16 @@ export async function executeAgentRun(params: {
   onSessionUpdate?: (sessionId: string) => void;
   useGroupLock?: boolean;
   useSemaphore?: boolean;
+  modelFallbacks?: string[];
+  reasoningEffort?: 'off' | 'low' | 'medium' | 'high';
   abortSignal?: AbortSignal;
   isScheduledTask?: boolean;
-  isBackgroundTask?: boolean;
   taskId?: string;
-  jobId?: string;
-  isBackgroundJob?: boolean;
-  disablePlanner?: boolean;
-  disableResponseValidation?: boolean;
-  responseValidationMaxRetries?: number;
-  disableMemoryExtraction?: boolean;
-  profile?: TaskProfile;
   availableGroups?: Array<{ jid: string; name: string; lastActivity: string; isRegistered: boolean }>;
   maxToolSteps?: number;
   timeoutMs?: number;
   timezone?: string;
+  streamDir?: string;
   attachments?: Array<{
     type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
     path: string;
@@ -136,6 +131,18 @@ export async function executeAgentRun(params: {
     recallEnabled: params.recallMaxResults > 0 && params.recallMaxTokens > 0
   });
 
+  // Context window guard
+  const ctxLength = context.modelCapabilities?.context_length;
+  if (ctxLength && ctxLength < 16_000) {
+    throw new AgentExecutionError(
+      `Model context window too small (${ctxLength} tokens, minimum 16,000)`,
+      context
+    );
+  }
+  if (ctxLength && ctxLength < 32_000) {
+    logger.warn({ model: context.resolvedModel.model, ctxLength }, 'Model context window below 32K — quality may degrade');
+  }
+
   const resolvedMaxOutputTokens = [params.modelMaxOutputTokens, context.resolvedModel.override?.max_output_tokens]
     .filter((value): value is number => Number.isFinite(value))
     .reduce((min, value) => Math.min(min, value), Infinity);
@@ -147,10 +154,7 @@ export async function executeAgentRun(params: {
     chatJid: params.chatJid,
     isMain,
     isScheduledTask: params.isScheduledTask,
-    isBackgroundTask: params.isBackgroundTask,
     taskId: params.taskId,
-    jobId: params.jobId,
-    isBackgroundJob: params.isBackgroundJob,
     userId: params.userId ?? undefined,
     userName: params.userName,
     memoryRecall: context.memoryRecall,
@@ -161,17 +165,15 @@ export async function executeAgentRun(params: {
     behaviorConfig: context.behaviorConfig as Record<string, unknown>,
     toolPolicy: context.toolPolicy as Record<string, unknown>,
     modelOverride: params.modelOverride || context.resolvedModel.model,
+    modelFallbacks: params.modelFallbacks,
+    reasoningEffort: params.reasoningEffort,
     modelMaxOutputTokens: Number.isFinite(resolvedMaxOutputTokens) ? resolvedMaxOutputTokens : undefined,
     modelContextTokens: context.resolvedModel.override?.context_window,
     modelTemperature: context.resolvedModel.override?.temperature,
     timezone: params.timezone || TIMEZONE,
     hostPlatform: `${process.platform}/${process.arch}`,
-    disablePlanner: params.disablePlanner,
-    disableResponseValidation: params.disableResponseValidation,
-    responseValidationMaxRetries: params.responseValidationMaxRetries,
-    disableMemoryExtraction: params.disableMemoryExtraction,
-    profile: params.profile,
     maxToolSteps: params.maxToolSteps,
+    streamDir: params.streamDir,
     attachments: params.attachments
   }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });
 
@@ -181,7 +183,7 @@ export async function executeAgentRun(params: {
     user_id: params.userId ?? undefined,
     prompt: params.prompt.slice(0, 500),
     model: params.modelOverride || context.resolvedModel.model,
-    source: params.isBackgroundJob ? 'background' : params.isScheduledTask ? 'scheduler' : 'message'
+    source: params.isScheduledTask ? 'scheduler' : 'message'
   });
 
   let output: ContainerOutput;
@@ -219,15 +221,13 @@ export function recordAgentTelemetry(params: {
   output: ContainerOutput | null;
   context: AgentContext;
   metricsSource?: string;
-  toolAuditSource: 'message' | 'background' | 'scheduler' | 'heartbeat';
+  toolAuditSource: 'message' | 'scheduler' | 'heartbeat';
   errorMessage?: string;
   errorType?: string;
   extraTimings?: Record<string, number>;
 }): void {
   const { traceBase, output, context } = params;
-  const stageSource = params.metricsSource
-    ? params.metricsSource
-    : (params.toolAuditSource === 'background' ? 'background' : 'telegram');
+  const stageSource = params.metricsSource || 'telegram';
   const pricing = output?.model
     ? getModelPricing(context.modelRegistry, output.model)
     : context.modelPricing;
@@ -236,8 +236,6 @@ export function recordAgentTelemetry(params: {
   const timingBundle: Record<string, number> = {};
   if (context.timings?.context_build_ms) timingBundle.context_build_ms = context.timings.context_build_ms;
   if (context.timings?.memory_recall_ms) timingBundle.memory_recall_ms = context.timings.memory_recall_ms;
-  if (output?.timings?.planner_ms) timingBundle.planner_ms = output.timings.planner_ms;
-  if (output?.timings?.response_validation_ms) timingBundle.response_validation_ms = output.timings.response_validation_ms;
   if (output?.timings?.memory_extraction_ms) timingBundle.memory_extraction_ms = output.timings.memory_extraction_ms;
   if (output?.timings?.tool_ms) timingBundle.tool_ms = output.timings.tool_ms;
   if (params.extraTimings) {
@@ -274,12 +272,6 @@ export function recordAgentTelemetry(params: {
   }
   if (context.timings?.memory_recall_ms) {
     recordStageLatency('memory_recall', context.timings.memory_recall_ms, stageSource);
-  }
-  if (output?.timings?.planner_ms) {
-    recordStageLatency('planner', output.timings.planner_ms, stageSource);
-  }
-  if (output?.timings?.response_validation_ms) {
-    recordStageLatency('response_validation', output.timings.response_validation_ms, stageSource);
   }
   if (output?.timings?.memory_extraction_ms) {
     recordStageLatency('memory_extraction', output.timings.memory_extraction_ms, stageSource);

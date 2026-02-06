@@ -35,16 +35,14 @@ src/                          # Host process (Node.js)
 ├── agent-execution.ts        # Shared agent run logic (container invocation, telemetry)
 ├── container-runner.ts       # Spawns agent containers with mounts
 ├── ipc-dispatcher.ts         # Container IPC file watcher and dispatch
-├── request-router.ts         # Request classification and routing profiles
+├── request-router.ts         # Request routing configuration
 ├── task-scheduler.ts         # Scheduled task execution
-├── background-jobs.ts        # Durable background job queue
+├── streaming.ts              # Streaming delivery for real-time message updates
 ├── db.ts                     # SQLite operations
 ├── memory-store.ts           # Long-term memory storage (SQLite + FTS + embeddings)
 ├── runtime-config.ts         # Runtime configuration type and loading
 ├── config.ts                 # Paths, intervals, routing defaults
 ├── hooks.ts                  # Lifecycle event hooks
-├── workflow-engine.ts        # Declarative YAML/JSON workflow engine
-├── workflow-store.ts         # Workflow state persistence (SQLite)
 ├── transcription.ts          # Voice message transcription
 ├── error-messages.ts         # User-friendly error mapping
 ├── providers/
@@ -61,7 +59,7 @@ container/                    # Agent container
     └── src/
         ├── index.ts          # Main agent loop: OpenRouter calls, tool dispatch
         ├── container-protocol.ts  # Input/output types for host<->container IPC
-        ├── tools/            # Tool implementations (bash, web, file, etc.)
+        ├── tools.ts          # Tool definitions and execution
         └── ...
 
 scripts/                      # Setup and utility scripts
@@ -114,7 +112,7 @@ Key provider interface methods:
 For faster iteration during development, run individual tests:
 
 ```bash
-npx tsx --test src/**/*.test.ts     # Host tests only
+npm run build && node --test test/*.test.js     # Host tests only
 ```
 
 ## Adding a new provider

@@ -17,16 +17,39 @@ Example:
 ```json
 {
   "default": {
-    "allow": ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash"],
+    "allow": [
+      "Read", "Write", "Edit", "Glob", "Grep", "GitClone", "NpmInstall",
+      "WebSearch", "WebFetch", "Bash", "Python", "Browser",
+      "mcp__dotclaw__send_message", "mcp__dotclaw__send_file",
+      "mcp__dotclaw__send_photo", "mcp__dotclaw__send_voice",
+      "mcp__dotclaw__send_audio", "mcp__dotclaw__send_location",
+      "mcp__dotclaw__send_contact", "mcp__dotclaw__send_poll",
+      "mcp__dotclaw__send_buttons", "mcp__dotclaw__edit_message",
+      "mcp__dotclaw__delete_message", "mcp__dotclaw__download_url",
+      "mcp__dotclaw__text_to_speech",
+      "mcp__dotclaw__schedule_task", "mcp__dotclaw__run_task",
+      "mcp__dotclaw__list_tasks", "mcp__dotclaw__pause_task",
+      "mcp__dotclaw__resume_task", "mcp__dotclaw__cancel_task",
+      "mcp__dotclaw__update_task",
+      "mcp__dotclaw__register_group", "mcp__dotclaw__remove_group",
+      "mcp__dotclaw__list_groups", "mcp__dotclaw__set_model",
+      "mcp__dotclaw__memory_upsert", "mcp__dotclaw__memory_forget",
+      "mcp__dotclaw__memory_list", "mcp__dotclaw__memory_search",
+      "mcp__dotclaw__memory_stats"
+    ],
     "deny": [],
-    "max_per_run": { "Bash": 128, "WebSearch": 40, "WebFetch": 60 },
+    "max_per_run": { "Bash": 128, "Python": 64, "WebSearch": 40, "WebFetch": 60 },
     "default_max_per_run": 256
-  },
+  }
+}
+```
+
+**Warning:** Adding a `groups` override with an `allow` list restricts that group to **only** the listed tools (intersection with default). A group override like `"main": { "allow": ["Bash"] }` would block all other tools including Read, Write, and Edit. Only add group overrides when you intentionally want to restrict a group. To deny specific tools, use `deny` instead:
+
+```json
+{
   "groups": {
-    "main": { "allow": ["Bash", "WebSearch", "WebFetch"] }
-  },
-  "users": {
-    "123456789": { "deny": ["Bash"] }
+    "restricted-chat": { "deny": ["Bash", "Python"] }
   }
 }
 ```
@@ -125,6 +148,7 @@ The agent has access to the following coding tools:
 - `WebFetch` — Fetch and extract content from a URL
 - `GitClone` — Clone a git repository
 - `NpmInstall` — Install npm packages
+- `Browser` — In-container Chromium automation (navigate, screenshot, click, fill, extract)
 
 ## Built-in DotClaw tools
 
@@ -152,26 +176,7 @@ Scheduling:
 - `mcp__dotclaw__resume_task`
 - `mcp__dotclaw__cancel_task`
 - `mcp__dotclaw__list_tasks`
-- `mcp__dotclaw__run_task_now`
-
-Background jobs:
-
-- `mcp__dotclaw__spawn_job`
-- `mcp__dotclaw__job_status`
-- `mcp__dotclaw__list_jobs`
-- `mcp__dotclaw__cancel_job`
-- `mcp__dotclaw__job_update`
-
-Orchestration:
-
-- `mcp__dotclaw__orchestrate`
-
-Workflows:
-
-- `mcp__dotclaw__workflow_start`
-- `mcp__dotclaw__workflow_status`
-- `mcp__dotclaw__workflow_cancel`
-- `mcp__dotclaw__workflow_list`
+- `mcp__dotclaw__run_task`
 
 Memory:
 
@@ -191,5 +196,6 @@ Group management (main group only):
 Utility:
 
 - `mcp__dotclaw__download_url` (enabled when WebFetch is enabled)
+- `mcp__dotclaw__text_to_speech` (convert text to speech audio)
 
 Most send tools support `reply_to_message_id` for threaded replies.

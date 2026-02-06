@@ -411,37 +411,6 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       return requestResponse('run_task', { task_id: taskId }, config, 900_000);
     },
 
-    async spawnJob(args: {
-      prompt: string;
-      context_mode?: 'group' | 'isolated';
-      timeout_ms?: number;
-      max_tool_steps?: number;
-      tool_allow?: string[];
-      tool_deny?: string[];
-      model_override?: string;
-      priority?: number;
-      tags?: string[];
-      target_group?: string;
-    }) {
-      return requestResponse('spawn_job', args as Record<string, unknown>, config);
-    },
-
-    async jobStatus(jobId: string) {
-      return requestResponse('job_status', { job_id: jobId }, config);
-    },
-
-    async listJobs(args: { status?: string; limit?: number; target_group?: string }) {
-      return requestResponse('list_jobs', args as Record<string, unknown>, config);
-    },
-
-    async cancelJob(jobId: string) {
-      return requestResponse('cancel_job', { job_id: jobId }, config);
-    },
-
-    async jobUpdate(args: { job_id: string; message: string; level?: string; notify?: boolean; data?: Record<string, unknown> }) {
-      return requestResponse('job_update', args as Record<string, unknown>, config);
-    },
-
     async setModel(args: { model: string; scope?: 'global' | 'group' | 'user'; target_id?: string }) {
       if (!isMain) {
         return { ok: false, error: 'Only the main group can change the model.' };
@@ -502,36 +471,5 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
       }, config);
     },
 
-    async orchestrate(args: {
-      tasks: Array<{
-        name: string;
-        prompt: string;
-        model_override?: string;
-        timeout_ms?: number;
-        tool_allow?: string[];
-        tool_deny?: string[];
-      }>;
-      max_concurrent?: number;
-      timeout_ms?: number;
-      aggregation_prompt?: string;
-    }) {
-      return requestResponse('orchestrate', args as Record<string, unknown>, config, args.timeout_ms || 600_000);
-    },
-
-    async workflowStart(args: { name: string; params?: Record<string, unknown> }) {
-      return requestResponse('workflow_start', args as Record<string, unknown>, config);
-    },
-
-    async workflowStatus(args: { run_id: string }) {
-      return requestResponse('workflow_status', args as Record<string, unknown>, config);
-    },
-
-    async workflowCancel(args: { run_id: string }) {
-      return requestResponse('workflow_cancel', args as Record<string, unknown>, config);
-    },
-
-    async workflowList(args: { status?: string; limit?: number }) {
-      return requestResponse('workflow_list', args as Record<string, unknown>, config);
-    }
   };
 }

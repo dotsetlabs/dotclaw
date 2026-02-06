@@ -8,10 +8,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  isBackgroundTask?: boolean;
-  isBackgroundJob?: boolean;
   taskId?: string;
-  jobId?: string;
   userId?: string;
   userName?: string;
   maxToolSteps?: number;
@@ -37,16 +34,14 @@ export interface ContainerInput {
   behaviorConfig?: Record<string, unknown>;
   toolPolicy?: Record<string, unknown>;
   modelOverride?: string;
+  modelFallbacks?: string[];
+  reasoningEffort?: 'off' | 'low' | 'medium' | 'high';
   modelContextTokens?: number;
   modelMaxOutputTokens?: number;
   modelTemperature?: number;
   timezone?: string;
   hostPlatform?: string;
-  disablePlanner?: boolean;
-  disableResponseValidation?: boolean;
-  responseValidationMaxRetries?: number;
-  disableMemoryExtraction?: boolean;
-  profile?: 'fast' | 'standard' | 'deep' | 'background';
+  streamDir?: string;
   attachments?: Array<{
     type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
     path: string;
@@ -76,8 +71,6 @@ export interface ContainerOutput {
   memory_items_upserted?: number;
   memory_items_extracted?: number;
   timings?: {
-    planner_ms?: number;
-    response_validation_ms?: number;
     memory_extraction_ms?: number;
     tool_ms?: number;
   };

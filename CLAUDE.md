@@ -57,10 +57,10 @@ Host process (Node.js)              Docker container (agent-runner)
 ─────────────────────               ──────────────────────────────
 Providers (Telegram/Discord)        OpenRouter SDK calls
 Message pipeline (SQLite queue)     Tool execution (bash, browser, MCP)
-Request router (fast/std/deep)      Session management
+Request router                      Session management
 Container runner                    Memory extraction
 IPC dispatcher          ←──IPC──→   Skill loading
-Telemetry + traces                  Planner + validation passes
+Telemetry + traces                  Streaming delivery
 ```
 
 **IPC modes:**
@@ -72,10 +72,10 @@ Telemetry + traces                  Planner + validation passes
 1. Provider receives message → downloads attachments to `groups/<group>/inbox/`
 2. `enqueueMessage()` → SQLite `message_queue` (status: pending)
 3. `drainQueue()` → `claimBatchForChat()` groups rapid messages within `BATCH_WINDOW_MS` (2s)
-4. `routeRequest()` classifies into fast/standard/deep/background profile (sets model, token limits)
+4. `routeRequest()` applies flat routing config (model, token limits, max tool steps)
 5. `executeAgentRun()` builds context (memory recall, tool policy) → `runContainerAgent()`
-6. Container agent-runner calls OpenRouter, iterates tool calls up to `maxToolSteps`
-7. Response returned via IPC → sent back through provider → telemetry recorded
+6. Container agent-runner calls OpenRouter with streaming, iterates tool calls up to `maxToolSteps` (default 50)
+7. Streaming response delivered via edit-in-place → sent back through provider → telemetry recorded
 
 Transient failures re-queue with exponential backoff (base 3s, max 60s, up to 4 retries).
 
@@ -100,11 +100,11 @@ Chat IDs are prefixed: `telegram:123456`, `discord:789012`. The provider registr
 | `src/container-runner.ts` | Docker container lifecycle, mounts, daemon management |
 | `src/container-protocol.ts` | `ContainerInput`/`ContainerOutput` interfaces (shared with container) |
 | `src/ipc-dispatcher.ts` | File-watcher for container→host async messages |
-| `src/request-router.ts` | Request classification into fast/standard/deep/background |
+| `src/request-router.ts` | Request routing configuration |
 | `src/runtime-config.ts` | Runtime config type definition and loader (with validation) |
+| `src/streaming.ts` | Streaming delivery for real-time message updates |
 | `src/providers/registry.ts` | Provider registry (prefix-based routing) |
 | `src/task-scheduler.ts` | Cron and one-off scheduled tasks |
-| `src/background-jobs.ts` | Durable background job queue |
 | `src/db.ts` | SQLite schema and operations |
 | `src/memory-store.ts` | Long-term memory with embeddings and FTS |
 | `container/agent-runner/src/index.ts` | Agent entry point (OpenRouter calls, tool loop) |

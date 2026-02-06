@@ -66,6 +66,7 @@ export type RuntimeConfig = {
       maxRetries: number;
       retryBaseMs: number;
       retryMaxMs: number;
+      interruptOnNewMessage: boolean;
     };
     metrics: {
       port: number;
@@ -145,90 +146,20 @@ export type RuntimeConfig = {
       intervalMs: number;
       groupFolder: string;
     };
-    backgroundJobs: {
-      enabled: boolean;
-      pollIntervalMs: number;
-      maxConcurrent: number;
-      maxRuntimeMs: number;
-      maxToolSteps: number;
-      inlineMaxChars: number;
-      contextModeDefault: 'group' | 'isolated';
-      toolAllow: string[];
-      toolDeny: string[];
-      jobRetentionMs: number;
-      taskLogRetentionMs: number;
-      progress: {
-        enabled: boolean;
-        startDelayMs: number;
-        intervalMs: number;
-        maxUpdates: number;
-      };
-      autoSpawn: {
-        enabled: boolean;
-        foregroundTimeoutMs: number;
-        onTimeout: boolean;
-        onToolLimit: boolean;
-        classifier: {
-          enabled: boolean;
-          model: string;
-          timeoutMs: number;
-          maxOutputTokens: number;
-          temperature: number;
-          confidenceThreshold: number;
-          adaptive?: {
-            enabled: boolean;
-            minThreshold: number;
-            maxThreshold: number;
-            queueDepthLow: number;
-            queueDepthHigh: number;
-          };
-        };
-      };
-    };
     routing: {
+      model: string;
+      fallbacks: string[];
+      maxOutputTokens: number;
+      maxToolSteps: number;
+      temperature?: number;
+      recallMaxResults: number;
+      recallMaxTokens: number;
+    };
+    streaming: {
       enabled: boolean;
-      maxFastChars: number;
-      maxStandardChars: number;
-      classifierFallback: {
-        enabled: boolean;
-      };
-      plannerProbe: {
-        enabled: boolean;
-        model: string;
-        timeoutMs: number;
-        maxOutputTokens: number;
-        temperature: number;
-        minChars: number;
-        minSteps: number;
-        minTools: number;
-      };
-      toolIntentProbe: {
-        enabled: boolean;
-        model: string;
-        timeoutMs: number;
-        maxOutputTokens: number;
-      };
-      profiles: Record<string, {
-        model: string;
-        maxOutputTokens: number;
-        maxToolSteps: number;
-        recallMaxResults?: number;
-        recallMaxTokens?: number;
-        enablePlanner: boolean;
-        enableValidation: boolean;
-        responseValidationMaxRetries?: number;
-        enableMemoryRecall: boolean;
-        enableMemoryExtraction: boolean;
-        toolAllow?: string[];
-        toolDeny?: string[];
-        progress?: {
-          enabled?: boolean;
-          initialMs?: number;
-          intervalMs?: number;
-          maxUpdates?: number;
-          messages?: string[];
-        };
-      }>;
+      chunkFlushIntervalMs: number;
+      editIntervalMs: number;
+      maxEditLength: number;
     };
     toolBudgets: {
       enabled: boolean;
@@ -279,26 +210,6 @@ export type RuntimeConfig = {
     models: {
       summary: string;
       memory: string;
-      planner: string;
-      responseValidation: string;
-      toolSummary: string;
-    };
-    planner: {
-      enabled: boolean;
-      mode: string;
-      minTokens: number;
-      triggerRegex: string;
-      maxOutputTokens: number;
-      temperature: number;
-    };
-    responseValidation: {
-      enabled: boolean;
-      maxOutputTokens: number;
-      temperature: number;
-      maxRetries: number;
-      allowToolCalls: boolean;
-      minPromptTokens: number;
-      minResponseTokens: number;
     };
     tools: {
       maxToolSteps: number;
@@ -371,6 +282,9 @@ export type RuntimeConfig = {
         url?: string;
       }>;
       connectionTimeoutMs: number;
+    };
+    reasoning: {
+      effort: 'off' | 'low' | 'medium' | 'high';
     };
     skills: {
       enabled: boolean;
@@ -458,7 +372,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       stalledTimeoutMs: 300_000,
       maxRetries: 4,
       retryBaseMs: 3_000,
-      retryMaxMs: 60_000
+      retryMaxMs: 60_000,
+      interruptOnNewMessage: true
     },
     metrics: {
       port: 3001,
@@ -538,143 +453,20 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       intervalMs: 3_600_000,
       groupFolder: 'main'
     },
-    backgroundJobs: {
-      enabled: true,
-      pollIntervalMs: 2000,
-      maxConcurrent: 2,
-      maxRuntimeMs: 2_400_000,
-      maxToolSteps: 256,
-      inlineMaxChars: 8000,
-      contextModeDefault: 'group',
-      toolAllow: [],
-      toolDeny: [
-        'mcp__dotclaw__schedule_task',
-        'mcp__dotclaw__update_task',
-        'mcp__dotclaw__pause_task',
-        'mcp__dotclaw__resume_task',
-        'mcp__dotclaw__cancel_task',
-        'mcp__dotclaw__spawn_job'
-      ],
-      jobRetentionMs: 604_800_000,
-      taskLogRetentionMs: 2_592_000_000,
-      progress: {
-        enabled: false,
-        startDelayMs: 30_000,
-        intervalMs: 120_000,
-        maxUpdates: 3
-      },
-      autoSpawn: {
-        enabled: true,
-        foregroundTimeoutMs: 90_000,
-        onTimeout: true,
-        onToolLimit: true,
-        classifier: {
-          enabled: true,
-          model: 'deepseek/deepseek-v3.2',
-          timeoutMs: 3000,
-          maxOutputTokens: 32,
-          temperature: 0,
-          confidenceThreshold: 0.6,
-          adaptive: {
-            enabled: true,
-            minThreshold: 0.55,
-            maxThreshold: 0.65,
-            queueDepthLow: 0,
-            queueDepthHigh: 4
-          }
-        }
-      }
-    },
     routing: {
+      model: 'moonshotai/kimi-k2.5',
+      fallbacks: [],
+      maxOutputTokens: 4096,
+      maxToolSteps: 50,
+      temperature: 0.2,
+      recallMaxResults: 8,
+      recallMaxTokens: 1500,
+    },
+    streaming: {
       enabled: true,
-      maxFastChars: 200,
-      maxStandardChars: 1200,
-      classifierFallback: {
-        enabled: true,
-      },
-      plannerProbe: {
-        enabled: true,
-        model: 'deepseek/deepseek-v3.2',
-        timeoutMs: 3000,
-        maxOutputTokens: 120,
-        temperature: 0,
-        minChars: 700,
-        minSteps: 4,
-        minTools: 3
-      },
-      toolIntentProbe: {
-        enabled: true,
-        model: 'deepseek/deepseek-v3.2',
-        timeoutMs: 2000,
-        maxOutputTokens: 8,
-      },
-      profiles: {
-        fast: {
-          model: 'deepseek/deepseek-v3.2',
-          maxOutputTokens: 4096,
-          maxToolSteps: 12,
-          recallMaxResults: 0,
-          recallMaxTokens: 0,
-          enablePlanner: false,
-          enableValidation: false,
-          responseValidationMaxRetries: 0,
-          enableMemoryRecall: false,
-          enableMemoryExtraction: false,
-          toolAllow: [],
-          toolDeny: [],
-          progress: {
-            enabled: false
-          }
-        },
-        standard: {
-          model: 'moonshotai/kimi-k2.5',
-          maxOutputTokens: 4096,
-          maxToolSteps: 48,
-          recallMaxResults: 6,
-          recallMaxTokens: 1500,
-          enablePlanner: true,
-          enableValidation: true,
-          responseValidationMaxRetries: 1,
-          enableMemoryRecall: true,
-          enableMemoryExtraction: true,
-          toolAllow: [],
-          toolDeny: []
-        },
-        deep: {
-          model: 'moonshotai/kimi-k2.5',
-          maxOutputTokens: 4096,
-          maxToolSteps: 128,
-          recallMaxResults: 12,
-          recallMaxTokens: 2500,
-          enablePlanner: true,
-          enableValidation: true,
-          responseValidationMaxRetries: 2,
-          enableMemoryRecall: true,
-          enableMemoryExtraction: true,
-          toolAllow: [],
-          toolDeny: []
-        },
-        background: {
-          model: 'moonshotai/kimi-k2.5',
-          maxOutputTokens: 4096,
-          maxToolSteps: 256,
-          recallMaxResults: 16,
-          recallMaxTokens: 4000,
-          enablePlanner: true,
-          enableValidation: true,
-          responseValidationMaxRetries: 2,
-          enableMemoryRecall: true,
-          enableMemoryExtraction: true,
-          toolAllow: [],
-          toolDeny: [],
-          progress: {
-            enabled: true,
-            initialMs: 15_000,
-            intervalMs: 60_000,
-            maxUpdates: 3
-          }
-        }
-      }
+      chunkFlushIntervalMs: 200,
+      editIntervalMs: 400,
+      maxEditLength: 3800,
     },
     toolBudgets: {
       enabled: false,
@@ -725,26 +517,6 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     models: {
       summary: 'deepseek/deepseek-v3.2',
       memory: 'deepseek/deepseek-v3.2',
-      planner: 'deepseek/deepseek-v3.2',
-      responseValidation: 'deepseek/deepseek-v3.2',
-      toolSummary: 'deepseek/deepseek-v3.2'
-    },
-    planner: {
-      enabled: true,
-      mode: 'auto',
-      minTokens: 800,
-      triggerRegex: '(plan|steps|roadmap|research|design|architecture|spec|strategy)',
-      maxOutputTokens: 1024,
-      temperature: 0.2
-    },
-    responseValidation: {
-      enabled: true,
-      maxOutputTokens: 1024,
-      temperature: 0,
-      maxRetries: 1,
-      allowToolCalls: false,
-      minPromptTokens: 400,
-      minResponseTokens: 160
     },
     tools: {
       maxToolSteps: 96,
@@ -811,6 +583,9 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       servers: [],
       connectionTimeoutMs: 10_000
     },
+    reasoning: {
+      effort: 'low',
+    },
     skills: {
       enabled: true,
       maxSkills: 32,
@@ -862,9 +637,15 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   h.messageQueue.batchWindowMs = clampMin(h.messageQueue.batchWindowMs, 0, 'host.messageQueue.batchWindowMs');
   h.messageQueue.maxRetries = clampMin(h.messageQueue.maxRetries, 0, 'host.messageQueue.maxRetries');
 
-  // Background jobs
-  h.backgroundJobs.maxConcurrent = clampMin(h.backgroundJobs.maxConcurrent, 1, 'host.backgroundJobs.maxConcurrent');
-  h.backgroundJobs.maxRuntimeMs = clampMin(h.backgroundJobs.maxRuntimeMs, 1000, 'host.backgroundJobs.maxRuntimeMs');
+  // Routing
+  h.routing.maxOutputTokens = clampMin(h.routing.maxOutputTokens, 1, 'host.routing.maxOutputTokens');
+  h.routing.maxToolSteps = clampMin(h.routing.maxToolSteps, 1, 'host.routing.maxToolSteps');
+  h.routing.recallMaxResults = clampMin(h.routing.recallMaxResults, 0, 'host.routing.recallMaxResults');
+  h.routing.recallMaxTokens = clampMin(h.routing.recallMaxTokens, 0, 'host.routing.recallMaxTokens');
+
+  // Streaming
+  h.streaming.editIntervalMs = clampMin(h.streaming.editIntervalMs, 100, 'host.streaming.editIntervalMs');
+  h.streaming.maxEditLength = clampMin(h.streaming.maxEditLength, 100, 'host.streaming.maxEditLength');
 
   // Hooks
   config.hooks.maxConcurrent = clampMin(config.hooks.maxConcurrent, 1, 'hooks.maxConcurrent');
@@ -944,6 +725,18 @@ export function loadRuntimeConfig(): RuntimeConfig {
   const merged = fromFile ? mergeDefaults(DEFAULT_CONFIG, fromFile) : cloneConfig(DEFAULT_CONFIG);
   if (!hasTelegramHandlerOverride(fromFile)) {
     merged.host.telegram.handlerTimeoutMs = Math.max(merged.host.container.timeoutMs + 30_000, 120_000);
+  }
+  // Warn about deprecated config keys (silently dropped by mergeDefaults)
+  if (isPlainObject(fromFile)) {
+    const host = (fromFile as Record<string, unknown>).host;
+    if (isPlainObject(host)) {
+      if (isPlainObject(host.backgroundJobs)) {
+        console.warn('[runtime-config] host.backgroundJobs is deprecated and ignored — background jobs have been removed');
+      }
+      if (isPlainObject(host.routing) && isPlainObject((host.routing as Record<string, unknown>).profiles)) {
+        console.warn('[runtime-config] host.routing.profiles is deprecated — routing now uses a single flat config');
+      }
+    }
   }
   validateRuntimeConfig(merged);
   cachedConfig = merged;

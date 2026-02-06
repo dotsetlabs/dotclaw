@@ -1,5 +1,5 @@
 import http from 'http';
-import { Registry, collectDefaultMetrics, Counter, Histogram, Gauge } from 'prom-client';
+import { Registry, collectDefaultMetrics, Counter, Histogram } from 'prom-client';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { logger } from './logger.js';
 
@@ -32,17 +32,6 @@ const taskRunsTotal = new Counter({
   labelNames: ['status']
 });
 
-const backgroundJobRunsTotal = new Counter({
-  name: 'dotclaw_background_job_runs_total',
-  help: 'Total background job runs',
-  labelNames: ['status']
-});
-
-const routingProfilesTotal = new Counter({
-  name: 'dotclaw_routing_profile_total',
-  help: 'Total routing decisions by profile',
-  labelNames: ['profile']
-});
 
 const tokensPromptTotal = new Counter({
   name: 'dotclaw_tokens_prompt_total',
@@ -88,23 +77,15 @@ const responseLatency = new Histogram({
 
 const stageLatency = new Histogram({
   name: 'dotclaw_stage_latency_ms',
-  help: 'Latency of routing/validation/planning/etc stages in ms',
+  help: 'Latency of processing stages in ms',
   labelNames: ['stage', 'source'],
   buckets: [10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000]
-});
-
-const classifierThreshold = new Gauge({
-  name: 'dotclaw_classifier_threshold',
-  help: 'Effective background job classifier confidence threshold',
-  labelNames: ['source']
 });
 
 registry.registerMetric(messagesTotal);
 registry.registerMetric(errorsTotal);
 registry.registerMetric(toolCallsTotal);
 registry.registerMetric(taskRunsTotal);
-registry.registerMetric(backgroundJobRunsTotal);
-registry.registerMetric(routingProfilesTotal);
 registry.registerMetric(tokensPromptTotal);
 registry.registerMetric(tokensCompletionTotal);
 registry.registerMetric(costTotal);
@@ -113,7 +94,6 @@ registry.registerMetric(memoryUpsertTotal);
 registry.registerMetric(memoryExtractTotal);
 registry.registerMetric(responseLatency);
 registry.registerMetric(stageLatency);
-registry.registerMetric(classifierThreshold);
 
 export function recordMessage(source: string): void {
   messagesTotal.inc({ source });
@@ -131,15 +111,6 @@ export function recordTaskRun(status: 'success' | 'error'): void {
   taskRunsTotal.inc({ status });
 }
 
-export function recordBackgroundJobRun(status: 'success' | 'error' | 'canceled' | 'timed_out'): void {
-  backgroundJobRunsTotal.inc({ status });
-}
-
-export function recordRoutingDecision(profile: string): void {
-  if (!profile) return;
-  routingProfilesTotal.inc({ profile });
-}
-
 export function recordLatency(ms: number): void {
   if (Number.isFinite(ms)) responseLatency.observe(ms);
 }
@@ -147,11 +118,6 @@ export function recordLatency(ms: number): void {
 export function recordStageLatency(stage: string, ms: number, source: string = 'telegram'): void {
   if (!stage || !Number.isFinite(ms)) return;
   stageLatency.observe({ stage, source }, ms);
-}
-
-export function recordClassifierThreshold(source: string, threshold: number): void {
-  if (!Number.isFinite(threshold)) return;
-  classifierThreshold.set({ source }, threshold);
 }
 
 export function recordTokenUsage(model: string, source: string, promptTokens: number, completionTokens: number): void {

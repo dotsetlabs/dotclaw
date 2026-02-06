@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import type { RegisteredGroup, Session, BackgroundJobStatus } from './types.js';
+import type { RegisteredGroup, Session } from './types.js';
 import { ProviderRegistry } from './providers/registry.js';
 import {
   createTask,
@@ -8,13 +8,6 @@ import {
   deleteTask,
   getTaskById,
 } from './db.js';
-import {
-  spawnBackgroundJob,
-  getBackgroundJobStatus,
-  listBackgroundJobsForGroup,
-  cancelBackgroundJob,
-  recordBackgroundJobUpdate,
-} from './background-jobs.js';
 import { resolveContainerGroupPathToHost } from './path-mapping.js';
 import {
   upsertMemoryItems,
@@ -42,8 +35,6 @@ import {
 import { runTaskNow } from './task-scheduler.js';
 
 const runtime = loadRuntimeConfig();
-const JOB_UPDATE_NOTIFY_DEDUP_WINDOW_MS = 120_000;
-const lastJobUpdateNotifications = new Map<string, { message: string; at: number }>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -838,127 +829,6 @@ async function processRequestIpc(
           error: result.ok ? undefined : result.error
         };
       }
-      case 'spawn_job': {
-        const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
-        if (!prompt) {
-          return { id: requestId, ok: false, error: 'prompt is required.' };
-        }
-        const targetGroup = (typeof payload.target_group === 'string' && isMain)
-          ? payload.target_group
-          : sourceGroup;
-        const groupEntry = Object.entries(registeredGroups).find(([, group]) => group.folder === targetGroup);
-        if (!groupEntry) {
-          return { id: requestId, ok: false, error: 'Target group not registered.' };
-        }
-        const [chatId, group] = groupEntry;
-        const result = spawnBackgroundJob({
-          prompt,
-          groupFolder: group.folder,
-          chatJid: chatId,
-          contextMode: (payload.context_mode === 'group' || payload.context_mode === 'isolated')
-            ? payload.context_mode
-            : undefined,
-          timeoutMs: typeof payload.timeout_ms === 'number' ? payload.timeout_ms : undefined,
-          maxToolSteps: typeof payload.max_tool_steps === 'number' ? payload.max_tool_steps : undefined,
-          toolAllow: Array.isArray(payload.tool_allow) ? payload.tool_allow as string[] : undefined,
-          toolDeny: Array.isArray(payload.tool_deny) ? payload.tool_deny as string[] : undefined,
-          modelOverride: typeof payload.model_override === 'string' ? payload.model_override : undefined,
-          priority: typeof payload.priority === 'number' ? payload.priority : undefined,
-          tags: Array.isArray(payload.tags) ? payload.tags as string[] : undefined,
-          parentTraceId: typeof payload.parent_trace_id === 'string' ? payload.parent_trace_id : undefined,
-          parentMessageId: typeof payload.parent_message_id === 'string' ? payload.parent_message_id : undefined
-        });
-        return {
-          id: requestId,
-          ok: result.ok,
-          result: result.ok ? { job_id: result.jobId } : undefined,
-          error: result.ok ? undefined : result.error
-        };
-      }
-      case 'job_status': {
-        const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
-        if (!jobId) {
-          return { id: requestId, ok: false, error: 'job_id is required.' };
-        }
-        const job = getBackgroundJobStatus(jobId);
-        if (!job) {
-          return { id: requestId, ok: false, error: 'Job not found.' };
-        }
-        if (!isMain && job.group_folder !== sourceGroup) {
-          return { id: requestId, ok: false, error: 'Unauthorized job status request.' };
-        }
-        return { id: requestId, ok: true, result: { job } };
-      }
-      case 'list_jobs': {
-        const targetGroup = (typeof payload.target_group === 'string' && isMain)
-          ? payload.target_group
-          : sourceGroup;
-        const statusRaw = typeof payload.status === 'string' ? payload.status : undefined;
-        const allowedStatuses: BackgroundJobStatus[] = ['queued', 'running', 'succeeded', 'failed', 'canceled', 'timed_out'];
-        const status = statusRaw && allowedStatuses.includes(statusRaw as BackgroundJobStatus)
-          ? (statusRaw as BackgroundJobStatus)
-          : undefined;
-        const limit = typeof payload.limit === 'number' ? payload.limit : undefined;
-        const jobs = listBackgroundJobsForGroup({ groupFolder: targetGroup, status, limit });
-        return { id: requestId, ok: true, result: { jobs } };
-      }
-      case 'cancel_job': {
-        const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
-        if (!jobId) {
-          return { id: requestId, ok: false, error: 'job_id is required.' };
-        }
-        const job = getBackgroundJobStatus(jobId);
-        if (!job) {
-          return { id: requestId, ok: false, error: 'Job not found.' };
-        }
-        if (!isMain && job.group_folder !== sourceGroup) {
-          return { id: requestId, ok: false, error: 'Unauthorized job cancel attempt.' };
-        }
-        const result = cancelBackgroundJob(jobId);
-        return { id: requestId, ok: result.ok, error: result.error };
-      }
-      case 'job_update': {
-        const jobId = typeof payload.job_id === 'string' ? payload.job_id : '';
-        const message = typeof payload.message === 'string' ? payload.message.trim() : '';
-        const levelRaw = typeof payload.level === 'string' ? payload.level : 'progress';
-        const allowedLevels = ['info', 'progress', 'warn', 'error'] as const;
-        type JobUpdateLevel = typeof allowedLevels[number];
-        const level: JobUpdateLevel = allowedLevels.includes(levelRaw as JobUpdateLevel)
-          ? (levelRaw as JobUpdateLevel)
-          : 'progress';
-        if (!jobId || !message) {
-          return { id: requestId, ok: false, error: 'job_id and message are required.' };
-        }
-        const job = getBackgroundJobStatus(jobId);
-        if (!job) {
-          return { id: requestId, ok: false, error: 'Job not found.' };
-        }
-        if (!isMain && job.group_folder !== sourceGroup) {
-          return { id: requestId, ok: false, error: 'Unauthorized job update attempt.' };
-        }
-        const result = recordBackgroundJobUpdate({
-          jobId,
-          level,
-          message,
-          data: typeof payload.data === 'object' && payload.data ? payload.data as Record<string, unknown> : undefined
-        });
-        if (result.ok && payload.notify === true && job.chat_jid) {
-          const nowMs = Date.now();
-          const previous = lastJobUpdateNotifications.get(job.id);
-          const isDuplicate = previous !== undefined
-            && previous.message === message
-            && (nowMs - previous.at) < JOB_UPDATE_NOTIFY_DEDUP_WINDOW_MS;
-          if (!isDuplicate) {
-            const provider = deps.registry.getProviderForChat(job.chat_jid);
-            const notifyResult = await provider.sendMessage(job.chat_jid, message);
-            if (!notifyResult.success) {
-              return { id: requestId, ok: false, error: 'Background job update saved, but notification delivery failed.' };
-            }
-            lastJobUpdateNotifications.set(job.id, { message, at: nowMs });
-          }
-        }
-        return { id: requestId, ok: result.ok, error: result.error };
-      }
       case 'edit_message': {
         const messageId = typeof payload.message_id === 'number' ? String(payload.message_id) : String(payload.message_id);
         const text = typeof payload.text === 'string' ? payload.text.trim() : '';
@@ -993,63 +863,6 @@ async function processRequestIpc(
         const provider = deps.registry.getProviderForChat(chatJid);
         await provider.deleteMessage(chatJid, messageId);
         return { id: requestId, ok: true, result: { deleted: true } };
-      }
-      case 'orchestrate': {
-        const tasks = Array.isArray(payload.tasks) ? payload.tasks as Array<{ name: string; prompt: string; model_override?: string; timeout_ms?: number; tool_allow?: string[]; tool_deny?: string[] }> : [];
-        if (tasks.length === 0) {
-          return { id: requestId, ok: false, error: 'tasks array is required.' };
-        }
-        const orchGroupEntry = Object.entries(registeredGroups).find(([, g]) => g.folder === sourceGroup);
-        const orchChatJid = orchGroupEntry ? orchGroupEntry[0] : '';
-        const { runOrchestration } = await import('./orchestration.js');
-        const result = await runOrchestration({
-          tasks,
-          max_concurrent: typeof payload.max_concurrent === 'number' ? payload.max_concurrent : undefined,
-          timeout_ms: typeof payload.timeout_ms === 'number' ? payload.timeout_ms : undefined,
-          aggregation_prompt: typeof payload.aggregation_prompt === 'string' ? payload.aggregation_prompt : undefined,
-          groupFolder: sourceGroup,
-          chatJid: orchChatJid
-        }, {
-          registeredGroups: () => registeredGroups,
-          getSessions: () => sessions,
-          setSession: (gf: string, sid: string) => { deps.setSession(gf, sid); }
-        });
-        return { id: requestId, ok: result.ok, result, error: result.error };
-      }
-      case 'workflow_start': {
-        const { startWorkflowRun } = await import('./workflow-engine.js');
-        const name = typeof payload.name === 'string' ? payload.name : '';
-        if (!name) return { id: requestId, ok: false, error: 'Workflow name is required.' };
-        const wfGroupEntry = Object.entries(registeredGroups).find(([, g]) => g.folder === sourceGroup);
-        const wfChatJid = wfGroupEntry ? wfGroupEntry[0] : '';
-        const result = await startWorkflowRun(name, sourceGroup, wfChatJid, payload.params as Record<string, unknown> | undefined, {
-          registeredGroups: () => registeredGroups,
-          getSessions: () => sessions,
-          setSession: (gf: string, sid: string) => { deps.setSession(gf, sid); }
-        });
-        return { id: requestId, ok: result.ok, result, error: result.error };
-      }
-      case 'workflow_status': {
-        const { getWorkflowRunStatus } = await import('./workflow-engine.js');
-        const runId = typeof payload.run_id === 'string' ? payload.run_id : '';
-        if (!runId) return { id: requestId, ok: false, error: 'run_id is required.' };
-        const result = getWorkflowRunStatus(runId);
-        return { id: requestId, ok: !!result, result, error: result ? undefined : 'Run not found.' };
-      }
-      case 'workflow_cancel': {
-        const { cancelWorkflowRun } = await import('./workflow-engine.js');
-        const runId = typeof payload.run_id === 'string' ? payload.run_id : '';
-        if (!runId) return { id: requestId, ok: false, error: 'run_id is required.' };
-        const canceled = cancelWorkflowRun(runId);
-        return { id: requestId, ok: canceled, error: canceled ? undefined : 'Run not found or not running.' };
-      }
-      case 'workflow_list': {
-        const { listWorkflowRuns } = await import('./workflow-engine.js');
-        const runs = listWorkflowRuns(sourceGroup, {
-          status: typeof payload.status === 'string' ? payload.status : undefined,
-          limit: typeof payload.limit === 'number' ? payload.limit : 10
-        });
-        return { id: requestId, ok: true, result: { runs } };
       }
       default:
         return { id: requestId, ok: false, error: `Unknown request type: ${data.type}` };

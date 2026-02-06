@@ -62,5 +62,4 @@ export const TRACE_RETENTION_DAYS = runtime.host.trace.retentionDays;
 export const MAINTENANCE_INTERVAL_MS = runtime.host.maintenance.intervalMs;
 export const BATCH_WINDOW_MS = runtime.host.messageQueue.batchWindowMs;
 export const MAX_BATCH_SIZE = runtime.host.messageQueue.maxBatchSize ?? 50;
-export const JOB_RETENTION_MS = runtime.host.backgroundJobs.jobRetentionMs ?? 604_800_000;
-export const TASK_LOG_RETENTION_MS = runtime.host.backgroundJobs.taskLogRetentionMs ?? 2_592_000_000;
+export const TASK_LOG_RETENTION_MS = 2_592_000_000; // 30 days

@@ -71,7 +71,6 @@ test('validation clamps invalid negative timeouts to safe defaults', async () =>
       container: { timeoutMs: 0 },
       concurrency: { maxAgents: 0 },
       maintenance: { intervalMs: -1 },
-      backgroundJobs: { maxConcurrent: -5 }
     },
     hooks: { maxConcurrent: 0 }
   };
@@ -84,7 +83,6 @@ test('validation clamps invalid negative timeouts to safe defaults', async () =>
     assert.ok(config.host.container.timeoutMs >= 1000, 'container timeoutMs should be clamped to >= 1000');
     assert.ok(config.host.concurrency.maxAgents >= 1, 'maxAgents should be clamped to >= 1');
     assert.ok(config.host.maintenance.intervalMs >= 60000, 'maintenance intervalMs should be clamped to >= 60000');
-    assert.ok(config.host.backgroundJobs.maxConcurrent >= 1, 'backgroundJobs maxConcurrent should be clamped to >= 1');
     assert.ok(config.hooks.maxConcurrent >= 1, 'hooks maxConcurrent should be clamped to >= 1');
   });
 });

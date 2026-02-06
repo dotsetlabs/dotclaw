@@ -1,6 +1,6 @@
 {
   "name": "@dotsetlabs/dotclaw",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Personal OpenRouter-based assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
@@ -24,7 +24,6 @@
     "container/Dockerfile",
     "container/build.sh",
     "container/.dockerignore",
-    "container/skills",
     "container/agent-runner/package.json",
     "container/agent-runner/package-lock.json",
     "container/agent-runner/tsconfig.json",

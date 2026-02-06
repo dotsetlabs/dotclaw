@@ -57,7 +57,13 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp | string; message: string }> = [
 
   // Memory/resource errors
   { pattern: /out of memory/i, message: "That task needed more memory than available. Please try with less data." },
-  { pattern: /memory.?limit/i, message: "That task needed more memory than available. Please try with less data." }
+  { pattern: /memory.?limit/i, message: "That task needed more memory than available. Please try with less data." },
+
+  // Interrupt
+  { pattern: /interrupted/i, message: "Got your new message — working on that instead." },
+
+  // Fallback chain exhaustion
+  { pattern: /All models failed/i, message: "All available models are down right now. Please try again in a minute." }
 ];
 
 /**

@@ -142,7 +142,7 @@ if ! command -v systemctl >/dev/null 2>&1; then
 fi
 
 DOTCLAW_SERVICE_CONTENT="[Unit]
-Description=DotClaw Telegram Assistant
+Description=DotClaw Assistant
 After=network-online.target docker.service
 Wants=network-online.target docker.service
 

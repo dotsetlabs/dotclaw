@@ -23,7 +23,13 @@ title: Runtime Config
     "metrics": { "port": 3001, "enabled": true },
     "dashboard": { "enabled": true },
     "memory": { "embeddings": { "enabled": true } },
-    "routing": { "enabled": true }
+    "routing": {
+      "model": "moonshotai/kimi-k2.5",
+      "fallbacks": [],
+      "maxOutputTokens": 4096,
+      "maxToolSteps": 25,
+      "temperature": 0.2
+    }
   },
   "agent": {
     "assistantName": "Rain"
@@ -110,6 +116,7 @@ title: Runtime Config
 | `maxRetries` | `4` | Maximum retries for failed messages |
 | `retryBaseMs` | `3000` | Base delay between retries |
 | `retryMaxMs` | `60000` | Maximum retry delay |
+| `interruptOnNewMessage` | `true` | Auto-cancel the active run when a new message arrives in the same chat |
 
 ### `host.scheduler`
 
@@ -242,73 +249,30 @@ title: Runtime Config
 | `tokensPerMessage` | `3` | Token overhead per message |
 | `tokensPerRequest` | `0` | Additional token overhead per request |
 
-### `host.backgroundJobs`
-
-`host.backgroundJobs` enables a durable background job queue for long-running tasks that complete
-asynchronously and report back when done.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `enabled` | `true` | Enable background job queue |
-| `pollIntervalMs` | `2000` | Job queue poll interval |
-| `maxConcurrent` | `2` | Maximum concurrent background jobs |
-| `maxRuntimeMs` | `2400000` (40m) | Maximum job runtime |
-| `maxToolSteps` | `256` | Tool step limit for background jobs |
-| `inlineMaxChars` | `8000` | Maximum characters for inline results |
-| `contextModeDefault` | `"group"` | Default context mode: `group` or `isolated` |
-| `toolAllow` | `[]` | Tool allowlist for background jobs |
-| `toolDeny` | `[...]` | Tool denylist (prevents recursive scheduling by default) |
-| `jobRetentionMs` | `604800000` (7d) | Completed job retention period |
-| `taskLogRetentionMs` | `2592000000` (30d) | Task log retention period |
-
-#### `host.backgroundJobs.autoSpawn`
-
-`autoSpawn` can promote stalled foreground requests into background jobs automatically.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `enabled` | `true` | Enable automatic background job promotion |
-| `foregroundTimeoutMs` | `90000` (90s) | Foreground timeout before promotion |
-| `onTimeout` | `true` | Promote when foreground times out |
-| `onToolLimit` | `true` | Promote when tool step limit is reached |
-
-#### `host.backgroundJobs.autoSpawn.classifier`
-
-An LLM classifier that decides immediately when a request should run in the background.
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `enabled` | `true` | Enable classifier |
-| `model` | `"deepseek/deepseek-v3.2"` | Classifier model |
-| `confidenceThreshold` | `0.6` | Minimum confidence to auto-spawn |
-
 ### `host.routing`
 
-`host.routing` controls per-request routing profiles. Each profile sets the model, output limits, tool steps, and feature toggles.
+`host.routing` controls the model and parameters used for all requests. A single flat configuration replaces the previous routing profiles.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `true` | Enable request routing |
-| `maxFastChars` | `200` | Maximum chars for fast profile |
-| `maxStandardChars` | `1200` | Maximum chars for standard/deep boundary |
-| `classifierFallback.enabled` | `true` | LLM classifier decides background escalation |
+| `model` | `"moonshotai/kimi-k2.5"` | Model for all requests |
+| `fallbacks` | `[]` | Fallback models tried in order when the primary model fails (e.g. rate limit, outage) |
+| `maxOutputTokens` | `4096` | Maximum output tokens per response |
+| `maxToolSteps` | `50` | Maximum tool-call steps per request |
+| `temperature` | `0.2` | Sampling temperature |
+| `recallMaxResults` | `8` | Maximum memory items returned per recall query |
+| `recallMaxTokens` | `1500` | Maximum tokens for recalled memory content |
 
-#### Routing profile fields
+### `host.streaming`
 
-| Field | Description |
-|-------|-------------|
-| `model` | Per-profile model override |
-| `maxOutputTokens` | Response token cap |
-| `maxToolSteps` | Tool-call step limit |
-| `enablePlanner` | Toggle planner |
-| `enableValidation` | Toggle response validation |
-| `responseValidationMaxRetries` | Per-request validation retries |
-| `enableMemoryRecall` | Toggle memory recall |
-| `recallMaxResults` | Recall item cap |
-| `recallMaxTokens` | Recall token cap |
-| `enableMemoryExtraction` | Toggle memory extraction |
-| `toolAllow` / `toolDeny` | Per-profile tool policy overrides |
-| `progress` | Optional per-profile progress settings |
+`host.streaming` controls real-time streaming delivery of agent responses with edit-in-place updates.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable streaming responses |
+| `chunkFlushIntervalMs` | `200` | Interval between flushing accumulated chunks (ms) |
+| `editIntervalMs` | `400` | Minimum interval between message edits (ms) |
+| `maxEditLength` | `3800` | Maximum message length before truncating edits |
 
 ---
 
@@ -319,6 +283,21 @@ An LLM classifier that decides immediately when a request should run in the back
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `assistantName` | `"Rain"` | Assistant display name |
+
+### `agent.reasoning`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `effort` | `"low"` | Reasoning effort for the primary model: `off`, `low`, `medium`, `high`. Higher effort uses more reasoning tokens for better quality on complex questions. Summary and memory calls always use `low`. |
+
+### `agent.skills`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable skill discovery and loading |
+| `maxSkills` | `32` | Maximum skills to load per request |
+| `maxSummaryChars` | `4000` | Maximum characters per skill summary in the catalog |
+| `installEnabled` | `true` | Allow skill installation from agent |
 
 ### `agent.openrouter`
 
@@ -366,28 +345,6 @@ Sub-models used for auxiliary tasks:
 |---------|---------|-------------|
 | `summary` | `"deepseek/deepseek-v3.2"` | Context summary model |
 | `memory` | `"deepseek/deepseek-v3.2"` | Memory extraction model |
-| `planner` | `"deepseek/deepseek-v3.2"` | Planner model |
-| `responseValidation` | `"deepseek/deepseek-v3.2"` | Response validation model |
-| `toolSummary` | `"deepseek/deepseek-v3.2"` | Tool output summary model |
-
-### `agent.planner`
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `enabled` | `true` | Enable multi-step planner |
-| `mode` | `"auto"` | Planner mode |
-| `minTokens` | `800` | Minimum tokens to trigger planning |
-| `triggerRegex` | `"(plan\|steps\|...)"` | Regex to detect planning requests |
-
-### `agent.responseValidation`
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `enabled` | `true` | Enable response quality validation |
-| `maxRetries` | `1` | Retries if validation fails |
-| `allowToolCalls` | `false` | Allow tool calls during validation |
-| `minPromptTokens` | `400` | Minimum prompt size to trigger validation |
-| `minResponseTokens` | `160` | Minimum response size to trigger validation |
 
 ### `agent.tools`
 
@@ -517,6 +474,6 @@ Each server entry:
 }
 ```
 
-Supported events: `message:received`, `message:processing`, `message:responded`, `agent:start`, `agent:complete`, `job:spawned`, `job:completed`, `task:fired`, `task:completed`, `memory:upserted`.
+Supported events: `message:received`, `message:processing`, `message:responded`, `agent:start`, `agent:complete`, `task:fired`, `task:completed`, `memory:upserted`.
 
 Blocking hooks receive JSON on stdin and can return `{"cancel": true}` to abort the operation.

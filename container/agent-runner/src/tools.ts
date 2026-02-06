@@ -94,7 +94,7 @@ function buildToolRuntime(config: AgentRuntimeConfig['agent']): ToolRuntime {
     toolSummary: {
       enabled: config.tools.toolSummary.enabled,
       maxBytes: config.tools.toolSummary.maxBytes,
-      model: config.models.toolSummary,
+      model: config.models.summary,
       maxOutputTokens: config.tools.toolSummary.maxOutputTokens,
       tools: toolSummaryTools,
       timeoutMs: toolSummaryTimeoutMs
@@ -881,20 +881,13 @@ async function maybeSummarizeToolResult<T>(name: string, result: T, runtime: Too
 export function createTools(
   ctx: IpcContext,
   config: AgentRuntimeConfig['agent'],
-  options?: { onToolCall?: ToolCallLogger; policy?: ToolPolicy; jobProgress?: { jobId?: string; enabled?: boolean } }
+  options?: { onToolCall?: ToolCallLogger; policy?: ToolPolicy }
 ) {
   const runtime = buildToolRuntime(config);
   const ipc = createIpcHandlers(ctx, config.ipc);
   const isMain = ctx.isMain;
   const onToolCall = options?.onToolCall;
   const policy = options?.policy;
-  const progressConfig = runtime.progress;
-  const progressJobId = options?.jobProgress?.jobId;
-  const progressEnabled = Boolean(progressJobId && progressConfig.enabled && options?.jobProgress?.enabled !== false);
-  const progressNotifyTools = new Set(
-    (progressConfig.notifyTools || []).map(item => item.trim().toLowerCase()).filter(Boolean)
-  );
-  let lastProgressNotifyAt = 0;
   const hasAllowPolicy = Array.isArray(policy?.allow);
   const allowList = (policy?.allow || []).map(item => item.toLowerCase());
   const denyList = (policy?.deny || []).map(item => item.toLowerCase());
@@ -915,28 +908,10 @@ export function createTools(
   const webFetchAllowlist = runtime.webfetchAllowlist;
   const webFetchBlocklist = runtime.webfetchBlocklist;
 
-  const shouldNotifyTool = (name: string) => {
-    if (!progressEnabled) return false;
-    if (!progressNotifyTools || progressNotifyTools.size === 0) return false;
-    return progressNotifyTools.has(name.toLowerCase());
-  };
-
-  const sendJobUpdate = (payload: { message: string; level?: 'info' | 'progress' | 'warn' | 'error'; notify?: boolean; data?: Record<string, unknown> }) => {
-    if (!progressEnabled || !progressJobId) return;
-    void ipc.jobUpdate({
-      job_id: progressJobId,
-      message: payload.message,
-      level: payload.level,
-      notify: payload.notify,
-      data: payload.data
-    }).catch(() => undefined);
-  };
-
   const wrapExecute = <TInput, TOutput>(name: string, execute: (args: TInput) => Promise<TOutput>) => {
     return async (args: TInput): Promise<TOutput> => {
       const start = Date.now();
       const normalizedName = name.toLowerCase();
-      const isSystemTool = normalizedName.startsWith('mcp__');
       try {
         if (denyList.includes(normalizedName)) {
           throw new Error(`Tool is disabled by policy: ${name}`);
@@ -950,26 +925,6 @@ export function createTools(
           throw new Error(`Tool usage limit reached for ${name} (max ${maxAllowed} per run)`);
         }
         usageCounts.set(name, currentCount + 1);
-
-        if (!isSystemTool && shouldNotifyTool(name) && progressConfig.notifyOnStart) {
-          const now = Date.now();
-          if (now - lastProgressNotifyAt >= progressConfig.minIntervalMs) {
-            lastProgressNotifyAt = now;
-            sendJobUpdate({
-              message: `Running ${name}...`,
-              level: 'progress',
-              notify: true,
-              data: { tool: name, stage: 'start' }
-            });
-          } else {
-            sendJobUpdate({
-              message: `Running ${name}...`,
-              level: 'progress',
-              notify: false,
-              data: { tool: name, stage: 'start' }
-            });
-          }
-        }
 
         const rawResult = await execute(args);
         const result = await maybeSummarizeToolResult(name, rawResult, runtime);
@@ -992,14 +947,6 @@ export function createTools(
           output_bytes: outputBytes,
           output_truncated: outputTruncated
         });
-        if (!isSystemTool && shouldNotifyTool(name)) {
-          sendJobUpdate({
-            message: `${name} finished.`,
-            level: 'info',
-            notify: false,
-            data: { tool: name, stage: 'end', ok: true, duration_ms: Date.now() - start }
-          });
-        }
         return result;
       } catch (err) {
         onToolCall?.({
@@ -1009,14 +956,6 @@ export function createTools(
           duration_ms: Date.now() - start,
           error: err instanceof Error ? err.message : String(err)
         });
-        if (!isSystemTool && shouldNotifyTool(name) && progressConfig.notifyOnError) {
-          sendJobUpdate({
-            message: `${name} failed: ${err instanceof Error ? err.message : String(err)}`,
-            level: 'error',
-            notify: true,
-            data: { tool: name, stage: 'end', ok: false, duration_ms: Date.now() - start }
-          });
-        }
         throw err;
       }
     };
@@ -2031,193 +1970,6 @@ export function createTools(
       ipc.updateTask(args))
   });
 
-  const spawnJobTool = tool({
-    name: 'mcp__dotclaw__spawn_job',
-    description: 'Start a long-running background job. Use only for tasks that take >2 minutes (deep research, large code projects). Quick tasks should run in the foreground. context_mode "group" shares the workspace; "isolated" gets a clean environment.',
-    inputSchema: z.object({
-      prompt: z.string(),
-      context_mode: z.enum(['group', 'isolated']).optional(),
-      timeout_ms: z.number().optional(),
-      max_tool_steps: z.number().optional(),
-      tool_allow: z.array(z.string()).optional(),
-      tool_deny: z.array(z.string()).optional(),
-      model_override: z.string().optional(),
-      priority: z.number().optional(),
-      tags: z.array(z.string()).optional(),
-      target_group: z.string().optional()
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      result: z.any().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__spawn_job', async (args: {
-      prompt: string;
-      context_mode?: 'group' | 'isolated';
-      timeout_ms?: number;
-      max_tool_steps?: number;
-      tool_allow?: string[];
-      tool_deny?: string[];
-      model_override?: string;
-      priority?: number;
-      tags?: string[];
-      target_group?: string;
-    }) => ipc.spawnJob(args))
-  });
-
-  const jobStatusTool = tool({
-    name: 'mcp__dotclaw__job_status',
-    description: 'Get the status of a background job.',
-    inputSchema: z.object({
-      job_id: z.string()
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      result: z.any().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__job_status', async ({ job_id }: { job_id: string }) => ipc.jobStatus(job_id))
-  });
-
-  const listJobsTool = tool({
-    name: 'mcp__dotclaw__list_jobs',
-    description: 'List background jobs for the group.',
-    inputSchema: z.object({
-      status: z.string().optional(),
-      limit: z.number().optional(),
-      target_group: z.string().optional()
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      result: z.any().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__list_jobs', async (args: { status?: string; limit?: number; target_group?: string }) => ipc.listJobs(args))
-  });
-
-  const cancelJobTool = tool({
-    name: 'mcp__dotclaw__cancel_job',
-    description: 'Cancel a background job.',
-    inputSchema: z.object({
-      job_id: z.string()
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__cancel_job', async ({ job_id }: { job_id: string }) => ipc.cancelJob(job_id))
-  });
-
-  const jobUpdateTool = tool({
-    name: 'mcp__dotclaw__job_update',
-    description: 'Log progress or send a notification for a background job.',
-    inputSchema: z.object({
-      job_id: z.string(),
-      message: z.string(),
-      level: z.enum(['info', 'progress', 'warn', 'error']).optional(),
-      notify: z.boolean().optional(),
-      data: z.record(z.string(), z.any()).optional()
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__job_update', async (args: { job_id: string; message: string; level?: string; notify?: boolean; data?: Record<string, unknown> }) =>
-      ipc.jobUpdate(args))
-  });
-
-  const orchestrateTool = tool({
-    name: 'mcp__dotclaw__orchestrate',
-    description: 'Run multiple sub-tasks in parallel and aggregate results. Each task runs as an independent background job. Use for research, analysis, or any task that can be decomposed into parallel parts.',
-    inputSchema: z.object({
-      tasks: z.array(z.object({
-        name: z.string().describe('Short name for this sub-task'),
-        prompt: z.string().describe('Full prompt for the sub-task'),
-        model_override: z.string().optional(),
-        timeout_ms: z.number().optional(),
-        tool_allow: z.array(z.string()).optional(),
-        tool_deny: z.array(z.string()).optional()
-      })).min(1).max(10),
-      max_concurrent: z.number().int().min(1).max(10).optional().describe('Max parallel tasks (default: all)'),
-      timeout_ms: z.number().optional().describe('Overall timeout in ms (default: 600000)'),
-      aggregation_prompt: z.string().optional().describe('Optional prompt to synthesize all results into a final answer')
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      result: z.any().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__orchestrate', async (args: {
-      tasks: Array<{ name: string; prompt: string; model_override?: string; timeout_ms?: number; tool_allow?: string[]; tool_deny?: string[] }>;
-      max_concurrent?: number;
-      timeout_ms?: number;
-      aggregation_prompt?: string;
-    }) => ipc.orchestrate(args))
-  });
-
-  // ─── Workflow Tools ────────────────────────────────────────
-
-  const workflowStartTool = tool({
-    name: 'mcp__dotclaw__workflow_start',
-    description: 'Start a named workflow. Workflows are YAML/JSON definitions in the group workflows/ directory with multi-step execution, dependency graphs, and state passing between steps.',
-    inputSchema: z.object({
-      name: z.string().describe('Workflow name (matches filename without extension in workflows/ directory)'),
-      params: z.record(z.string(), z.any()).optional().describe('Optional parameters to pass to the workflow')
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      run_id: z.string().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__workflow_start', async (args: { name: string; params?: Record<string, unknown> }) =>
-      ipc.workflowStart(args))
-  });
-
-  const workflowStatusTool = tool({
-    name: 'mcp__dotclaw__workflow_status',
-    description: 'Get the status of a workflow run including all step results.',
-    inputSchema: z.object({
-      run_id: z.string().describe('Workflow run ID (returned by workflow_start)')
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      result: z.any().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__workflow_status', async (args: { run_id: string }) =>
-      ipc.workflowStatus(args))
-  });
-
-  const workflowCancelTool = tool({
-    name: 'mcp__dotclaw__workflow_cancel',
-    description: 'Cancel a running workflow.',
-    inputSchema: z.object({
-      run_id: z.string().describe('Workflow run ID to cancel')
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__workflow_cancel', async (args: { run_id: string }) =>
-      ipc.workflowCancel(args))
-  });
-
-  const workflowListTool = tool({
-    name: 'mcp__dotclaw__workflow_list',
-    description: 'List workflow runs for the current group.',
-    inputSchema: z.object({
-      status: z.string().optional().describe('Filter by status: pending, running, completed, failed, canceled'),
-      limit: z.number().int().min(1).max(50).optional().describe('Max results (default: 10)')
-    }),
-    outputSchema: z.object({
-      ok: z.boolean(),
-      result: z.any().optional(),
-      error: z.string().optional()
-    }),
-    execute: wrapExecute('mcp__dotclaw__workflow_list', async (args: { status?: string; limit?: number }) =>
-      ipc.workflowList(args))
-  });
-
   const registerGroupTool = tool({
     name: 'mcp__dotclaw__register_group',
     description: 'Register a new chat/channel (main group only).',
@@ -2472,16 +2224,6 @@ export function createTools(
     resumeTaskTool,
     cancelTaskTool,
     updateTaskTool,
-    spawnJobTool,
-    jobStatusTool,
-    listJobsTool,
-    cancelJobTool,
-    jobUpdateTool,
-    orchestrateTool,
-    workflowStartTool,
-    workflowStatusTool,
-    workflowCancelTool,
-    workflowListTool,
     memoryUpsertTool,
     memoryForgetTool,
     memoryListTool,

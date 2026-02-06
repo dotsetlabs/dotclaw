@@ -41,13 +41,9 @@ that can be allowed or denied through the same policy file. These tools work acr
 
 The task scheduler runs cron-based or one-off tasks and executes them in the target group's context. Scheduling uses the timezone defined in `~/.dotclaw/config/runtime.json` or the system timezone by default.
 
-## Background jobs
+## Streaming responses
 
-Background jobs run long-lived work asynchronously and report back when finished. Jobs are durable and tracked in the database. Large outputs are written to `~/.dotclaw/groups/<group>/jobs/<job_id>/` and summarized in chat.
-
-## Progress and planning
-
-For long-running requests, DotClaw sends staged progress updates (planning, searching, coding, drafting, finalizing). When a lightweight planner probe detects multi-step work, progress updates and background job acknowledgements can include a short preview of the planned steps.
+DotClaw streams agent responses in real time using edit-in-place delivery. As the model generates output, partial responses are sent to the chat and progressively updated until the final response is complete. This provides immediate feedback without waiting for the full response to generate.
 
 ## Voice
 
@@ -63,15 +59,23 @@ DotClaw can connect to MCP (Model Context Protocol) servers using stdio transpor
 
 ## Hooks
 
-Lifecycle hooks let you run custom scripts when events occur (message received, agent started, job completed, etc.). Hooks can be blocking (awaited, with optional cancellation) or async (fire-and-forget). Configure in `hooks` in runtime config.
+Lifecycle hooks let you run custom scripts when events occur (message received, agent started, task completed, etc.). Hooks can be blocking (awaited, with optional cancellation) or async (fire-and-forget). Configure in `hooks` in runtime config.
 
-## Orchestration
+## Model fallback chain
 
-The `orchestrate` tool enables multi-agent fan-out: run multiple agent tasks in parallel with concurrency control and optional result aggregation. Useful for research, multi-perspective analysis, and divide-and-conquer workflows.
+When the primary model fails (rate limit, outage, timeout), DotClaw automatically retries with fallback models. Configure fallbacks in `host.routing.fallbacks` — an array of model IDs tried in order. Only retryable errors (429, 5xx, timeouts, model unavailable) trigger fallback; auth errors and content policy violations fail immediately.
 
-## Workflows
+## Configurable reasoning
 
-Declarative YAML or JSON workflows define multi-step pipelines with dependency tracking, conditional execution, retry policies, and step result interpolation. Place workflow files in `~/.dotclaw/groups/<group>/workflows/`. The agent can start, monitor, and cancel workflows via IPC tools.
+Control how much internal reasoning the model uses via `agent.reasoning.effort`: `off`, `low`, `medium`, or `high`. Higher effort produces better answers on complex questions but uses more tokens. Default is `low`. Summary and memory extraction calls always use `low` regardless of this setting.
+
+## Image and vision
+
+DotClaw supports multi-modal input. When a user sends a photo, the agent receives it as base64-encoded image content alongside the text message. The agent can describe, analyze, or act on images. Supported formats: JPEG, PNG, GIF, WebP (up to 5 MB).
+
+## Message interrupt
+
+When `host.messageQueue.interruptOnNewMessage` is enabled (default), sending a new message while the agent is processing automatically cancels the active run and starts processing the new message. Any partial streaming response is deleted. This ensures the agent always works on the most recent request.
 
 ## Canceling requests
 

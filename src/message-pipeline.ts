@@ -4,7 +4,6 @@ import type { RegisteredGroup, Session, MessageAttachment } from './types.js';
 import type { ContainerOutput } from './container-protocol.js';
 import type { AgentContext } from './agent-context.js';
 import type { ProviderRegistry } from './providers/registry.js';
-import type { ProviderAttachment } from './providers/types.js';
 import {
   getMessagesSinceCursor,
   getChatState,
@@ -14,27 +13,18 @@ import {
   completeQueuedMessages,
   failQueuedMessages,
   requeueQueuedMessages,
-  getBackgroundJobQueuePosition,
-  getBackgroundJobQueueDepth,
   linkMessageToTrace,
   getPendingMessageCount,
 } from './db.js';
-import {
-  spawnBackgroundJob,
-} from './background-jobs.js';
 import { hostPathToContainerGroupPath } from './path-mapping.js';
-import { writeTrace } from './trace-writer.js';
-import { createProgressManager, DEFAULT_PROGRESS_MESSAGES, DEFAULT_PROGRESS_STAGES, formatProgressWithPlan, formatPlanStepList } from './progress.js';
-import { recordMessage, recordError, recordRoutingDecision, recordStageLatency } from './metrics.js';
+import { recordMessage, recordError, recordStageLatency } from './metrics.js';
 import { synthesizeSpeechHost } from './transcription.js';
 import { emitHook } from './hooks.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
 import { setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
 import { humanizeError } from './error-messages.js';
-import { classifyBackgroundJob } from './background-job-classifier.js';
 import { routeRequest } from './request-router.js';
-import { probePlanner } from './planner-probe.js';
 import {
   GROUPS_DIR,
   BATCH_WINDOW_MS,
@@ -42,19 +32,11 @@ import {
 } from './config.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { ProviderRegistry as ProviderRegistryClass } from './providers/registry.js';
+import { StreamingDelivery, watchStreamChunks } from './streaming.js';
 
 const runtime = loadRuntimeConfig();
 
-const MEMORY_RECALL_MAX_RESULTS = runtime.host.memory.recall.maxResults;
-const MEMORY_RECALL_MAX_TOKENS = runtime.host.memory.recall.maxTokens;
-const BACKGROUND_JOBS_ENABLED = runtime.host.backgroundJobs.enabled;
-const AUTO_SPAWN_CONFIG = runtime.host.backgroundJobs.autoSpawn;
-const AUTO_SPAWN_ENABLED = BACKGROUND_JOBS_ENABLED && AUTO_SPAWN_CONFIG.enabled;
-const AUTO_SPAWN_FOREGROUND_TIMEOUT_MS = AUTO_SPAWN_CONFIG.foregroundTimeoutMs;
-const AUTO_SPAWN_ON_TIMEOUT = AUTO_SPAWN_CONFIG.onTimeout;
-const AUTO_SPAWN_ON_TOOL_LIMIT = AUTO_SPAWN_CONFIG.onToolLimit;
-const AUTO_SPAWN_CLASSIFIER_ENABLED = AUTO_SPAWN_CONFIG.classifier.enabled;
-const TOOL_CALL_FALLBACK_PATTERN = /tool calls? but did not get a final response/i;
+const INTERRUPT_ON_NEW_MESSAGE = runtime.host.messageQueue.interruptOnNewMessage ?? true;
 const MESSAGE_QUEUE_MAX_RETRIES = Math.max(1, runtime.host.messageQueue.maxRetries ?? 4);
 const MESSAGE_QUEUE_RETRY_BASE_MS = Math.max(250, runtime.host.messageQueue.retryBaseMs ?? 3_000);
 const MESSAGE_QUEUE_RETRY_MAX_MS = Math.max(MESSAGE_QUEUE_RETRY_BASE_MS, runtime.host.messageQueue.retryMaxMs ?? 60_000);
@@ -124,45 +106,9 @@ export function buildAttachmentsXml(attachments: MessageAttachment[], groupFolde
   }).join('\n');
 }
 
-function inferProgressStage(params: { content: string; plannerTools: string[]; plannerSteps: string[]; enablePlanner: boolean }): string {
-  const content = params.content.toLowerCase();
-  const tools = params.plannerTools.map(tool => tool.toLowerCase());
-  const hasWebTool = tools.some(tool => tool.includes('web') || tool.includes('search') || tool.includes('fetch'));
-  const hasCodeTool = tools.some(tool => tool.includes('bash') || tool.includes('edit') || tool.includes('write') || tool.includes('git'));
-  if (params.enablePlanner) return 'planning';
-  if (hasWebTool || /research|search|browse|web|site|docs/.test(content)) return 'searching';
-  if (hasCodeTool || /build|code|implement|refactor|fix|debug/.test(content)) return 'coding';
-  return 'drafting';
-}
-
-function estimateForegroundMs(params: { content: string; routing: { estimatedMinutes?: number; profile: string }; plannerSteps: string[]; plannerTools: string[] }): number | null {
-  if (typeof params.routing.estimatedMinutes === 'number' && Number.isFinite(params.routing.estimatedMinutes)) {
-    return Math.max(1000, params.routing.estimatedMinutes * 60_000);
-  }
-  const baseChars = params.content.length;
-  if (baseChars === 0) return null;
-  const stepFactor = params.plannerSteps.length > 0 ? params.plannerSteps.length * 6000 : 0;
-  const toolFactor = params.plannerTools.length > 0 ? params.plannerTools.length * 8000 : 0;
-  const lengthFactor = Math.min(60_000, Math.max(3000, Math.round(baseChars / 3)));
-  const profileFactor = params.routing.profile === 'deep' ? 1.4 : 1;
-  return Math.round((lengthFactor + stepFactor + toolFactor) * profileFactor);
-}
-
-function inferPlanStepIndex(stage: string, totalSteps: number): number | null {
-  if (!Number.isFinite(totalSteps) || totalSteps <= 0) return null;
-  const normalized = stage.trim().toLowerCase();
-  if (!normalized) return 1;
-  switch (normalized) {
-    case 'planning': return 1;
-    case 'searching': return Math.min(2, totalSteps);
-    case 'coding': return Math.min(Math.max(2, Math.ceil(totalSteps * 0.6)), totalSteps);
-    case 'drafting': return Math.min(Math.max(2, Math.ceil(totalSteps * 0.8)), totalSteps);
-    case 'finalizing': return totalSteps;
-    default: return 1;
-  }
-}
-
 /** Convert ProviderAttachment to MessageAttachment for DB storage */
+import type { ProviderAttachment } from './providers/types.js';
+
 export function providerAttachmentToMessageAttachment(pa: ProviderAttachment): MessageAttachment {
   return {
     type: pa.type,
@@ -243,6 +189,15 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       void provider.sendMessage(msg.chatId, "Nothing's running right now.", { threadId: msg.threadId });
       return;
     }
+    if (INTERRUPT_ON_NEW_MESSAGE) {
+      const controller = activeRuns.get(msg.chatId);
+      if (controller) {
+        logger.info({ chatId: msg.chatId }, 'Interrupting active run for new message');
+        controller.abort('interrupted');
+        activeRuns.delete(msg.chatId);
+      }
+    }
+
     enqueueMessageItem({
       chat_jid: msg.chatId,
       message_id: msg.messageId,
@@ -394,7 +349,6 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       return `<message sender="${escapeXml(m.sender_name)}" sender_id="${escapeXml(m.sender)}" time="${m.timestamp}">${inner}</message>`;
     });
     const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
-    const lastMessage = missedMessages[missedMessages.length - 1];
     const replyToMessageId = msg.messageId;
     const containerAttachments = (() => {
       for (let idx = missedMessages.length - 1; idx >= 0; idx -= 1) {
@@ -426,49 +380,15 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       return undefined;
     })();
 
+    // Single routing decision — no probes, no profiles
     const routingStartedAt = Date.now();
-    const routingDecision = routeRequest({ prompt, lastMessage });
+    const routing = routeRequest();
     const routerMs = Date.now() - routingStartedAt;
     recordStageLatency('router', routerMs, providerName);
 
-    // Smart upgrade: if routed to "fast" by short length, probe for tool intent
-    if (routingDecision.profile === 'fast' && routingDecision.reason === 'short prompt') {
-      const { probeToolIntent } = await import('./tool-intent-probe.js');
-      const probeResult = await probeToolIntent(lastMessage?.content || prompt);
-      if (probeResult.needsTools) {
-        const standardConfig = runtime.host.routing.profiles?.standard;
-        if (standardConfig) {
-          routingDecision.profile = 'standard';
-          routingDecision.reason = 'tool intent probe';
-          routingDecision.modelOverride = standardConfig.model;
-          routingDecision.maxOutputTokens = standardConfig.maxOutputTokens;
-          routingDecision.maxToolSteps = standardConfig.maxToolSteps;
-          routingDecision.enablePlanner = standardConfig.enablePlanner;
-          routingDecision.enableResponseValidation = standardConfig.enableValidation;
-          routingDecision.enableMemoryRecall = standardConfig.enableMemoryRecall;
-          routingDecision.enableMemoryExtraction = standardConfig.enableMemoryExtraction;
-          if (typeof standardConfig.recallMaxResults === 'number') {
-            routingDecision.recallMaxResults = standardConfig.recallMaxResults;
-          }
-          if (typeof standardConfig.recallMaxTokens === 'number') {
-            routingDecision.recallMaxTokens = standardConfig.recallMaxTokens;
-          }
-          if (typeof standardConfig.responseValidationMaxRetries === 'number') {
-            routingDecision.responseValidationMaxRetries = standardConfig.responseValidationMaxRetries;
-          }
-        }
-        logger.info({ latencyMs: probeResult.latencyMs }, 'Tool intent probe upgraded fast → standard');
-      } else {
-        logger.debug({ latencyMs: probeResult.latencyMs }, 'Tool intent probe: staying fast');
-      }
-    }
-
-    recordRoutingDecision(routingDecision.profile);
     logger.info({
       chatId: msg.chatId,
-      profile: routingDecision.profile,
-      reason: routingDecision.reason,
-      shouldBackground: routingDecision.shouldBackground
+      model: routing.model,
     }, 'Routing decision');
 
     const traceBase = createTraceBase({
@@ -497,268 +417,103 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
     let context: AgentContext | null = null;
     let errorMessage: string | null = null;
 
-    const isTimeoutError = (value?: string | null): boolean => {
-      if (!value) return false;
-      return /timed out|timeout/i.test(value);
-    };
+    // Set up streaming delivery
+    const streamingConfig = runtime.host.streaming;
+    const streaming = streamingConfig.enabled
+      ? new StreamingDelivery(provider, msg.chatId, streamingConfig, {
+        threadId: msg.threadId,
+        replyToMessageId,
+      })
+      : null;
 
-    const shouldPlannerProbe = () => {
-      const config = runtime.host.routing.plannerProbe;
-      if (!config.enabled) return false;
-      if (routingDecision.profile === 'fast' || routingDecision.shouldBackground) return false;
-      const contentLength = lastMessage?.content?.length || 0;
-      return contentLength >= config.minChars;
-    };
-
-    let plannerProbeTools: string[] = [];
-    let plannerProbeSteps: string[] = [];
-    let plannerProbeMs: number | null = null;
-
-    const maybeAutoSpawn = async (
-      reason: 'timeout' | 'tool_limit' | 'classifier' | 'router' | 'planner',
-      _detail?: string | null,
-      overrides?: {
-        modelOverride?: string;
-        maxToolSteps?: number;
-        timeoutMs?: number;
-        tags?: string[];
-      }
-    ): Promise<boolean> => {
-      if (!BACKGROUND_JOBS_ENABLED) return false;
-      if (reason !== 'router' && !AUTO_SPAWN_ENABLED) return false;
-      if (reason === 'timeout' && !AUTO_SPAWN_ON_TIMEOUT) return false;
-      if (reason === 'tool_limit' && !AUTO_SPAWN_ON_TOOL_LIMIT) return false;
-
-      const tags = ['auto-spawn', reason, `profile:${routingDecision.profile}`];
-      if (overrides?.tags && overrides.tags.length > 0) {
-        tags.push(...overrides.tags);
-      }
-      if (routingDecision.estimatedMinutes) {
-        tags.push(`eta:${routingDecision.estimatedMinutes}`);
-      }
-      const estimatedMs = typeof routingDecision.estimatedMinutes === 'number'
-        ? routingDecision.estimatedMinutes * 60_000
-        : null;
-      const computedTimeoutMs = estimatedMs
-        ? Math.min(runtime.host.backgroundJobs.maxRuntimeMs, Math.max(5 * 60_000, Math.round(estimatedMs * 2)))
-        : undefined;
-      // Always use the background profile's model for background jobs, not the
-      // original routing profile's model (which may be a fast/standard model and
-      // may not even be in the model allowlist).
-      const bgProfile = runtime.host.routing.profiles?.background;
-      const bgModel = overrides?.modelOverride ?? bgProfile?.model ?? routingDecision.modelOverride;
-      const bgMaxToolSteps = overrides?.maxToolSteps ?? bgProfile?.maxToolSteps ?? routingDecision.maxToolSteps;
-      const result = spawnBackgroundJob({
-        prompt,
-        groupFolder: group.folder,
-        chatJid: msg.chatId,
-        contextMode: 'group',
-        tags,
-        parentTraceId: traceBase.trace_id,
-        parentMessageId: msg.messageId,
-        modelOverride: bgModel,
-        maxToolSteps: bgMaxToolSteps,
-        toolAllow: routingDecision.toolAllow,
-        toolDeny: routingDecision.toolDeny,
-        timeoutMs: overrides?.timeoutMs ?? computedTimeoutMs
-      });
-      if (!result.ok || !result.jobId) {
-        logger.warn({ chatId: msg.chatId, reason, error: result.error }, 'Auto-spawn background job failed');
-        return false;
-      }
-
-      const queuePosition = getBackgroundJobQueuePosition({ jobId: result.jobId, groupFolder: group.folder });
-      const eta = routingDecision.estimatedMinutes ? `~${routingDecision.estimatedMinutes} min` : null;
-      const queueLine = queuePosition && queuePosition.position > 1
-        ? `\n\n${queuePosition.position - 1} job${queuePosition.position > 2 ? 's' : ''} ahead of this one.`
-        : '';
-      const etaLine = eta ? `\n\nEstimated time: ${eta}.` : '';
-      const planPreview = plannerProbeSteps.length > 0
-        ? formatPlanStepList({ steps: plannerProbeSteps, currentStep: 1, maxSteps: 4 })
-        : '';
-      const planLine = planPreview ? `\n\nPlanned steps:\n${planPreview}` : '';
-      await sendMessageForQueue(
-        msg.chatId,
-        `Working on it in the background. I'll send the result when it's done.${queueLine}${etaLine}${planLine}`,
-        { threadId: msg.threadId, replyToMessageId }
-      );
-
-      updateChatState(msg.chatId, msg.timestamp, msg.messageId);
-      return true;
-    };
-
-    if (shouldPlannerProbe() && lastMessage) {
-      const probeStarted = Date.now();
-      const probeResult = await probePlanner({
-        lastMessage,
-        recentMessages: missedMessages
-      });
-      plannerProbeMs = Date.now() - probeStarted;
-      recordStageLatency('planner_probe', plannerProbeMs, providerName);
-      if (probeResult.steps.length > 0) plannerProbeSteps = probeResult.steps;
-      if (probeResult.tools.length > 0) plannerProbeTools = probeResult.tools;
-      logger.info({
-        chatId: msg.chatId,
-        shouldBackground: probeResult.shouldBackground,
-        steps: probeResult.steps.length,
-        tools: probeResult.tools.length,
-        latencyMs: probeResult.latencyMs,
-        model: probeResult.model,
-        error: probeResult.error
-      }, 'Planner probe decision');
-      if (probeResult.shouldBackground) {
-        const autoSpawned = await maybeAutoSpawn('planner', 'planner probe predicted multi-step work');
-        if (autoSpawned) return true;
-      }
-    }
-
-    let classifierMs: number | null = null;
-    if (AUTO_SPAWN_ENABLED && AUTO_SPAWN_CLASSIFIER_ENABLED && lastMessage && routingDecision.shouldRunClassifier) {
-      try {
-        const queueDepth = getBackgroundJobQueueDepth({ groupFolder: group.folder });
-        const classifierResult = await classifyBackgroundJob({
-          lastMessage,
-          recentMessages: missedMessages,
-          isGroup: msg.isGroup,
-          chatType: msg.chatType,
-          queueDepth,
-          metricsSource: providerName,
-        });
-        if (classifierResult.latencyMs) {
-          classifierMs = classifierResult.latencyMs;
-          recordStageLatency('classifier', classifierResult.latencyMs, providerName);
-        }
-        logger.info({
-          chatId: msg.chatId,
-          decision: classifierResult.shouldBackground,
-          confidence: classifierResult.confidence,
-          latencyMs: classifierResult.latencyMs,
-          model: classifierResult.model,
-          reason: classifierResult.reason,
-          error: classifierResult.error
-        }, 'Background job classifier decision');
-        if (classifierResult.shouldBackground) {
-          const estimated = classifierResult.estimatedMinutes;
-          if (typeof estimated === 'number' && Number.isFinite(estimated) && estimated > 0) {
-            routingDecision.estimatedMinutes = Math.round(estimated);
-          }
-          const autoSpawned = await maybeAutoSpawn('classifier', classifierResult.reason);
-          if (autoSpawned) return true;
-        }
-      } catch (err) {
-        logger.warn({ chatId: msg.chatId, err }, 'Background job classifier failed');
-      }
-    }
-
-    // Refresh typing indicator
+    // Refresh typing indicator (cleared on first stream chunk or completion)
     const typingInterval = setInterval(() => { void provider.setTyping(msg.chatId); }, 4_000);
 
-    const predictedStage = inferProgressStage({
-      content: lastMessage?.content || prompt,
-      plannerTools: plannerProbeTools,
-      plannerSteps: plannerProbeSteps,
-      enablePlanner: routingDecision.enablePlanner
-    });
-    const predictedMs = estimateForegroundMs({
-      content: lastMessage?.content || prompt,
-      routing: routingDecision,
-      plannerSteps: plannerProbeSteps,
-      plannerTools: plannerProbeTools
-    });
-    const planStepIndex = inferPlanStepIndex(predictedStage, plannerProbeSteps.length);
-
-    const progressManager = createProgressManager({
-      enabled: routingDecision.progress.enabled,
-      initialDelayMs: routingDecision.progress.initialMs,
-      intervalMs: routingDecision.progress.intervalMs,
-      maxUpdates: routingDecision.progress.maxUpdates,
-      messages: routingDecision.progress.messages.length > 0
-        ? routingDecision.progress.messages
-        : DEFAULT_PROGRESS_MESSAGES,
-      stageMessages: DEFAULT_PROGRESS_STAGES,
-      stageThrottleMs: 20_000,
-      send: async (text) => { await provider.sendMessage(msg.chatId, text, { threadId: msg.threadId }); },
-      onError: (err) => logger.debug({ chatId: msg.chatId, err }, 'Failed to send progress update')
-    });
-    progressManager.start();
-    let sentPlan = false;
-    if (predictedMs && predictedMs >= 10_000 && routingDecision.progress.enabled) {
-      if (plannerProbeSteps.length > 0) {
-        const planMessage = formatProgressWithPlan({
-          steps: plannerProbeSteps,
-          currentStep: planStepIndex ?? 1,
-          stage: predictedStage
-        });
-        progressManager.notify(planMessage);
-        sentPlan = true;
-      } else {
-        progressManager.notify(DEFAULT_PROGRESS_STAGES.ack);
-      }
-    }
-    if (!(sentPlan && predictedStage === 'planning')) {
-      progressManager.setStage(predictedStage);
-    }
-    if (predictedStage === 'planning') {
-      const followUpStage = inferProgressStage({
-        content: lastMessage?.content || prompt,
-        plannerTools: plannerProbeTools,
-        plannerSteps: plannerProbeSteps,
-        enablePlanner: false
-      });
-      if (followUpStage !== 'planning') {
-        const delay = Math.min(15_000, Math.max(5_000, Math.floor(routingDecision.progress.initialMs / 2)));
-        setTimeout(() => progressManager.setStage(followUpStage), delay);
-      }
-    }
     const abortController = new AbortController();
     activeRuns.set(msg.chatId, abortController);
+
+    // Prepare stream directory for IPC-based streaming
+    let streamDir: string | undefined;
+    if (streamingConfig.enabled) {
+      const { DATA_DIR } = await import('./config.js');
+      streamDir = path.join(DATA_DIR, 'ipc', group.folder, 'stream', traceBase.trace_id);
+      fs.mkdirSync(streamDir, { recursive: true });
+    }
+
     try {
-      const recallMaxResults = routingDecision.enableMemoryRecall
-        ? (Number.isFinite(routingDecision.recallMaxResults)
-          ? Math.max(0, Math.floor(routingDecision.recallMaxResults as number))
-          : MEMORY_RECALL_MAX_RESULTS)
-        : 0;
-      const recallMaxTokens = routingDecision.enableMemoryRecall
-        ? (Number.isFinite(routingDecision.recallMaxTokens)
-          ? Math.max(0, Math.floor(routingDecision.recallMaxTokens as number))
-          : MEMORY_RECALL_MAX_TOKENS)
-        : 0;
-      const execution = await executeAgentRun({
+      // Launch agent run (single call — no probes, no retries)
+      const executionPromise = executeAgentRun({
         group,
         prompt,
         chatJid: msg.chatId,
         userId: msg.senderId,
         userName: msg.senderName,
         recallQuery: recallQuery || msg.content,
-        recallMaxResults,
-        recallMaxTokens,
-        toolAllow: routingDecision.toolAllow,
-        toolDeny: routingDecision.toolDeny,
+        recallMaxResults: routing.recallMaxResults,
+        recallMaxTokens: routing.recallMaxTokens,
         sessionId: sessions[group.folder],
         onSessionUpdate: (sessionId) => { deps.setSession(group.folder, sessionId); },
         availableGroups: deps.buildAvailableGroupsSnapshot(),
-        modelOverride: routingDecision.modelOverride,
-        modelMaxOutputTokens: routingDecision.maxOutputTokens,
-        maxToolSteps: routingDecision.maxToolSteps,
-        disablePlanner: !routingDecision.enablePlanner,
-        disableResponseValidation: !routingDecision.enableResponseValidation,
-        responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
-        disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
-        profile: routingDecision.profile as 'fast' | 'standard' | 'deep' | 'background',
+        modelOverride: routing.model,
+        modelFallbacks: routing.fallbacks,
+        reasoningEffort: loadRuntimeConfig().agent.reasoning.effort,
+        modelMaxOutputTokens: routing.maxOutputTokens,
+        maxToolSteps: routing.maxToolSteps,
         attachments: containerAttachments,
         abortSignal: abortController.signal,
-        timeoutMs: AUTO_SPAWN_ENABLED && AUTO_SPAWN_FOREGROUND_TIMEOUT_MS > 0
-          ? AUTO_SPAWN_FOREGROUND_TIMEOUT_MS
-          : undefined
+        streamDir,
       });
-      output = execution.output;
-      context = execution.context;
-      progressManager.setStage('finalizing');
+
+      // Concurrently watch stream chunks and deliver in real-time
+      if (streaming && streamDir) {
+        const chunkWatcher = (async () => {
+          try {
+            let firstChunk = true;
+            for await (const chunk of watchStreamChunks(streamDir!, abortController.signal)) {
+              if (firstChunk) {
+                clearInterval(typingInterval);
+                firstChunk = false;
+              }
+              await streaming.onChunk(chunk);
+            }
+          } catch (err) {
+            // Stream watching errors are non-fatal
+            if (!(err instanceof Error && err.name === 'AbortError')) {
+              logger.debug({ chatId: msg.chatId, err }, 'Stream chunk watcher error');
+            }
+          }
+        })();
+
+        // Wait for agent to complete
+        const execution = await executionPromise;
+        output = execution.output;
+        context = execution.context;
+
+        // Wait briefly for any remaining chunks
+        await Promise.race([chunkWatcher, sleep(500)]);
+      } else {
+        const execution = await executionPromise;
+        output = execution.output;
+        context = execution.context;
+      }
 
       if (output.status === 'error') {
         errorMessage = output.error || 'Unknown error';
       }
     } catch (err) {
+      // Check if run was interrupted by a new message
+      if (abortController.signal.aborted && abortController.signal.reason === 'interrupted') {
+        logger.debug({ chatId: msg.chatId }, 'Run interrupted by new message');
+        if (streaming) {
+          try { await streaming.cleanup(); } catch { /* best effort */ }
+        }
+        clearInterval(typingInterval);
+        activeRuns.delete(msg.chatId);
+        if (streamDir) {
+          try { fs.rmSync(streamDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        return false;
+      }
       if (err instanceof AgentExecutionError) {
         context = err.context;
         errorMessage = err.message;
@@ -768,14 +523,15 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       logger.error({ group: group.name, err }, 'Agent error');
     } finally {
       clearInterval(typingInterval);
-      progressManager.stop();
       activeRuns.delete(msg.chatId);
+      // Clean up stream directory
+      if (streamDir) {
+        try { fs.rmSync(streamDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
     }
 
     const extraTimings: Record<string, number> = {};
     extraTimings.router_ms = routerMs;
-    if (classifierMs !== null) extraTimings.classifier_ms = classifierMs;
-    if (plannerProbeMs !== null) extraTimings.planner_probe_ms = plannerProbeMs;
 
     if (!output) {
       const message = errorMessage || 'No output from agent';
@@ -792,6 +548,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         });
       } else {
         recordError('agent');
+        const { writeTrace } = await import('./trace-writer.js');
         writeTrace({
           trace_id: traceBase.trace_id,
           timestamp: traceBase.timestamp,
@@ -807,12 +564,13 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
           source: traceBase.source
         });
       }
-      if (isTimeoutError(message)) {
-        const autoSpawned = await maybeAutoSpawn('timeout', message);
-        if (autoSpawned) return true;
-      }
       const userMessage = humanizeError(errorMessage || 'Unknown error');
-      await sendMessageForQueue(msg.chatId, userMessage, { threadId: msg.threadId, replyToMessageId });
+      // Finalize streaming or send error
+      if (streaming) {
+        await streaming.finalize(userMessage);
+      } else {
+        await sendMessageForQueue(msg.chatId, userMessage, { threadId: msg.threadId, replyToMessageId });
+      }
       return false;
     }
 
@@ -831,12 +589,12 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       }
       logger.error({ group: group.name, error: output.error }, 'Container agent error');
       const errorText = errorMessage || output.error || 'Unknown error';
-      if (isTimeoutError(errorText)) {
-        const autoSpawned = await maybeAutoSpawn('timeout', errorText);
-        if (autoSpawned) return true;
-      }
       const userMessage = humanizeError(errorText);
-      await sendMessageForQueue(msg.chatId, userMessage, { threadId: msg.threadId, replyToMessageId });
+      if (streaming) {
+        await streaming.finalize(userMessage);
+      } else {
+        await sendMessageForQueue(msg.chatId, userMessage, { threadId: msg.threadId, replyToMessageId });
+      }
       return false;
     }
 
@@ -860,19 +618,39 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
             fs.unlinkSync(voicePath);
           } catch (err) {
             logger.warn({ error: err instanceof Error ? err.message : String(err) }, 'Failed to send TTS voice reply');
-            await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+            if (streaming) {
+              await streaming.finalize(output.result);
+            } else {
+              await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+            }
           }
         } else {
-          await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+          if (streaming) {
+            await streaming.finalize(output.result);
+          } else {
+            await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+          }
         }
       } else {
-        const sendResult = await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
-        const sentMessageId = sendResult.messageId;
-        if (sentMessageId) {
-          try {
-            linkMessageToTrace(sentMessageId, msg.chatId, traceBase.trace_id);
-          } catch {
-            // Don't fail if linking fails
+        // Finalize streaming with the complete text, or send normally
+        if (streaming) {
+          const sentMessageId = await streaming.finalize(output.result);
+          if (sentMessageId) {
+            try {
+              linkMessageToTrace(sentMessageId, msg.chatId, traceBase.trace_id);
+            } catch {
+              // Don't fail if linking fails
+            }
+          }
+        } else {
+          const sendResult = await sendMessageForQueue(msg.chatId, output.result, { threadId: msg.threadId, replyToMessageId });
+          const sentMessageId = sendResult.messageId;
+          if (sentMessageId) {
+            try {
+              linkMessageToTrace(sentMessageId, msg.chatId, traceBase.trace_id);
+            } catch {
+              // Don't fail if linking fails
+            }
           }
         }
       }
@@ -884,23 +662,6 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         );
       }
     } else if (output.tool_calls && output.tool_calls.length > 0) {
-      const toolLimitHit = !output.result || !output.result.trim() || TOOL_CALL_FALLBACK_PATTERN.test(output.result);
-      if (toolLimitHit) {
-        const autoSpawned = await maybeAutoSpawn('tool_limit', 'Tool-call step limit reached');
-        if (autoSpawned) {
-          if (context) {
-            recordAgentTelemetry({
-              traceBase,
-              output,
-              context,
-              metricsSource: providerName,
-              toolAuditSource: 'message',
-              extraTimings
-            });
-          }
-          return true;
-        }
-      }
       await sendMessageForQueue(
         msg.chatId,
         "I ran out of steps before I could finish. Try narrowing the scope or asking for a specific part.",

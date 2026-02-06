@@ -43,26 +43,6 @@ export type AgentRuntimeConfig = {
     models: {
       summary: string;
       memory: string;
-      planner: string;
-      responseValidation: string;
-      toolSummary: string;
-    };
-    planner: {
-      enabled: boolean;
-      mode: string;
-      minTokens: number;
-      triggerRegex: string;
-      maxOutputTokens: number;
-      temperature: number;
-    };
-    responseValidation: {
-      enabled: boolean;
-      maxOutputTokens: number;
-      temperature: number;
-      maxRetries: number;
-      allowToolCalls: boolean;
-      minPromptTokens: number;
-      minResponseTokens: number;
     };
     tools: {
       maxToolSteps: number;
@@ -136,6 +116,9 @@ export type AgentRuntimeConfig = {
       }>;
       connectionTimeoutMs: number;
     };
+    reasoning: {
+      effort: 'off' | 'low' | 'medium' | 'high';
+    };
     skills: {
       enabled: boolean;
       maxSkills: number;
@@ -168,7 +151,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     compactionTriggerTokens: 20_000,
     recentContextTokens: 8000,
     summaryUpdateEveryMessages: 20,
-    maxOutputTokens: 1024,
+    maxOutputTokens: 4096,
     summaryMaxOutputTokens: 2048,
     temperature: 0.2,
     maxContextMessageTokens: 3000
@@ -187,30 +170,10 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
   },
   models: {
     summary: 'deepseek/deepseek-v3.2',
-    memory: 'deepseek/deepseek-v3.2',
-    planner: 'deepseek/deepseek-v3.2',
-    responseValidation: 'deepseek/deepseek-v3.2',
-    toolSummary: 'deepseek/deepseek-v3.2'
-  },
-  planner: {
-    enabled: true,
-    mode: 'auto',
-    minTokens: 800,
-    triggerRegex: '(plan|steps|roadmap|research|design|architecture|spec|strategy)',
-    maxOutputTokens: 1024,
-    temperature: 0.2
-  },
-  responseValidation: {
-    enabled: true,
-    maxOutputTokens: 1024,
-    temperature: 0,
-    maxRetries: 1,
-    allowToolCalls: false,
-    minPromptTokens: 400,
-    minResponseTokens: 160
+    memory: 'deepseek/deepseek-v3.2'
   },
   tools: {
-    maxToolSteps: 96,
+    maxToolSteps: 50,
     outputLimitBytes: 400_000,
     enableBash: true,
     enableWebSearch: true,
@@ -273,6 +236,9 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     enabled: false,
     servers: [],
     connectionTimeoutMs: 10_000
+  },
+  reasoning: {
+    effort: 'low',
   },
   skills: {
     enabled: true,

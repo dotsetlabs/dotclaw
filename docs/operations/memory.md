@@ -8,7 +8,7 @@ DotClaw stores long-term memory in a SQLite database at `~/.dotclaw/data/store/m
 
 ## Memory extraction
 
-The agent automatically extracts important facts, preferences, and instructions from conversations. Extraction can be synchronous (during the response) or asynchronous (after the response) based on the `agent.memory.extraction.async` setting.
+The agent automatically extracts important facts, preferences, and instructions from conversations. In daemon mode, extraction runs asynchronously as a fire-and-forget background task after the response is delivered. In ephemeral mode, extraction is skipped to avoid blocking the container.
 
 ## Memory recall
 

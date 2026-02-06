@@ -11,12 +11,10 @@ Personal OpenRouter-based assistant for Telegram and Discord. Each request runs 
 - Voice transcription and text-to-speech
 - Browser automation (Chromium in-container)
 - MCP server integration (stdio transport)
-- Lifecycle hooks (message, agent, job, task, memory events)
-- Multi-agent orchestration (parallel fan-out with aggregation)
-- Declarative YAML/JSON workflows (multi-step pipelines)
+- Lifecycle hooks (message, agent, task, memory events)
+- Real-time streaming responses with edit-in-place delivery
 - Long-term memory with embeddings and semantic search
 - Scheduled tasks (cron and one-off)
-- Background jobs for long-running work
 - Tool policies and daily budgets
 - Plugin tools and Autotune optimization
 - Prometheus-compatible metrics and status dashboard

@@ -10,6 +10,7 @@ const DATA_DIR = path.join(DOTCLAW_HOME, 'data');
 const ENV_PATH = path.join(DOTCLAW_HOME, '.env');
 const MODEL_CONFIG_PATH = path.join(CONFIG_DIR, 'model.json');
 const RUNTIME_CONFIG_PATH = path.join(CONFIG_DIR, 'runtime.json');
+const REGISTERED_GROUPS_PATH = path.join(DATA_DIR, 'registered_groups.json');
 
 function parseEnv(content) {
   const lines = content.split('\n');
@@ -68,6 +69,22 @@ async function promptForValue(rl, label, currentValue, optional = false) {
       resolve(value);
     });
   });
+}
+
+function loadJson(filePath, fallback) {
+  try {
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    }
+  } catch {
+    // ignore
+  }
+  return fallback;
+}
+
+function saveJson(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
 }
 
 function loadRuntimeConfig() {
@@ -231,6 +248,70 @@ async function main() {
   nextRuntimeConfig.host.memory.embeddings.openrouterSiteName = openrouterSiteName || '';
 
   saveRuntimeConfig(nextRuntimeConfig);
+
+  // ── Migrate registered groups when providers change ──
+  const enabledProviders = new Set();
+  if (telegramEnabled) enabledProviders.add('telegram');
+  if (discordEnabled) enabledProviders.add('discord');
+
+  const groups = loadJson(REGISTERED_GROUPS_PATH, {});
+  const staleEntries = Object.entries(groups).filter(([chatId]) => {
+    const prefix = chatId.split(':')[0];
+    return !enabledProviders.has(prefix);
+  });
+
+  if (staleEntries.length > 0) {
+    // Determine what provider to migrate to
+    const targetProvider = discordEnabled ? 'discord' : 'telegram';
+
+    for (const [oldChatId, groupData] of staleEntries) {
+      const oldPrefix = oldChatId.split(':')[0];
+
+      if (nonInteractive) {
+        const newId = process.env.DOTCLAW_CONFIGURE_CHAT_ID;
+        if (newId) {
+          const newChatId = `${targetProvider}:${newId}`;
+          groups[newChatId] = groupData;
+          delete groups[oldChatId];
+          console.log(`Migrated group "${groupData.name}" from ${oldPrefix} to ${newChatId}`);
+        } else {
+          console.warn(
+            `Warning: Group "${groupData.name}" is registered under ${oldPrefix} (${oldChatId}), ` +
+            `but ${oldPrefix} is now disabled. Set DOTCLAW_CONFIGURE_CHAT_ID to migrate it.`
+          );
+        }
+      } else {
+        const migrateRl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const idLabel = targetProvider === 'discord' ? 'Discord channel ID' : 'Telegram chat ID';
+        const idHint = targetProvider === 'discord'
+          ? '(Right-click channel -> Copy Channel ID)'
+          : '(Use @userinfobot or @get_id_bot)';
+
+        console.log(
+          `\nGroup "${groupData.name}" is registered under ${oldPrefix} (${oldChatId}), ` +
+          `but ${oldPrefix} is now disabled.`
+        );
+        const newId = await new Promise(resolve => {
+          migrateRl.question(
+            `${idLabel} to re-register this group ${idHint}, or press Enter to skip: `,
+            answer => resolve(answer.trim())
+          );
+        });
+        migrateRl.close();
+
+        if (newId) {
+          const newChatId = `${targetProvider}:${newId}`;
+          groups[newChatId] = groupData;
+          delete groups[oldChatId];
+          console.log(`Migrated group "${groupData.name}" to ${newChatId}`);
+        } else {
+          console.log(`Skipped migration for "${groupData.name}". You can update registered_groups.json manually.`);
+        }
+      }
+    }
+
+    saveJson(REGISTERED_GROUPS_PATH, groups);
+  }
 
   console.log('Configuration updated.');
 }

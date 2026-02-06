@@ -23,10 +23,6 @@ npm run dev
 ./container/build.sh
 ```
 
-## Background jobs
-
-Long-running work runs as background jobs. See `operations/background-jobs` for details.
-
 ## Logs
 
 Logs are written to `~/.dotclaw/logs/` by default:

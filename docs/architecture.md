@@ -9,14 +9,13 @@ title: Architecture
 ```
 Messaging providers (Telegram / Discord)
   -> Provider Registry
-  -> Request Router (fast/standard/deep/background classification)
+  -> Request Router (single-call request routing)
   -> Message Pipeline (SQLite queue + batching)
-  -> Docker container (agent runtime)
+  -> Docker container (agent runtime, streaming delivery)
   -> IPC Dispatcher
   -> Response back to originating provider
 
-Background jobs, orchestration, and workflows follow the same container
-path but run asynchronously. Hooks fire at lifecycle boundaries.
+Hooks fire at lifecycle boundaries.
 ```
 
 ## Key directories
@@ -62,7 +61,6 @@ All runtime data is stored in `~/.dotclaw` (configurable via `DOTCLAW_HOME` envi
     <group>/CLAUDE.md     Group memory
     <group>/inbox/        Downloaded incoming Telegram media
     <group>/downloads/    Files downloaded by mcp__dotclaw__download_url
-    <group>/jobs/         Background job artifacts
   logs/
   prompts/
   traces/

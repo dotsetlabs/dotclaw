@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 import { claimDueTasks, updateTaskAfterRun, logTaskRun, getTaskById, updateTask, updateTaskRunStatsOnly } from './db.js';
-import { recordTaskRun, recordError, recordMessage, recordRoutingDecision, recordStageLatency } from './metrics.js';
+import { recordTaskRun, recordError, recordMessage } from './metrics.js';
 import { ScheduledTask, RegisteredGroup } from './types.js';
 import { GROUPS_DIR, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { loadRuntimeConfig } from './runtime-config.js';
@@ -228,45 +228,26 @@ ${task.prompt}` : task.prompt;
     inputText: task.prompt,
     source: 'dotclaw-scheduler'
   });
-  const routingStartedAt = Date.now();
   const routingDecision = routePrompt(taskPrompt);
-  recordRoutingDecision(routingDecision.profile);
-  const routerMs = Date.now() - routingStartedAt;
-  recordStageLatency('router', routerMs, 'scheduler');
 
   try {
-    const recallMaxResults = routingDecision.enableMemoryRecall
-      ? (Number.isFinite(routingDecision.recallMaxResults)
-        ? Math.max(0, Math.floor(routingDecision.recallMaxResults as number))
-        : runtime.host.memory.recall.maxResults)
-      : 0;
-    const recallMaxTokens = routingDecision.enableMemoryRecall
-      ? (Number.isFinite(routingDecision.recallMaxTokens)
-        ? Math.max(0, Math.floor(routingDecision.recallMaxTokens as number))
-        : runtime.host.memory.recall.maxTokens)
-      : 0;
     const execution = await executeAgentRun({
       group,
       prompt: taskPrompt,
       chatJid: task.chat_jid,
       userId: null,
       recallQuery: task.prompt,
-      recallMaxResults,
-      recallMaxTokens,
+      recallMaxResults: routingDecision.recallMaxResults,
+      recallMaxTokens: routingDecision.recallMaxTokens,
       sessionId,
       persistSession: task.context_mode === 'group',
       onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
       isScheduledTask: true,
       taskId: task.id,
       useGroupLock: false,
-      modelOverride: routingDecision.modelOverride,
+      modelOverride: routingDecision.model,
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
       maxToolSteps: routingDecision.maxToolSteps,
-      disablePlanner: !routingDecision.enablePlanner,
-      disableResponseValidation: !routingDecision.enableResponseValidation,
-      responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
-      disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
-      profile: routingDecision.profile,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
       timezone: taskTimezone
@@ -301,7 +282,7 @@ ${task.prompt}` : task.prompt;
       toolAuditSource: 'scheduler',
       errorMessage: error ?? undefined,
       errorType: error ? 'scheduler' : undefined,
-      extraTimings: { router_ms: routerMs }
+      extraTimings: {}
     });
   } else if (error) {
     recordError('scheduler');
@@ -427,44 +408,25 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
     inputText: task.prompt,
     source: 'dotclaw-manual-task'
   });
-  const routingStartedAt = Date.now();
   const routingDecision = routePrompt(taskPrompt);
-  recordRoutingDecision(routingDecision.profile);
-  const routerMs = Date.now() - routingStartedAt;
-  recordStageLatency('router', routerMs, 'scheduler');
 
   try {
-    const recallMaxResults = routingDecision.enableMemoryRecall
-      ? (Number.isFinite(routingDecision.recallMaxResults)
-        ? Math.max(0, Math.floor(routingDecision.recallMaxResults as number))
-        : runtime.host.memory.recall.maxResults)
-      : 0;
-    const recallMaxTokens = routingDecision.enableMemoryRecall
-      ? (Number.isFinite(routingDecision.recallMaxTokens)
-        ? Math.max(0, Math.floor(routingDecision.recallMaxTokens as number))
-        : runtime.host.memory.recall.maxTokens)
-      : 0;
     const execution = await executeAgentRun({
       group,
       prompt: taskPrompt,
       chatJid: task.chat_jid,
       userId: null,
       recallQuery: task.prompt,
-      recallMaxResults,
-      recallMaxTokens,
+      recallMaxResults: routingDecision.recallMaxResults,
+      recallMaxTokens: routingDecision.recallMaxTokens,
       sessionId,
       persistSession: task.context_mode === 'group',
       onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
       isScheduledTask: true,
       taskId: task.id,
-      modelOverride: routingDecision.modelOverride,
+      modelOverride: routingDecision.model,
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
       maxToolSteps: routingDecision.maxToolSteps,
-      disablePlanner: !routingDecision.enablePlanner,
-      disableResponseValidation: !routingDecision.enableResponseValidation,
-      responseValidationMaxRetries: routingDecision.responseValidationMaxRetries,
-      disableMemoryExtraction: !routingDecision.enableMemoryExtraction,
-      profile: routingDecision.profile,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
       timezone: task.timezone || TIMEZONE
@@ -499,7 +461,7 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       toolAuditSource: 'scheduler',
       errorMessage: error ?? undefined,
       errorType: error ? 'scheduler' : undefined,
-      extraTimings: { router_ms: routerMs }
+      extraTimings: {}
     });
   } else if (error) {
     recordError('scheduler');

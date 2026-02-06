@@ -59,10 +59,31 @@ function getCachedOpenRouter(apiKey: string, options: ReturnType<typeof getOpenR
   if (cachedOpenRouter && cachedOpenRouterKey === apiKey && cachedOpenRouterOptions === optionsKey) {
     return cachedOpenRouter;
   }
-  cachedOpenRouter = new OpenRouter({
+  const client = new OpenRouter({
     apiKey,
     ...options
   });
+
+  // The SDK accepts httpReferer/xTitle in the constructor but never injects
+  // them as HTTP headers in the Responses API path (betaResponsesSend).
+  // Wrap callModel to inject them on every request.
+  const { httpReferer, xTitle } = options;
+  if (httpReferer || xTitle) {
+    const extraHeaders: Record<string, string> = {};
+    if (httpReferer) extraHeaders['HTTP-Referer'] = httpReferer;
+    if (xTitle) extraHeaders['X-Title'] = xTitle;
+
+    const originalCallModel = client.callModel.bind(client);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    client.callModel = (request: any, opts?: any) => {
+      return originalCallModel(request, {
+        ...opts,
+        headers: { ...extraHeaders, ...(opts?.headers as Record<string, string>) }
+      });
+    };
+  }
+
+  cachedOpenRouter = client;
   cachedOpenRouterKey = apiKey;
   cachedOpenRouterOptions = optionsKey;
   return cachedOpenRouter;
@@ -72,18 +93,30 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
+function classifyError(err: unknown): 'retryable' | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  if (/429|rate.?limit/.test(lower)) return 'retryable';
+  if (/\b5\d{2}\b/.test(msg) || /server error|bad gateway|unavailable/.test(lower)) return 'retryable';
+  if (/timeout|timed out|deadline/.test(lower)) return 'retryable';
+  if (/model.?not.?available|no endpoints|provider error/.test(lower)) return 'retryable';
+  return null;
+}
+
 // ── Response text extraction ─────────────────────────────────────────
 
-async function getResponseText(result: OpenRouterResult, context: string): Promise<string> {
+async function getResponseText(result: OpenRouterResult, context: string): Promise<{ text: string; error?: string }> {
   try {
     const text = await result.getText();
     if (typeof text === 'string' && text.trim()) {
-      return text;
+      return { text };
     }
   } catch (err) {
-    log(`getText failed (${context}): ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    log(`getText failed (${context}): ${message}`);
+    return { text: '', error: message };
   }
-  return '';
+  return { text: '' };
 }
 
 function writeOutput(output: ContainerOutput): void {
@@ -199,62 +232,6 @@ function getConfig(config: ReturnType<typeof loadAgentConfig>): MemoryConfig & {
   };
 }
 
-function buildPlannerPrompt(messages: Message[]): { instructions: string; input: string } {
-  const transcript = messages.map(msg => `${msg.role.toUpperCase()}: ${msg.content}`).join('\n\n');
-  const instructions = [
-    'You are a planning module for a personal assistant.',
-    'Given the conversation, produce a concise plan in JSON.',
-    'Return JSON only with keys:',
-    '- steps: array of short action steps',
-    '- tools: array of tool names you expect to use (if any)',
-    '- risks: array of potential pitfalls or missing info',
-    '- questions: array of clarifying questions (if any)',
-    'Keep each array short. Use empty arrays if not needed.'
-  ].join('\n');
-  const input = `Conversation:\n${transcript}`;
-  return { instructions, input };
-}
-
-function parsePlannerResponse(text: string): { steps: string[]; tools: string[]; risks: string[]; questions: string[] } | null {
-  const trimmed = text.trim();
-  let jsonText = trimmed;
-  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch) {
-    jsonText = fenceMatch[1].trim();
-  }
-  try {
-    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
-    const steps = Array.isArray(parsed.steps) ? parsed.steps.filter(item => typeof item === 'string') : [];
-    const tools = Array.isArray(parsed.tools) ? parsed.tools.filter(item => typeof item === 'string') : [];
-    const risks = Array.isArray(parsed.risks) ? parsed.risks.filter(item => typeof item === 'string') : [];
-    const questions = Array.isArray(parsed.questions) ? parsed.questions.filter(item => typeof item === 'string') : [];
-    return { steps, tools, risks, questions };
-  } catch {
-    return null;
-  }
-}
-
-function formatPlanBlock(plan: { steps: string[]; tools: string[]; risks: string[]; questions: string[] }): string {
-  const lines: string[] = ['Planned approach (planner):'];
-  if (plan.steps.length > 0) {
-    lines.push('Steps:');
-    for (const step of plan.steps) lines.push(`- ${step}`);
-  }
-  if (plan.tools.length > 0) {
-    lines.push('Tools:');
-    for (const tool of plan.tools) lines.push(`- ${tool}`);
-  }
-  if (plan.risks.length > 0) {
-    lines.push('Risks:');
-    for (const risk of plan.risks) lines.push(`- ${risk}`);
-  }
-  if (plan.questions.length > 0) {
-    lines.push('Questions:');
-    for (const question of plan.questions) lines.push(`- ${question}`);
-  }
-  return lines.join('\n');
-}
-
 function getOpenRouterOptions(config: ReturnType<typeof loadAgentConfig>) {
   const timeoutMs = config.agent.openrouter.timeoutMs;
   const retryEnabled = config.agent.openrouter.retry;
@@ -319,16 +296,6 @@ function estimateMessagesTokens(messages: Message[], tokensPerChar: number, toke
 
 const MEMORY_SUMMARY_MAX_CHARS = 2000;
 
-const compactToolsDoc = [
-  'Tools: Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, GitClone, NpmInstall,',
-  'mcp__dotclaw__send_message, send_file, send_photo, send_voice, send_audio, send_location,',
-  'send_contact, send_poll, send_buttons, edit_message, delete_message, download_url,',
-  'schedule_task, run_task, list_tasks, pause_task, resume_task, cancel_task, update_task,',
-  'spawn_job, job_status, list_jobs, cancel_job, job_update, register_group, remove_group,',
-  'list_groups, set_model, memory_upsert, memory_search, memory_list, memory_forget, memory_stats.',
-  'plugin__* (plugins), mcp_ext__* (external MCP).'
-].join('\n');
-
 function buildSystemInstructions(params: {
   assistantName: string;
   groupNotes?: string | null;
@@ -344,47 +311,33 @@ function buildSystemInstructions(params: {
   toolReliability?: Array<{ name: string; success_rate: number; count: number; avg_duration_ms: number | null }>;
   behaviorConfig?: Record<string, unknown>;
   isScheduledTask: boolean;
-  isBackgroundTask: boolean;
   taskId?: string;
-  isBackgroundJob: boolean;
-  jobId?: string;
   timezone?: string;
   hostPlatform?: string;
   messagingPlatform?: string;
-  planBlock?: string;
-  profile?: 'fast' | 'standard' | 'deep' | 'background';
   taskExtractionPack?: PromptPack | null;
   responseQualityPack?: PromptPack | null;
   toolCallingPack?: PromptPack | null;
   toolOutcomePack?: PromptPack | null;
   memoryPolicyPack?: PromptPack | null;
   memoryRecallPack?: PromptPack | null;
+  maxToolSteps?: number;
 }): string {
-  const profile = params.profile || 'standard';
-  const isFast = profile === 'fast';
-
-  // Tool descriptions are already in each tool's schema — only add essential guidance here
-  const toolGuidance = isFast ? '' : [
+  const toolGuidance = [
     'Key tool rules:',
     '- User attachments arrive in /workspace/group/inbox/ (see <attachment> tags). Process with Read/Bash/Python.',
-    '- To send media from the web: download_url → send_photo/send_file/send_audio. Always foreground.',
+    '- To send media from the web: download_url → send_photo/send_file/send_audio.',
     '- Charts/plots: matplotlib → savefig → send_photo. Graphviz → dot -Tpng → send_photo.',
     '- Voice messages are auto-transcribed (<transcript> in <attachment>). Reply with normal text — the host auto-converts to voice.',
     '- GitHub CLI (`gh`) is available if GH_TOKEN is set.',
-    '- Use spawn_job ONLY for tasks >2 minutes (deep research, large projects). Everything else: foreground.',
-    '- When you spawn a job, reply minimally (e.g. "Working on it"). No job IDs, bullet plans, or status offers.',
     '- plugin__* and mcp_ext__* tools may be available if configured.'
   ].join('\n');
 
-  const toolsSection = isFast ? compactToolsDoc : toolGuidance;
-
-  const browserAutomation = !isFast && agentConfig.agent.browser.enabled ? [
+  const browserAutomation = agentConfig.agent.browser.enabled ? [
     'Browser Tool: actions: navigate, snapshot, click, fill, screenshot, extract, evaluate, close.',
     'Use snapshot with interactive=true for clickable refs (@e1, @e2). Screenshots → /workspace/group/screenshots/.'
   ].join('\n') : '';
 
-  // Memory section: skip for fast profile, consolidate empty placeholders for other profiles
-  const includeMemory = !isFast;
   const hasAnyMemory = params.memorySummary || params.memoryFacts.length > 0 ||
     params.longTermRecall.length > 0 || params.userProfile;
 
@@ -415,7 +368,7 @@ function buildSystemInstructions(params: {
   const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
   const skillNotes = params.skillCatalog ? formatSkillCatalog(params.skillCatalog) : '';
 
-  const toolReliability = !isFast && params.toolReliability && params.toolReliability.length > 0
+  const toolReliability = params.toolReliability && params.toolReliability.length > 0
     ? params.toolReliability
       .sort((a, b) => a.success_rate - b.success_rate)
       .slice(0, 20)
@@ -464,23 +417,13 @@ function buildSystemInstructions(params: {
   const scheduledNote = params.isScheduledTask
     ? `You are running as a scheduled task${params.taskId ? ` (task id: ${params.taskId})` : ''}. If you need to communicate, use \`mcp__dotclaw__send_message\`.`
     : '';
-  const backgroundNote = params.isBackgroundTask
-    ? 'You are running in the background for a user request. Focus on completing the task and return a complete response without asking follow-up questions unless strictly necessary.'
-    : '';
-  const jobNote = params.isBackgroundJob
-    ? `You are running as a background job${params.jobId ? ` (job id: ${params.jobId})` : ''}. Complete the task silently and return the result. Do NOT call \`mcp__dotclaw__job_update\` for routine progress — only for critical blockers or required user decisions. Do NOT send messages to the chat about your progress. Just do the work and return the final result. The system will deliver your result to the user automatically.`
-    : '';
-  const jobArtifactsNote = params.isBackgroundJob && params.jobId
-    ? `Job artifacts directory: /workspace/group/jobs/${params.jobId}`
-    : '';
 
   const fmtPack = (label: string, pack: PromptPack | null | undefined) =>
     pack ? formatPromptPack({ label, pack, maxDemos: PROMPT_PACKS_MAX_DEMOS, maxChars: PROMPT_PACKS_MAX_CHARS }) : '';
 
-  // Skip prompt packs for fast profile; enforce aggregate budget for others
-  const PROMPT_PACKS_TOTAL_BUDGET = PROMPT_PACKS_MAX_CHARS * 3; // Aggregate cap across all packs
+  const PROMPT_PACKS_TOTAL_BUDGET = PROMPT_PACKS_MAX_CHARS * 3;
   const allPackBlocks: string[] = [];
-  if (!isFast) {
+  {
     const packEntries: Array<[string, PromptPack | null | undefined]> = [
       ['Tool Calling Guidelines', params.toolCallingPack],
       ['Tool Outcome Guidelines', params.toolOutcomePack],
@@ -505,9 +448,8 @@ function buildSystemInstructions(params: {
   const memoryPolicyBlock = allPackBlocks.find(b => b.includes('Memory Policy')) || '';
   const memoryRecallBlock = allPackBlocks.find(b => b.includes('Memory Recall')) || '';
 
-  // Build memory sections — omit entirely for fast, consolidate empty placeholders for others
   const memorySections: string[] = [];
-  if (includeMemory) {
+  {
     if (hasAnyMemory) {
       if (memorySummary) {
         memorySections.push('Long-term memory summary:', memorySummary);
@@ -538,16 +480,12 @@ function buildSystemInstructions(params: {
     `You are ${params.assistantName}, a personal assistant running inside DotClaw.${params.messagingPlatform ? ` You are currently connected via ${params.messagingPlatform}.` : ''}`,
     hostPlatformNote,
     scheduledNote,
-    backgroundNote,
-    jobNote,
-    jobArtifactsNote,
-    toolsSection,
+    toolGuidance,
     browserAutomation,
     groupNotes,
     globalNotes,
     skillNotes,
     timezoneNote,
-    params.planBlock || '',
     toolCallingBlock,
     toolOutcomeBlock,
     taskExtractionBlock,
@@ -558,6 +496,9 @@ function buildSystemInstructions(params: {
     availableGroups ? `Available groups (main group only):\n${availableGroups}` : '',
     toolReliability ? `Tool reliability (recent):\n${toolReliability}` : '',
     behaviorNotes.length > 0 ? `Behavior notes:\n${behaviorNotes.join('\n')}` : '',
+    params.maxToolSteps
+      ? `You have a budget of ${params.maxToolSteps} tool steps per request. If a task is large, break your work into phases and always finish with a text summary of what you accomplished — never end on a tool call without a response.`
+      : '',
     'Be concise and helpful. When you use tools, summarize what happened rather than dumping raw output.'
   ].filter(Boolean).join('\n\n');
 }
@@ -613,6 +554,47 @@ function decodeXml(value: string): string {
     .replace(/&amp;/g, '&');
 }
 
+// ── Image/Vision support ──────────────────────────────────────────────
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB per image
+const MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024; // 20MB total across all images
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+function loadImageAttachments(attachments?: ContainerInput['attachments']): Array<{
+  type: 'image_url';
+  image_url: { url: string };
+}> {
+  if (!attachments) return [];
+  const images: Array<{ type: 'image_url'; image_url: { url: string } }> = [];
+  let totalBytes = 0;
+  for (const att of attachments) {
+    if (att.type !== 'photo') continue;
+    const mime = att.mime_type || 'image/jpeg';
+    if (!IMAGE_MIME_TYPES.has(mime)) continue;
+    try {
+      const stat = fs.statSync(att.path);
+      if (stat.size > MAX_IMAGE_BYTES) {
+        log(`Skipping image ${att.path}: ${stat.size} bytes exceeds ${MAX_IMAGE_BYTES}`);
+        continue;
+      }
+      if (totalBytes + stat.size > MAX_TOTAL_IMAGE_BYTES) {
+        log(`Skipping image ${att.path}: cumulative size would exceed ${MAX_TOTAL_IMAGE_BYTES}`);
+        break;
+      }
+      const data = fs.readFileSync(att.path);
+      totalBytes += data.length;
+      const b64 = data.toString('base64');
+      images.push({
+        type: 'image_url',
+        image_url: { url: `data:${mime};base64,${b64}` }
+      });
+    } catch (err) {
+      log(`Failed to load image ${att.path}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  return images;
+}
+
 function messagesToOpenRouter(messages: Message[]) {
   return messages.map(message => ({
     role: message.role,
@@ -655,7 +637,7 @@ async function updateMemorySummary(params: {
     temperature: 0.1,
     reasoning: { effort: 'low' as const }
   });
-  const text = await getResponseText(result, 'summary');
+  const { text } = await getResponseText(result, 'summary');
   return parseSummaryResponse(text);
 }
 
@@ -729,122 +711,6 @@ function parseMemoryExtraction(text: string): Array<Record<string, unknown>> {
   }
 }
 
-type ResponseValidation = {
-  verdict: 'pass' | 'fail';
-  issues: string[];
-  missing: string[];
-};
-
-function buildResponseValidationPrompt(params: { userPrompt: string; response: string }): { instructions: string; input: string } {
-  const instructions = [
-    'You are a strict response quality checker.',
-    'Given a user request and an assistant response, decide if the response fully addresses the request.',
-    'Fail if the response is empty, generic, deflects, promises work without results, or ignores any explicit questions.',
-    'Pass only if the response directly answers all parts with concrete, relevant content.',
-    'Return JSON only with keys: verdict ("pass"|"fail"), issues (array of strings), missing (array of strings).'
-  ].join('\n');
-
-  const input = [
-    'User request:',
-    params.userPrompt,
-    '',
-    'Assistant response:',
-    params.response
-  ].join('\n');
-
-  return { instructions, input };
-}
-
-function parseResponseValidation(text: string): ResponseValidation | null {
-  const trimmed = text.trim();
-  let jsonText = trimmed;
-  const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch) {
-    jsonText = fenceMatch[1].trim();
-  }
-  try {
-    const parsed = JSON.parse(jsonText);
-    const verdict = parsed?.verdict;
-    if (verdict !== 'pass' && verdict !== 'fail') return null;
-    const issues = Array.isArray(parsed?.issues)
-      ? parsed.issues.filter((issue: unknown) => typeof issue === 'string')
-      : [];
-    const missing = Array.isArray(parsed?.missing)
-      ? parsed.missing.filter((item: unknown) => typeof item === 'string')
-      : [];
-    return { verdict, issues, missing };
-  } catch {
-    return null;
-  }
-}
-
-async function validateResponseQuality(params: {
-  openrouter: OpenRouter;
-  model: string;
-  userPrompt: string;
-  response: string;
-  maxOutputTokens: number;
-  temperature: number;
-}): Promise<ResponseValidation | null> {
-  const prompt = buildResponseValidationPrompt({
-    userPrompt: params.userPrompt,
-    response: params.response
-  });
-  const result = await params.openrouter.callModel({
-    model: params.model,
-    instructions: prompt.instructions,
-    input: prompt.input,
-    maxOutputTokens: params.maxOutputTokens,
-    temperature: params.temperature,
-    reasoning: { effort: 'low' as const }
-  });
-  const text = await getResponseText(result, 'response_validation');
-  return parseResponseValidation(text);
-}
-
-function buildRetryGuidance(validation: ResponseValidation | null): string {
-  const issues = validation?.issues || [];
-  const missing = validation?.missing || [];
-  const points = [...issues, ...missing].filter(Boolean).slice(0, 8);
-  const details = points.length > 0
-    ? points.map(item => `- ${item}`).join('\n')
-    : '- The previous response did not fully address the request.';
-  return [
-    'IMPORTANT: Your previous response did not fully answer the user request.',
-    'Provide a direct, complete answer now. Do not mention this retry.',
-    'Issues to fix:',
-    details
-  ].join('\n');
-}
-
-function buildPlannerTrigger(pattern: string | undefined): RegExp | null {
-  if (!pattern) return null;
-  try {
-    return new RegExp(pattern, 'i');
-  } catch {
-    return null;
-  }
-}
-
-function shouldRunPlanner(params: {
-  enabled: boolean;
-  mode: string;
-  prompt: string;
-  tokensPerChar: number;
-  minTokens: number;
-  trigger: RegExp | null;
-}): boolean {
-  if (!params.enabled) return false;
-  const mode = params.mode.toLowerCase();
-  if (mode === 'always') return true;
-  if (mode === 'off') return false;
-
-  const estimatedTokens = estimateTokensForModel(params.prompt, params.tokensPerChar);
-  if (params.minTokens > 0 && estimatedTokens >= params.minTokens) return true;
-  if (params.trigger && params.trigger.test(params.prompt)) return true;
-  return false;
-}
-
 export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutput> {
   log(`Received input for group: ${input.groupFolder}`);
 
@@ -868,7 +734,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     config.compactionTriggerTokens = Math.max(1000, Math.min(config.compactionTriggerTokens, compactionTarget));
   }
   if (input.modelMaxOutputTokens && Number.isFinite(input.modelMaxOutputTokens)) {
-    config.maxOutputTokens = Math.min(config.maxOutputTokens, input.modelMaxOutputTokens);
+    config.maxOutputTokens = input.modelMaxOutputTokens;
   }
   if (input.modelTemperature && Number.isFinite(input.modelTemperature)) {
     config.temperature = input.modelTemperature;
@@ -877,30 +743,12 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const maxToolSteps = Number.isFinite(input.maxToolSteps)
     ? Math.max(1, Math.floor(input.maxToolSteps as number))
     : agent.tools.maxToolSteps;
-  const memoryExtractionEnabled = agent.memory.extraction.enabled && !input.disableMemoryExtraction;
+  const memoryExtractionEnabled = agent.memory.extraction.enabled;
   const isDaemon = process.env.DOTCLAW_DAEMON === '1';
-  const memoryExtractionAsync = agent.memory.extraction.async;
   const memoryExtractionMaxMessages = agent.memory.extraction.maxMessages;
   const memoryExtractionMaxOutputTokens = agent.memory.extraction.maxOutputTokens;
   const memoryExtractScheduled = agent.memory.extractScheduled;
   const memoryArchiveSync = agent.memory.archiveSync;
-  const plannerEnabled = agent.planner.enabled && !input.disablePlanner;
-  const plannerMode = String(agent.planner.mode || 'auto').toLowerCase();
-  const plannerMinTokens = agent.planner.minTokens;
-  const plannerTrigger = buildPlannerTrigger(agent.planner.triggerRegex);
-  const plannerModel = agent.models.planner;
-  const plannerMaxOutputTokens = agent.planner.maxOutputTokens;
-  const plannerTemperature = agent.planner.temperature;
-  const responseValidateEnabled = agent.responseValidation.enabled && !input.disableResponseValidation;
-  const responseValidateModel = agent.models.responseValidation;
-  const responseValidateMaxOutputTokens = agent.responseValidation.maxOutputTokens;
-  const responseValidateTemperature = agent.responseValidation.temperature;
-  const responseValidateMaxRetries = Number.isFinite(input.responseValidationMaxRetries)
-    ? Math.max(0, Math.floor(input.responseValidationMaxRetries as number))
-    : agent.responseValidation.maxRetries;
-  const responseValidateAllowToolCalls = agent.responseValidation.allowToolCalls;
-  const responseValidateMinPromptTokens = agent.responseValidation.minPromptTokens || 0;
-  const responseValidateMinResponseTokens = agent.responseValidation.minResponseTokens || 0;
   const maxContextMessageTokens = agent.context.maxContextMessageTokens;
 
   const openrouter = getCachedOpenRouter(apiKey, openrouterOptions);
@@ -917,7 +765,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const toolCalls: ToolCallRecord[] = [];
   let memoryItemsUpserted = 0;
   let memoryItemsExtracted = 0;
-  const timings: { planner_ms?: number; response_validation_ms?: number; memory_extraction_ms?: number; tool_ms?: number } = {};
+  const timings: { memory_extraction_ms?: number; tool_ms?: number } = {};
   const ipc = createIpcHandlers({
     chatJid: input.chatJid,
     groupFolder: input.groupFolder,
@@ -931,11 +779,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     onToolCall: (call) => {
       toolCalls.push(call);
     },
-    policy: input.toolPolicy,
-    jobProgress: {
-      jobId: input.jobId,
-      enabled: Boolean(input.isBackgroundJob)
-    }
+    policy: input.toolPolicy
   });
 
   // Discover MCP external tools if enabled
@@ -987,6 +831,14 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       };
     }
   }
+
+  // Resolve reasoning effort: input override > agent config > 'low'
+  const VALID_EFFORTS = ['off', 'low', 'medium', 'high'] as const;
+  const rawEffort = input.reasoningEffort || agent.reasoning?.effort || 'low';
+  const reasoningEffort = VALID_EFFORTS.includes(rawEffort as typeof VALID_EFFORTS[number]) ? rawEffort : 'low';
+  const resolvedReasoning = reasoningEffort === 'off'
+    ? undefined
+    : { effort: reasoningEffort as 'low' | 'medium' | 'high' };
 
   let prompt = input.prompt;
   if (input.isScheduledTask) {
@@ -1128,7 +980,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   if (memoryPolicyResult) promptPackVersions['memory-policy'] = memoryPolicyResult.pack.version;
   if (memoryRecallResult) promptPackVersions['memory-recall'] = memoryRecallResult.pack.version;
 
-  const buildInstructions = (planBlockValue: string) => buildSystemInstructions({
+  const buildInstructions = () => buildSystemInstructions({
     assistantName,
     groupNotes: claudeNotes.group,
     globalNotes: claudeNotes.global,
@@ -1143,75 +995,21 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     toolReliability: input.toolReliability,
     behaviorConfig: input.behaviorConfig,
     isScheduledTask: !!input.isScheduledTask,
-    isBackgroundTask: !!input.isBackgroundTask,
     taskId: input.taskId,
-    isBackgroundJob: !!input.isBackgroundJob,
-    jobId: input.jobId,
     timezone: typeof input.timezone === 'string' ? input.timezone : undefined,
     hostPlatform: typeof input.hostPlatform === 'string' ? input.hostPlatform : undefined,
     messagingPlatform: input.chatJid?.includes(':') ? input.chatJid.split(':')[0] : undefined,
-    planBlock: planBlockValue,
-    profile: input.profile,
     taskExtractionPack: taskPackResult?.pack || null,
     responseQualityPack: responseQualityResult?.pack || null,
     toolCallingPack: toolCallingResult?.pack || null,
     toolOutcomePack: toolOutcomeResult?.pack || null,
     memoryPolicyPack: memoryPolicyResult?.pack || null,
-    memoryRecallPack: memoryRecallResult?.pack || null
+    memoryRecallPack: memoryRecallResult?.pack || null,
+    maxToolSteps
   });
 
-  let planBlock = '';
-  let instructions = buildInstructions(planBlock);
-  let instructionsTokens = estimateTokensForModel(instructions, tokenEstimate.tokensPerChar);
-  let maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
-  let adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
-  let { recentMessages: plannerContextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6);
-  plannerContextMessages = clampContextMessages(plannerContextMessages, tokenEstimate.tokensPerChar, maxContextMessageTokens);
-
-  if (shouldRunPlanner({
-    enabled: plannerEnabled,
-    mode: plannerMode,
-    prompt,
-    tokensPerChar: tokenEstimate.tokensPerChar,
-    minTokens: plannerMinTokens,
-    trigger: plannerTrigger
-  })) {
-    try {
-      const plannerStartedAt = Date.now();
-      const plannerPrompt = buildPlannerPrompt(plannerContextMessages);
-      const plannerResult = await openrouter.callModel({
-        model: plannerModel,
-        instructions: plannerPrompt.instructions,
-        input: plannerPrompt.input,
-        maxOutputTokens: plannerMaxOutputTokens,
-        temperature: plannerTemperature,
-        reasoning: { effort: 'low' as const }
-      });
-      const plannerText = await getResponseText(plannerResult, 'planner');
-      const plan = parsePlannerResponse(plannerText);
-      if (plan) {
-        planBlock = formatPlanBlock(plan);
-      }
-      timings.planner_ms = Date.now() - plannerStartedAt;
-    } catch (err) {
-      log(`Planner failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  if (planBlock) {
-    instructions = buildInstructions(planBlock);
-    instructionsTokens = estimateTokensForModel(instructions, tokenEstimate.tokensPerChar);
-    maxContextTokens = Math.max(config.maxContextTokens - config.maxOutputTokens - instructionsTokens, 2000);
-    adjustedContextTokens = Math.max(1000, Math.floor(maxContextTokens * tokenRatio));
-    ({ recentMessages: plannerContextMessages } = splitRecentHistory(recentMessages, adjustedContextTokens, 6));
-    plannerContextMessages = clampContextMessages(plannerContextMessages, tokenEstimate.tokensPerChar, maxContextMessageTokens);
-  }
-
-  const buildContext = (extraInstruction?: string) => {
-    let resolvedInstructions = buildInstructions(planBlock);
-    if (extraInstruction) {
-      resolvedInstructions = `${resolvedInstructions}\n\n${extraInstruction}`;
-    }
+  const buildContext = () => {
+    const resolvedInstructions = buildInstructions();
     const resolvedInstructionTokens = estimateTokensForModel(resolvedInstructions, tokenEstimate.tokensPerChar);
     const resolvedMaxContext = Math.max(config.maxContextTokens - config.maxOutputTokens - resolvedInstructionTokens, 2000);
     const resolvedAdjusted = Math.max(1000, Math.floor(resolvedMaxContext * tokenRatio));
@@ -1227,17 +1025,13 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   let responseText = '';
   let completionTokens = 0;
   let promptTokens = 0;
-  let modelToolCalls: Array<{ name: string }> = [];
-
   let latencyMs: number | undefined;
-  const runCompletion = async (extraInstruction?: string): Promise<{
-    responseText: string;
-    completionTokens: number;
-    promptTokens: number;
-    latencyMs?: number;
-    modelToolCalls: Array<{ name: string }>;
-  }> => {
-    const { instructions: resolvedInstructions, instructionsTokens: resolvedInstructionTokens, contextMessages } = buildContext(extraInstruction);
+
+  const modelChain = [model, ...(input.modelFallbacks || [])].slice(0, 3);
+  let currentModel = model;
+
+  try {
+    const { instructions: resolvedInstructions, instructionsTokens: resolvedInstructionTokens, contextMessages } = buildContext();
     const resolvedPromptTokens = resolvedInstructionTokens
       + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
       + tokenEstimate.tokensPerRequest;
@@ -1252,113 +1046,107 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       }
     }
 
-    log('Starting OpenRouter call...');
-    const startedAt = Date.now();
-    const callParams = {
-      model,
-      instructions: resolvedInstructions,
-      input: messagesToOpenRouter(contextMessages),
-      tools,
-      stopWhen: stepCountIs(maxToolSteps),
-      maxOutputTokens: config.maxOutputTokens,
-      temperature: config.temperature,
-      reasoning: { effort: 'low' as const }
-    };
-    const result = await openrouter.callModel(callParams);
-    const localLatencyMs = Date.now() - startedAt;
+    const contextInput = messagesToOpenRouter(contextMessages);
 
-    // Get the complete response text via the SDK's proper getText() path
-    let localResponseText = await getResponseText(result, 'completion');
-
-    const toolCallsFromModel = await result.getToolCalls();
-    if (toolCallsFromModel.length > 0) {
-      log(`Model made ${toolCallsFromModel.length} tool call(s): ${toolCallsFromModel.map(t => t.name).join(', ')}`);
-    }
-
-    if (!localResponseText || !localResponseText.trim()) {
-      if (toolCallsFromModel.length > 0) {
-        localResponseText = 'I started running tool calls but did not get a final response. If you want me to continue, please ask a narrower subtask or say "continue".';
-      } else {
-        log(`Warning: Model returned empty/whitespace response. tool calls: ${toolCallsFromModel.length}`);
+    // Inject vision content into the last user message if images are present
+    const imageContent = loadImageAttachments(input.attachments);
+    if (imageContent.length > 0 && contextInput.length > 0) {
+      const lastMsg = contextInput[contextInput.length - 1];
+      if (lastMsg.role === 'user') {
+        // Convert string content to multi-modal content array
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (lastMsg as any).content = [
+          { type: 'text', text: typeof lastMsg.content === 'string' ? lastMsg.content : '' },
+          ...imageContent
+        ];
       }
-    } else {
-      log(`Model returned text response (${localResponseText.length} chars)`);
     }
 
-    const localCompletionTokens = estimateTokensForModel(localResponseText || '', tokenEstimate.tokensPerChar);
-    return {
-      responseText: localResponseText,
-      completionTokens: localCompletionTokens,
-      promptTokens: resolvedPromptTokens,
-      latencyMs: localLatencyMs,
-      modelToolCalls: toolCallsFromModel
-    };
-  };
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < modelChain.length; attempt++) {
+      currentModel = modelChain[attempt];
+      if (attempt > 0) log(`Fallback ${attempt}: trying ${currentModel}`);
 
-  try {
-    const firstAttempt = await runCompletion();
-    responseText = firstAttempt.responseText;
-    completionTokens = firstAttempt.completionTokens;
-    promptTokens = firstAttempt.promptTokens;
-    latencyMs = firstAttempt.latencyMs;
-    modelToolCalls = firstAttempt.modelToolCalls;
+      try {
+        log(`Starting OpenRouter call (${currentModel})...`);
+        const startedAt = Date.now();
+        const result = openrouter.callModel({
+          model: currentModel,
+          instructions: resolvedInstructions,
+          input: contextInput,
+          tools,
+          stopWhen: stepCountIs(maxToolSteps),
+          maxOutputTokens: config.maxOutputTokens,
+          temperature: config.temperature,
+          reasoning: resolvedReasoning
+        });
 
-    const shouldValidate = responseValidateEnabled
-      && promptTokens >= responseValidateMinPromptTokens
-      && completionTokens >= responseValidateMinResponseTokens
-      && (responseValidateAllowToolCalls || modelToolCalls.length === 0);
-    if (shouldValidate) {
-      const MAX_VALIDATION_ITERATIONS = 5;
-      let retriesLeft = responseValidateMaxRetries;
-      for (let _validationIter = 0; _validationIter < MAX_VALIDATION_ITERATIONS; _validationIter++) {
-        if (!responseValidateAllowToolCalls && modelToolCalls.length > 0) {
-          break;
-        }
-        let validationResult: ResponseValidation | null = null;
-        if (!responseText || !responseText.trim()) {
-          validationResult = { verdict: 'fail', issues: ['Response was empty.'], missing: [] };
-        } else {
+        // Stream text chunks to IPC if streamDir is provided
+        if (input.streamDir) {
+          let seq = 0;
           try {
-            const validationStartedAt = Date.now();
-            validationResult = await validateResponseQuality({
-              openrouter,
-              model: responseValidateModel,
-              userPrompt: query,
-              response: responseText,
-              maxOutputTokens: responseValidateMaxOutputTokens,
-              temperature: responseValidateTemperature
-            });
-            timings.response_validation_ms = (timings.response_validation_ms ?? 0) + (Date.now() - validationStartedAt);
-          } catch (err) {
-            log(`Response validation failed: ${err instanceof Error ? err.message : String(err)}`);
+            fs.mkdirSync(input.streamDir, { recursive: true });
+            for await (const delta of result.getTextStream()) {
+              seq++;
+              const chunkFile = path.join(input.streamDir, `chunk_${String(seq).padStart(6, '0')}.txt`);
+              const tmpFile = chunkFile + '.tmp';
+              fs.writeFileSync(tmpFile, delta);
+              fs.renameSync(tmpFile, chunkFile);
+            }
+            fs.writeFileSync(path.join(input.streamDir, 'done'), '');
+          } catch (streamErr) {
+            log(`Stream error: ${streamErr instanceof Error ? streamErr.message : String(streamErr)}`);
+            try { fs.writeFileSync(path.join(input.streamDir, 'error'), streamErr instanceof Error ? streamErr.message : String(streamErr)); } catch { /* ignore */ }
           }
         }
-        if (!validationResult || validationResult.verdict === 'pass') {
-          break;
+
+        latencyMs = Date.now() - startedAt;
+
+        const completionResult = await getResponseText(result, 'completion');
+        responseText = completionResult.text;
+
+        const toolCallsFromModel = await result.getToolCalls();
+        if (toolCallsFromModel.length > 0) {
+          log(`Model made ${toolCallsFromModel.length} tool call(s): ${toolCallsFromModel.map(t => t.name).join(', ')}`);
         }
-        if (retriesLeft <= 0) {
-          break;
+        if (!responseText || !responseText.trim()) {
+          if (completionResult.error) {
+            log(`Tool execution failed: ${completionResult.error}`);
+            responseText = `Something went wrong while processing your request: ${completionResult.error}. Please try again.`;
+          } else if (toolCallsFromModel.length > 0) {
+            responseText = 'I started running tool calls but did not get a final response. If you want me to continue, please ask a narrower subtask or say "continue".';
+          } else {
+            log(`Warning: Model returned empty/whitespace response. tool calls: ${toolCallsFromModel.length}`);
+          }
+        } else {
+          log(`Model returned text response (${responseText.length} chars)`);
         }
-        retriesLeft -= 1;
-        log(`Response validation failed; retrying (${retriesLeft} retries left)`);
-        const retryGuidance = buildRetryGuidance(validationResult);
-        const retryAttempt = await runCompletion(retryGuidance);
-        responseText = retryAttempt.responseText;
-        completionTokens = retryAttempt.completionTokens;
-        promptTokens = retryAttempt.promptTokens;
-        latencyMs = retryAttempt.latencyMs;
-        modelToolCalls = retryAttempt.modelToolCalls;
+
+        completionTokens = estimateTokensForModel(responseText || '', tokenEstimate.tokensPerChar);
+        promptTokens = resolvedPromptTokens;
+        lastError = null;
+        break; // Success
+      } catch (err) {
+        lastError = err;
+        if (classifyError(err) && attempt < modelChain.length - 1) {
+          log(`${currentModel} failed (${classifyError(err)}): ${err instanceof Error ? err.message : err}`);
+          continue;
+        }
+        throw err; // Non-retryable or last model — propagate
       }
     }
+
+    if (lastError) throw lastError;
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    log(`Agent error: ${errorMessage}`);
+    const allFailed = modelChain.length > 1 ? `All models failed. Last error: ${errorMessage}` : errorMessage;
+    log(`Agent error: ${allFailed}`);
     return {
       status: 'error',
       result: null,
       newSessionId: isNew ? sessionCtx.sessionId : undefined,
-      error: errorMessage,
-      model,
+      error: allFailed,
+      model: currentModel,
       prompt_pack_versions: Object.keys(promptPackVersions).length > 0 ? promptPackVersions : undefined,
       memory_summary: sessionCtx.state.summary,
       memory_facts: sessionCtx.state.facts,
@@ -1375,25 +1163,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   }
 
   appendHistory(sessionCtx, 'assistant', responseText || '');
-
   history = loadHistory(sessionCtx);
-  const newMessages = history.filter(m => m.seq > sessionCtx.state.lastSummarySeq);
-  if (newMessages.length >= config.summaryUpdateEveryMessages) {
-    const summaryUpdate = await updateMemorySummary({
-      openrouter,
-      model: summaryModel,
-      existingSummary: sessionCtx.state.summary,
-      existingFacts: sessionCtx.state.facts,
-      newMessages,
-      maxOutputTokens: config.summaryMaxOutputTokens
-    });
-    if (summaryUpdate) {
-      sessionCtx.state.summary = summaryUpdate.summary;
-      sessionCtx.state.facts = summaryUpdate.facts;
-      sessionCtx.state.lastSummarySeq = newMessages[newMessages.length - 1].seq;
-      saveMemoryState(sessionCtx);
-    }
-  }
 
   const runMemoryExtraction = async () => {
     const extractionMessages = history.slice(-memoryExtractionMaxMessages);
@@ -1406,7 +1176,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       messages: extractionMessages,
       memoryPolicyPack: memoryPolicyResult?.pack || null
     });
-    const extractionResult = await openrouter.callModel({
+    const extractionResult = openrouter.callModel({
       model: memoryModel,
       instructions: extractionPrompt.instructions,
       input: extractionPrompt.input,
@@ -1414,7 +1184,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       temperature: 0.1,
       reasoning: { effort: 'low' as const }
     });
-    const extractionText = await getResponseText(extractionResult, 'memory_extraction');
+    const { text: extractionText } = await getResponseText(extractionResult, 'memory_extraction');
     const extractedItems = parseMemoryExtraction(extractionText);
     if (extractedItems.length === 0) return;
 
@@ -1448,27 +1218,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     timings.memory_extraction_ms = (timings.memory_extraction_ms ?? 0) + (Date.now() - extractionStartedAt);
   };
 
-  if (memoryExtractionEnabled && (!input.isScheduledTask || memoryExtractScheduled)) {
-    const runMemoryExtractionWithRetry = async (maxRetries = 2): Promise<void> => {
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-          await runMemoryExtraction();
-          return;
-        } catch (err) {
-          log(`Memory extraction attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
-          if (attempt < maxRetries) {
-            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-          }
-        }
-      }
-      log('Memory extraction failed after all retries');
-    };
-
-    if (memoryExtractionAsync && isDaemon) {
-      void runMemoryExtractionWithRetry().catch(() => {});
-    } else {
-      await runMemoryExtractionWithRetry();
-    }
+  if (memoryExtractionEnabled && isDaemon && (!input.isScheduledTask || memoryExtractScheduled)) {
+    // Fire-and-forget in daemon mode; skip entirely in ephemeral mode
+    void runMemoryExtraction().catch((err) => {
+      log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   // Normalize empty/whitespace-only responses to null
@@ -1489,7 +1243,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     status: 'success',
     result: finalResult,
     newSessionId: isNew ? sessionCtx.sessionId : undefined,
-    model,
+    model: currentModel,
     prompt_pack_versions: Object.keys(promptPackVersions).length > 0 ? promptPackVersions : undefined,
     memory_summary: sessionCtx.state.summary,
     memory_facts: sessionCtx.state.facts,

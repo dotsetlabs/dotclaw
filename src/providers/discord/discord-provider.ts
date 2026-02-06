@@ -75,7 +75,7 @@ export class DiscordProvider implements MessagingProvider {
     maxAttachmentBytes: MAX_ATTACHMENT_BYTES,
     supportsInlineButtons: true,
     supportsPoll: true,
-    supportsVoiceMessages: false,
+    supportsVoiceMessages: true,
     supportsLocation: false,
     supportsContact: false,
     supportsReactions: true,
@@ -540,7 +540,10 @@ export class DiscordProvider implements MessagingProvider {
             const contentType: string = attachment.contentType || '';
             if (contentType.startsWith('image/')) type = 'photo';
             else if (contentType.startsWith('video/')) type = 'video';
-            else if (contentType.startsWith('audio/')) type = 'audio';
+            else if (contentType.startsWith('audio/')) {
+              // Discord voice messages have a waveform field
+              type = attachment.waveform ? 'voice' : 'audio';
+            }
 
             attachments.push({
               type,
@@ -548,6 +551,7 @@ export class DiscordProvider implements MessagingProvider {
               fileName: attachment.name || `attachment_${messageId}`,
               mimeType: contentType || undefined,
               fileSize: attachment.size || undefined,
+              duration: attachment.duration || undefined,
               width: attachment.width || undefined,
               height: attachment.height || undefined,
             });

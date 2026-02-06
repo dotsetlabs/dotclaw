@@ -19,114 +19,20 @@
         "enabled": true
       }
     },
-    "backgroundJobs": {
-      "enabled": true,
-      "maxConcurrent": 2,
-      "maxRuntimeMs": 2400000,
-      "maxToolSteps": 256,
-      "toolDeny": ["mcp__dotclaw__spawn_job"],
-      "progress": {
-        "enabled": false,
-        "startDelayMs": 30000,
-        "intervalMs": 120000,
-        "maxUpdates": 3
-      },
-      "autoSpawn": {
-        "enabled": true,
-        "foregroundTimeoutMs": 90000,
-        "onTimeout": true,
-        "onToolLimit": true,
-        "classifier": {
-          "enabled": true,
-          "model": "deepseek/deepseek-v3.2",
-          "timeoutMs": 3000,
-          "maxOutputTokens": 32,
-          "temperature": 0,
-          "confidenceThreshold": 0.6,
-          "adaptive": {
-            "enabled": true,
-            "minThreshold": 0.55,
-            "maxThreshold": 0.65,
-            "queueDepthLow": 0,
-            "queueDepthHigh": 4
-          }
-        }
-      }
-    },
     "routing": {
+      "model": "moonshotai/kimi-k2.5",
+      "fallbacks": ["anthropic/claude-sonnet-4-5", "openai/gpt-4.1"],
+      "maxOutputTokens": 4096,
+      "maxToolSteps": 50,
+      "temperature": 0.2,
+      "recallMaxResults": 8,
+      "recallMaxTokens": 1500
+    },
+    "streaming": {
       "enabled": true,
-      "maxFastChars": 200,
-      "maxStandardChars": 1200,
-      "backgroundMinChars": 2000,
-      "fastKeywords": ["hi", "hello", "hey", "who are you", "what can you do", "help", "thanks", "thank you"],
-      "deepKeywords": ["research", "analysis", "analyze", "report", "dashboard", "vibe", "refactor", "architecture", "design", "spec", "strategy", "migration", "benchmark", "investigate", "evaluate", "summarize", "long-running"],
-      "backgroundKeywords": ["background", "long-running", "research", "deep dive", "multi-step", "multi step", "dashboard", "refactor", "benchmark", "report", "analysis", "survey", "crawl", "scrape", "codebase"],
-      "classifierFallback": {
-        "enabled": true,
-        "minChars": 600
-      },
-      "plannerProbe": {
-        "enabled": true,
-        "model": "deepseek/deepseek-v3.2",
-        "timeoutMs": 3000,
-        "maxOutputTokens": 120,
-        "temperature": 0,
-        "minChars": 700,
-        "minSteps": 4,
-        "minTools": 3
-      },
-      "profiles": {
-        "fast": {
-          "model": "deepseek/deepseek-v3.2",
-          "maxOutputTokens": 4096,
-          "maxToolSteps": 12,
-          "recallMaxResults": 0,
-          "recallMaxTokens": 0,
-          "enablePlanner": false,
-          "enableValidation": false,
-          "responseValidationMaxRetries": 0,
-          "enableMemoryRecall": false,
-          "enableMemoryExtraction": false,
-          "progress": { "enabled": false }
-        },
-        "standard": {
-          "model": "moonshotai/kimi-k2.5",
-          "maxOutputTokens": 4096,
-          "maxToolSteps": 48,
-          "recallMaxResults": 6,
-          "recallMaxTokens": 1500,
-          "enablePlanner": true,
-          "enableValidation": true,
-          "responseValidationMaxRetries": 1,
-          "enableMemoryRecall": true,
-          "enableMemoryExtraction": true
-        },
-        "deep": {
-          "model": "moonshotai/kimi-k2.5",
-          "maxOutputTokens": 4096,
-          "maxToolSteps": 128,
-          "recallMaxResults": 12,
-          "recallMaxTokens": 2500,
-          "enablePlanner": true,
-          "enableValidation": true,
-          "responseValidationMaxRetries": 2,
-          "enableMemoryRecall": true,
-          "enableMemoryExtraction": true
-        },
-        "background": {
-          "model": "moonshotai/kimi-k2.5",
-          "maxOutputTokens": 4096,
-          "maxToolSteps": 256,
-          "recallMaxResults": 16,
-          "recallMaxTokens": 4000,
-          "enablePlanner": true,
-          "enableValidation": true,
-          "responseValidationMaxRetries": 2,
-          "enableMemoryRecall": true,
-          "enableMemoryExtraction": true,
-          "progress": { "enabled": true, "initialMs": 15000, "intervalMs": 60000, "maxUpdates": 3 }
-        }
-      }
+      "chunkFlushIntervalMs": 200,
+      "editIntervalMs": 400,
+      "maxEditLength": 3800
     },
     "toolBudgets": {
       "enabled": false
@@ -134,26 +40,14 @@
   },
   "agent": {
     "assistantName": "Rain",
+    "reasoning": { "effort": "low" },
     "promptPacks": {
       "enabled": true
     },
-    "planner": {
-      "enabled": true,
-      "mode": "auto"
-    },
-    "responseValidation": {
-      "enabled": true,
-      "minPromptTokens": 400,
-      "minResponseTokens": 160
-    },
     "tools": {
-      "progress": {
-        "enabled": true,
-        "minIntervalMs": 30000,
-        "notifyTools": [],
-        "notifyOnStart": false,
-        "notifyOnError": false
-      }
+      "enableBash": true,
+      "enableWebSearch": true,
+      "enableWebFetch": true
     }
   }
 }

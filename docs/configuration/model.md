@@ -50,8 +50,3 @@ set model to deepseek/deepseek-v3.2 for group main
 set model to moonshotai/kimi-k2.5 for user 123456789
 ```
 
-## Per-request routing
-
-DotClaw can select different models per request using `host.routing.profiles` in
-`~/.dotclaw/config/runtime.json`. This lets you keep fast/cheap models for simple questions
-and stronger models for deep or background work without changing global defaults.
