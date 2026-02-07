@@ -931,9 +931,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       });
     }
 
+    // Cap facts to prevent unbounded growth across compaction cycles.
+    // Keep the most recent facts (end of array) since compaction appends new ones.
+    const MAX_FACTS = 30;
+
     if (summaryUpdate) {
+      const cappedFacts = summaryUpdate.facts.length > MAX_FACTS
+        ? summaryUpdate.facts.slice(-MAX_FACTS)
+        : summaryUpdate.facts;
       sessionCtx.state.summary = summaryUpdate.summary;
-      sessionCtx.state.facts = summaryUpdate.facts;
+      sessionCtx.state.facts = cappedFacts;
       sessionCtx.state.lastSummarySeq = olderMessages.length > 0
         ? olderMessages[olderMessages.length - 1].seq
         : sessionCtx.state.lastSummarySeq;
@@ -1102,17 +1109,20 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
   try {
     const { instructions: resolvedInstructions, instructionsTokens: resolvedInstructionTokens, contextMessages } = buildContext();
-    const resolvedPromptTokens = resolvedInstructionTokens
+    // Apply 1.3x safety margin to account for token estimation inaccuracy.
+    // estimateTokensForModel (bytes * 0.25) underestimates by 30-40% in practice.
+    // OpenClaw uses SAFETY_MARGIN = 1.2; we use 1.3 for extra safety.
+    const TOKEN_SAFETY_MARGIN = 1.3;
+    const resolvedPromptTokens = Math.ceil((resolvedInstructionTokens
       + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
-      + tokenEstimate.tokensPerRequest;
+      + tokenEstimate.tokensPerRequest) * TOKEN_SAFETY_MARGIN);
 
-    // Safety margin: use 65% of context to account for tool schema tokens (~6K)
-    // and token estimation inaccuracy (estimateTokensForModel can undercount by 30-40%)
-    const safeLimit = Math.floor(config.maxContextTokens * 0.65);
+    // Safe limit: context window minus tool schema reserve (~6K) and output reserve
+    const safeLimit = Math.floor(config.maxContextTokens * 0.75);
     if (resolvedPromptTokens > safeLimit && contextMessages.length > 2) {
-      log(`Estimated ${resolvedPromptTokens} tokens exceeds safe limit ${safeLimit}, truncating`);
+      log(`Estimated ${resolvedPromptTokens} tokens (with 1.3x margin) exceeds safe limit ${safeLimit}, truncating`);
       while (contextMessages.length > 2) {
-        const currentTokens = resolvedInstructionTokens + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage) + tokenEstimate.tokensPerRequest;
+        const currentTokens = Math.ceil((resolvedInstructionTokens + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage) + tokenEstimate.tokensPerRequest) * TOKEN_SAFETY_MARGIN);
         if (currentTokens <= safeLimit) break;
         contextMessages.splice(0, 1);
       }
@@ -1265,10 +1275,24 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
           // original messages + model output + tool results (accumulated each round)
           conversationInput = [...conversationInput, ...lastResponse.output, ...toolResults];
 
-          // Cap follow-up context to prevent context overflow during tool loops.
-          // Tool results (especially memory_list, web_fetch) can be huge.
-          // Use 60% of context as the hard cap for follow-up input, leaving room for
-          // system prompt (~25%), tool schemas (~3%), and output.
+          // Phase 1: Soft-trim oversized tool results (like OpenClaw's context-pruning extension).
+          // Replace large tool result content with head+tail, preserving pair integrity.
+          const SOFT_TRIM_MAX_CHARS = 4000;
+          const SOFT_TRIM_HEAD = 1500;
+          const SOFT_TRIM_TAIL = 1500;
+          for (const item of conversationInput) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const anyItem = item as any;
+            if (anyItem?.type === 'function_call_output' && typeof anyItem.output === 'string' && anyItem.output.length > SOFT_TRIM_MAX_CHARS) {
+              const orig = anyItem.output;
+              anyItem.output = orig.slice(0, SOFT_TRIM_HEAD) + '\n...\n' + orig.slice(-SOFT_TRIM_TAIL)
+                + `\n[Tool result trimmed: kept first ${SOFT_TRIM_HEAD} and last ${SOFT_TRIM_TAIL} of ${orig.length} chars.]`;
+            }
+          }
+
+          // Phase 2: If still over budget, remove only initial context messages (role/content items
+          // without a 'type' field). NEVER remove function_call or function_call_output items —
+          // orphaning either side of a pair causes API 400 errors.
           const followupTokenLimit = Math.floor(config.maxContextTokens * 0.6);
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const estimateInputTokens = (items: any[]) => items.reduce((sum: number, item: any) => {
@@ -1276,14 +1300,20 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             return sum + estimateTokensForModel(content, tokenEstimate.tokensPerChar);
           }, 0);
           let followupInputTokens = estimateInputTokens(conversationInput);
-          if (followupInputTokens > followupTokenLimit && conversationInput.length > 4) {
-            log(`Tool loop context ${followupInputTokens} tokens exceeds limit ${followupTokenLimit}, trimming oldest messages`);
-            // Remove oldest entries (keep at least last 4: recent user msg + tool call + tool result + margin)
-            while (conversationInput.length > 4 && followupInputTokens > followupTokenLimit) {
+          if (followupInputTokens > followupTokenLimit) {
+            // Only remove initial context messages (no 'type' field = { role, content } format)
+            let trimmed = 0;
+            while (conversationInput.length > 2 && followupInputTokens > followupTokenLimit) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const first = conversationInput[0] as any;
+              if (first?.type) break; // Hit function_call/function_call_output territory — stop
               conversationInput.splice(0, 1);
-              followupInputTokens = estimateInputTokens(conversationInput);
+              trimmed++;
             }
-            log(`Trimmed to ${followupInputTokens} tokens (${conversationInput.length} items)`);
+            if (trimmed > 0) {
+              followupInputTokens = estimateInputTokens(conversationInput);
+              log(`Tool loop: trimmed ${trimmed} context messages, now ${followupInputTokens} tokens`);
+            }
           }
 
           // Follow-up call with complete context — model sees the full conversation
@@ -1301,33 +1331,53 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             lastResponse = await followupResult.getResponse();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            // Context overflow in tool loop: trim and retry once before giving up
-            if (classifyError(err) === 'context_overflow' && conversationInput.length > 4) {
-              log(`Context overflow in tool loop at step ${step}, trimming 50% of context`);
-              const trimCount = Math.floor(conversationInput.length / 2);
-              conversationInput.splice(0, trimCount);
-              try {
-                const retryResult = openrouter.callModel({
-                  model: currentModel,
-                  instructions: resolvedInstructions,
-                  input: conversationInput,
-                  tools: schemaTools,
-                  maxOutputTokens: resolvedMaxOutputTokens,
-                  temperature: config.temperature,
-                  reasoning: resolvedReasoning
-                });
-                lastResponse = await retryResult.getResponse();
-                const retryText = extractTextFromApiResponse(lastResponse);
-                if (retryText) {
-                  responseText = retryText;
-                  writeStreamChunk(retryText);
+            // Context overflow in tool loop: aggressively trim tool results, then retry.
+            // NEVER splice items — that breaks function_call/function_call_output pairs.
+            if (classifyError(err) === 'context_overflow') {
+              log(`Context overflow in tool loop at step ${step}, hard-clearing old tool results`);
+              // Hard-clear all function_call_output content except the most recent round
+              let cleared = 0;
+              for (let i = 0; i < conversationInput.length - toolResults.length; i++) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const item = conversationInput[i] as any;
+                if (item?.type === 'function_call_output' && typeof item.output === 'string' && item.output.length > 200) {
+                  item.output = '[Old tool result cleared to reduce context size.]';
+                  cleared++;
                 }
-                pendingCalls = extractFunctionCalls(lastResponse);
-                continue;
-              } catch (retryErr) {
-                log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
-                break;
               }
+              // Also remove initial context messages (safe — no type field)
+              while (conversationInput.length > 2) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                if ((conversationInput[0] as any)?.type) break;
+                conversationInput.splice(0, 1);
+              }
+              if (cleared > 0) {
+                log(`Hard-cleared ${cleared} tool results, retrying`);
+                try {
+                  const retryResult = openrouter.callModel({
+                    model: currentModel,
+                    instructions: resolvedInstructions,
+                    input: conversationInput,
+                    tools: schemaTools,
+                    maxOutputTokens: resolvedMaxOutputTokens,
+                    temperature: config.temperature,
+                    reasoning: resolvedReasoning
+                  });
+                  lastResponse = await retryResult.getResponse();
+                  const retryText = extractTextFromApiResponse(lastResponse);
+                  if (retryText) {
+                    responseText = retryText;
+                    writeStreamChunk(retryText);
+                  }
+                  pendingCalls = extractFunctionCalls(lastResponse);
+                  continue;
+                } catch (retryErr) {
+                  log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+                  break;
+                }
+              }
+              log(`No tool results to clear, giving up`);
+              break;
             }
             log(`Follow-up getResponse failed at step ${step}: ${message}`);
             break;
@@ -1361,16 +1411,18 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         lastError = err;
         const errClass = classifyError(err);
         // Context overflow: don't try fallback models (same context = same problem).
-        // Truncate messages and retry the same model once.
+        // Rebuild system prompt at max trim level + truncate messages, then retry.
         if (errClass === 'context_overflow' && contextMessages.length > 4) {
-          log(`Context overflow on ${currentModel}, truncating 50% of messages and retrying`);
+          log(`Context overflow on ${currentModel}, rebuilding prompt at max trim + truncating messages`);
+          // Rebuild system prompt at maximum trim level to free context
+          const minInstructions = resolveInstructions(4);
           const trimCount = Math.floor(contextMessages.length / 2);
           contextMessages.splice(0, trimCount);
           const trimmedInput = messagesToOpenRouter(contextMessages);
           try {
             const retryResult = openrouter.callModel({
               model: currentModel,
-              instructions: resolvedInstructions,
+              instructions: minInstructions,
               input: trimmedInput,
               tools: schemaTools,
               maxOutputTokens: resolvedMaxOutputTokens,
