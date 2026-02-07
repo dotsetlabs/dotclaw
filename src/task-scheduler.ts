@@ -13,6 +13,7 @@ import type { AgentContext } from './agent-context.js';
 import type { ContainerOutput } from './container-protocol.js';
 import { logger } from './logger.js';
 import { emitHook } from './hooks.js';
+import { humanizeError } from './error-messages.js';
 
 const runtime = loadRuntimeConfig();
 
@@ -98,7 +99,7 @@ function buildTaskNotificationMessage(params: {
     ? `Retrying (attempt ${params.retryCount}).`
     : null;
   const body = params.error
-    ? summarizeTaskText(params.error, 2000)
+    ? humanizeError(params.error)
     : (summarizeTaskText(params.result, 3000) || 'Done.');
   return [
     `Your task ${taskLabel} ${statusLabel}.`,
@@ -140,6 +141,9 @@ export function computeNextRun(task: ScheduledTask, error: string | null, nowMs:
       const baseBackoff = Math.min(TASK_RETRY_MAX_MS, TASK_RETRY_BASE_MS * Math.pow(2, retryCount - 1));
       const jitter = baseBackoff * (0.7 + Math.random() * 0.6);
       nextRun = new Date(nowMs + jitter).toISOString();
+    } else {
+      // Circuit breaker: max retries exhausted → pause the task
+      nextRun = null;
     }
   } else {
     retryCount = 0;
@@ -212,8 +216,12 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
   let output: ContainerOutput | null = null;
   let context: AgentContext | null = null;
 
+  // Recurring tasks (cron/interval) use fresh sessions to prevent unbounded
+  // session history accumulation. Only one-off tasks may use the group session.
+  const isRecurring = task.schedule_type === 'cron' || task.schedule_type === 'interval';
+  const useGroupSession = task.context_mode === 'group' && !isRecurring;
   const sessions = deps.getSessions();
-  const sessionId = task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  const sessionId = useGroupSession ? sessions[task.group_folder] : undefined;
 
   const stateBlock = task.state_json ? `[TASK STATE]
 ${task.state_json}
@@ -240,7 +248,7 @@ ${task.prompt}` : task.prompt;
       recallMaxResults: routingDecision.recallMaxResults,
       recallMaxTokens: routingDecision.recallMaxTokens,
       sessionId,
-      persistSession: task.context_mode === 'group',
+      persistSession: useGroupSession,
       onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
       isScheduledTask: true,
       taskId: task.id,
@@ -337,11 +345,14 @@ ${task.prompt}` : task.prompt;
   const resultSummary = error ? `Error: ${error}` : (result ? result.slice(0, 200) : 'Completed');
   updateTaskAfterRun(task.id, nextRun, resultSummary, error, retryCount);
 
-  // Pause if schedule itself is invalid (embedded in combinedError via scheduleError)
-  if (combinedError && (combinedError.includes('Invalid cron expression') || combinedError.includes('Invalid interval'))) {
+  // Pause if schedule is invalid or retries exhausted (circuit breaker)
+  if (combinedError && !nextRun) {
+    const reason = (combinedError.includes('Invalid cron expression') || combinedError.includes('Invalid interval'))
+      ? 'the schedule format is invalid'
+      : `it failed ${retryCount} times in a row`;
     updateTask(task.id, { status: 'paused', next_run: null });
     try {
-      await deps.sendMessage(task.chat_jid, 'Your scheduled task has been paused because the schedule format is invalid. Please update it.');
+      await deps.sendMessage(task.chat_jid, `Your scheduled task has been paused because ${reason}. Use the task tool to resume it when you're ready.`);
     } catch (pauseNotifyErr) {
       logger.error({ taskId: task.id, err: pauseNotifyErr }, 'Failed to send task pause notification');
     }
@@ -394,8 +405,11 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
   let output: ContainerOutput | null = null;
   let context: AgentContext | null = null;
 
+  // Manual runs of recurring tasks still use fresh sessions to prevent accumulation
+  const isRecurring = task.schedule_type === 'cron' || task.schedule_type === 'interval';
+  const useGroupSession = task.context_mode === 'group' && !isRecurring;
   const sessions = deps.getSessions();
-  const sessionId = task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  const sessionId = useGroupSession ? sessions[task.group_folder] : undefined;
 
   const stateBlock = task.state_json ? `[TASK STATE]\n${task.state_json}\n` : '';
   const taskPrompt = stateBlock ? `${stateBlock}\n${task.prompt}` : task.prompt;
@@ -419,7 +433,7 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       recallMaxResults: routingDecision.recallMaxResults,
       recallMaxTokens: routingDecision.recallMaxTokens,
       sessionId,
-      persistSession: task.context_mode === 'group',
+      persistSession: useGroupSession,
       onSessionUpdate: (sessionId) => deps.setSession(task.group_folder, sessionId),
       isScheduledTask: true,
       taskId: task.id,

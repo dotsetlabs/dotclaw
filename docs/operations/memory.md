@@ -12,12 +12,16 @@ The agent automatically extracts important facts, preferences, and instructions 
 
 ## Memory recall
 
-When processing a message, DotClaw recalls relevant memories using a combination of:
+Memory recall is **tool-based**: the agent calls the `mcp__dotclaw__memory_search` tool on demand when it needs to recall past conversations, preferences, or stored knowledge. This approach keeps memory out of the system prompt (preventing context bloat from irrelevant memories) and lets the agent decide when recall is needed.
 
-- **Keyword matching**: Fast lookup based on text overlap
-- **Semantic search**: Vector embeddings for meaning-based retrieval (when enabled)
+The system prompt instructs the agent to search memory before answering questions about prior decisions, dates, people, projects, or anything not visible in the current conversation. Session-level context (conversation summary, key facts, user profile) is always pre-injected into the system prompt for continuity.
 
-The number of recalled items is controlled by `host.memory.recall.maxResults` and `host.memory.recall.maxTokens`.
+The memory search tool uses hybrid recall combining:
+
+- **FTS5 keyword search**: Fast full-text search over memory content
+- **Semantic embeddings** (optional): Vector similarity search for meaning-based retrieval
+
+Results are filtered by `host.memory.recall.minScore` (default: 0.35) and limited by `host.memory.recall.maxResults` and `host.memory.recall.maxTokens`.
 
 ## Memory controls
 

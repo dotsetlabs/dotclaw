@@ -36,6 +36,14 @@ You can also ask it to run a scheduled task immediately without changing its sch
 
 Each scheduled run sends a completion or failure notification message to the task chat.
 
+## Failure handling
+
+When a scheduled task fails, DotClaw retries with exponential backoff (configurable via `host.scheduler.taskRetryBaseMs` and `host.scheduler.taskRetryMaxMs`).
+
+If a task exhausts its retry limit (`host.scheduler.taskMaxRetries`, default 3), or if its schedule is invalid, the task is **automatically paused** and a notification is sent to the chat. This circuit breaker prevents runaway loops where a broken task keeps retrying indefinitely. Use the task tool to resume a paused task after fixing the underlying issue.
+
+Recurring tasks use fresh sessions for each run, so a failure in one run doesn't corrupt context for the next.
+
 ## Targeting other groups
 
 Tasks run in the context of the group they are created in. To schedule for another group, use the `target_group` parameter when calling scheduler tools.

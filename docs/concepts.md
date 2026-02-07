@@ -10,11 +10,13 @@ DotClaw treats each messaging chat (Telegram or Discord) as a group with its own
 
 ## Memory
 
-DotClaw keeps long-term memory in a SQLite database at `~/.dotclaw/data/store/memory.db`. The agent automatically extracts important facts from conversations and recalls them when relevant.
+DotClaw keeps long-term memory in a SQLite database at `~/.dotclaw/data/store/memory.db`. The agent automatically extracts important facts from conversations and recalls them on demand using the `mcp__dotclaw__memory_search` tool.
 
 Memory features:
 - **Automatic extraction**: Facts, preferences, and instructions are extracted from conversations
-- **Semantic search**: Optional vector embeddings for meaning-based retrieval
+- **Tool-based recall**: The agent searches memory when needed (not pre-injected into every prompt)
+- **Hybrid search**: FTS5 keyword matching combined with optional vector embeddings for meaning-based retrieval
+- **Session context**: Conversation summary, key facts, and user profile are always available in the system prompt
 - **Per-group isolation**: Each group's memory is kept separate
 
 See [Memory](/operations/memory) for configuration options.

@@ -160,37 +160,30 @@ function buildToolGuidanceSection(params: SystemPromptParams): string {
 
 function buildMemorySection(params: SystemPromptParams): string {
   const parts: string[] = [];
-  const hasAny = params.memorySummary || params.memoryFacts.length > 0 ||
-    params.longTermRecall.length > 0 || params.userProfile;
 
-  if (hasAny) {
-    parts.push('The following memories may or may not be relevant to the current conversation. Use them only if they directly answer the user\'s question.');
-    if (params.memorySummary) {
-      parts.push('Long-term memory summary:');
-      parts.push(params.memorySummary.slice(0, MEMORY_SUMMARY_MAX_CHARS));
-    }
-    if (params.memoryFacts.length > 0) {
-      parts.push('Long-term facts:');
-      parts.push(params.memoryFacts.map(f => `- ${f}`).join('\n'));
-    }
-    if (params.userProfile) {
-      parts.push('User profile:');
-      parts.push(params.userProfile);
-    }
-    if (params.longTermRecall.length > 0) {
-      parts.push('What you remember about the user (long-term):');
-      parts.push(params.longTermRecall.map(item => `- ${item}`).join('\n'));
-    }
-    if (params.memoryStats) {
-      parts.push(`Memory stats: Total: ${params.memoryStats.total}, User: ${params.memoryStats.user}, Group: ${params.memoryStats.group}, Global: ${params.memoryStats.global}`);
-    }
-  } else {
-    parts.push('No long-term memory available yet.');
+  // Session-level context: summary and facts from the current conversation.
+  // These are essential for understanding the current thread.
+  if (params.memorySummary) {
+    parts.push('Conversation summary (this session):');
+    parts.push(params.memorySummary.slice(0, MEMORY_SUMMARY_MAX_CHARS));
+  }
+  if (params.memoryFacts.length > 0) {
+    parts.push('Key facts (this session):');
+    parts.push(params.memoryFacts.map(f => `- ${f}`).join('\n'));
   }
 
-  if (params.sessionRecall.length > 0) {
-    parts.push('Recent conversation context:');
-    parts.push(params.sessionRecall.map(item => `- ${item}`).join('\n'));
+  // User profile stays pre-injected — identity and preferences should always be available.
+  if (params.userProfile) {
+    parts.push('User profile:');
+    parts.push(params.userProfile);
+  }
+
+  // Long-term memory is now tool-based: agent searches on demand instead of pre-injection.
+  // This prevents context bloat from irrelevant memories and lets the agent decide what's needed.
+  parts.push('Long-term memory: Use the mcp__dotclaw__memory_search tool to recall information from past conversations, stored preferences, notes, and knowledge. Search BEFORE answering questions about prior decisions, dates, people, projects, or anything you don\'t see in the conversation above.');
+
+  if (params.memoryStats && params.memoryStats.total > 0) {
+    parts.push(`Memory store: ${params.memoryStats.total} entries available (search with mcp__dotclaw__memory_search).`);
   }
 
   return parts.join('\n');
@@ -306,9 +299,9 @@ export function buildSystemPrompt(params: SystemPromptParams): string {
   // Trim level 1+: drop prompt packs
   const packBlocks = trimLevel >= 1 ? [] : buildPromptPackSections(params);
 
-  // Trim level 3+: reduce memory section (drop session recall, limit long-term recall)
+  // Trim level 3+: reduce memory section (drop summary to save space)
   const memoryParams = trimLevel >= 3
-    ? { ...params, sessionRecall: [], longTermRecall: params.longTermRecall.slice(0, 2) }
+    ? { ...params, memorySummary: params.memorySummary ? params.memorySummary.slice(0, 500) : '', memoryFacts: params.memoryFacts.slice(0, 5) }
     : params;
 
   const sections = [

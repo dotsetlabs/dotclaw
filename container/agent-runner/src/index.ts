@@ -22,7 +22,6 @@ import {
   buildMultiPartSummaryPrompt,
   splitMessagesByTokenShare,
   parseSummaryResponse,
-  retrieveRelevantMemories,
   saveMemoryState,
   writeHistory,
   estimateTokens,
@@ -144,9 +143,10 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
-function classifyError(err: unknown): 'retryable' | null {
+function classifyError(err: unknown): 'retryable' | 'context_overflow' | null {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
+  if (/maximum context length|context.?length.?exceeded|too many tokens/i.test(msg)) return 'context_overflow';
   if (/429|rate.?limit/.test(lower)) return 'retryable';
   if (/\b5\d{2}\b/.test(msg) || /server error|bad gateway|unavailable/.test(lower)) return 'retryable';
   if (/timeout|timed out|deadline/.test(lower)) return 'retryable';
@@ -495,25 +495,6 @@ function loadClaudeNotes(): { group: string | null; global: string | null } {
 }
 
 
-function extractQueryFromPrompt(prompt: string): string {
-  if (!prompt) return '';
-  const messageMatches = [...prompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
-  if (messageMatches.length > 0) {
-    const last = messageMatches[messageMatches.length - 1][1];
-    return decodeXml(last).trim();
-  }
-  return prompt.trim();
-}
-
-function decodeXml(value: string): string {
-  return value
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
-}
-
 // ── Image/Vision support ──────────────────────────────────────────────
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB per image
@@ -848,10 +829,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     history = limitHistoryTurns(history, agent.context.maxHistoryTurns);
   }
 
-  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate 60% of context window
+  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate 50% of context to
+  // conversation history (matches OpenClaw's maxHistoryShare). System prompt gets up to 25%.
   const effectiveRecentTokens = config.recentContextTokens > 0
     ? config.recentContextTokens
-    : Math.floor(config.maxContextTokens * 0.6);
+    : Math.floor(config.maxContextTokens * 0.50);
   const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
   const adjustedRecentTokens = Math.max(1000, Math.floor(effectiveRecentTokens * tokenRatio));
 
@@ -929,9 +911,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       });
     }
 
+    // Cap facts to prevent unbounded growth across compaction cycles.
+    // Keep the most recent facts (end of array) since compaction appends new ones.
+    const MAX_FACTS = 30;
+
     if (summaryUpdate) {
+      const cappedFacts = summaryUpdate.facts.length > MAX_FACTS
+        ? summaryUpdate.facts.slice(-MAX_FACTS)
+        : summaryUpdate.facts;
       sessionCtx.state.summary = summaryUpdate.summary;
-      sessionCtx.state.facts = summaryUpdate.facts;
+      sessionCtx.state.facts = cappedFacts;
       sessionCtx.state.lastSummarySeq = olderMessages.length > 0
         ? olderMessages[olderMessages.length - 1].seq
         : sessionCtx.state.lastSummarySeq;
@@ -978,15 +967,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   // Recompute split after possible compaction
   ({ recentMessages, olderMessages } = splitRecentHistory(history, adjustedRecentTokens));
 
-  const query = extractQueryFromPrompt(prompt);
-  const sessionRecall = retrieveRelevantMemories({
-    query,
-    summary: sessionCtx.state.summary,
-    facts: sessionCtx.state.facts,
-    olderMessages,
-    config
-  });
-  const sessionRecallCount = sessionRecall.length;
+  // Long-term memory is now tool-based (agent calls mcp__dotclaw__memory_search on demand).
+  // Session recall removed — redundant with summary + facts + recent messages.
+  const sessionRecallCount = 0;
   const memoryRecallCount = input.memoryRecall ? input.memoryRecall.length : 0;
 
   const sharedPromptDir = fs.existsSync(PROMPTS_DIR) ? PROMPTS_DIR : undefined;
@@ -1036,8 +1019,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     skillCatalog,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
-    sessionRecall,
-    longTermRecall: input.memoryRecall || [],
+    sessionRecall: [],
+    longTermRecall: [],
     userProfile: input.userProfile ?? null,
     memoryStats: input.memoryStats,
     availableGroups,
@@ -1100,15 +1083,20 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
   try {
     const { instructions: resolvedInstructions, instructionsTokens: resolvedInstructionTokens, contextMessages } = buildContext();
-    const resolvedPromptTokens = resolvedInstructionTokens
+    // Apply 1.3x safety margin to account for token estimation inaccuracy.
+    // estimateTokensForModel (bytes * 0.25) underestimates by 30-40% in practice.
+    // OpenClaw uses SAFETY_MARGIN = 1.2; we use 1.3 for extra safety.
+    const TOKEN_SAFETY_MARGIN = 1.3;
+    const resolvedPromptTokens = Math.ceil((resolvedInstructionTokens
       + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage)
-      + tokenEstimate.tokensPerRequest;
+      + tokenEstimate.tokensPerRequest) * TOKEN_SAFETY_MARGIN);
 
-    const safeLimit = Math.floor(config.maxContextTokens * 0.9);
+    // Safe limit: context window minus tool schema reserve (~6K) and output reserve
+    const safeLimit = Math.floor(config.maxContextTokens * 0.75);
     if (resolvedPromptTokens > safeLimit && contextMessages.length > 2) {
-      log(`Estimated ${resolvedPromptTokens} tokens exceeds safe limit ${safeLimit}, truncating`);
+      log(`Estimated ${resolvedPromptTokens} tokens (with 1.3x margin) exceeds safe limit ${safeLimit}, truncating`);
       while (contextMessages.length > 2) {
-        const currentTokens = resolvedInstructionTokens + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage) + tokenEstimate.tokensPerRequest;
+        const currentTokens = Math.ceil((resolvedInstructionTokens + estimateMessagesTokens(contextMessages, tokenEstimate.tokensPerChar, tokenEstimate.tokensPerMessage) + tokenEstimate.tokensPerRequest) * TOKEN_SAFETY_MARGIN);
         if (currentTokens <= safeLimit) break;
         contextMessages.splice(0, 1);
       }
@@ -1261,6 +1249,49 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
           // original messages + model output + tool results (accumulated each round)
           conversationInput = [...conversationInput, ...lastResponse.output, ...toolResults];
 
+          // Phase 1: Soft-trim oversized tool results (like OpenClaw's context-pruning extension).
+          // Replace large tool result content with head+tail, preserving pair integrity.
+          // PROTECT the most recent round's tool results — only trim older ones.
+          const SOFT_TRIM_MAX_CHARS = 4000;
+          const SOFT_TRIM_HEAD = 1500;
+          const SOFT_TRIM_TAIL = 1500;
+          const protectedStart = conversationInput.length - toolResults.length;
+          for (let idx = 0; idx < protectedStart; idx++) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const anyItem = conversationInput[idx] as any;
+            if (anyItem?.type === 'function_call_output' && typeof anyItem.output === 'string' && anyItem.output.length > SOFT_TRIM_MAX_CHARS) {
+              const orig = anyItem.output;
+              anyItem.output = orig.slice(0, SOFT_TRIM_HEAD) + '\n...\n' + orig.slice(-SOFT_TRIM_TAIL)
+                + `\n[Tool result trimmed: kept first ${SOFT_TRIM_HEAD} and last ${SOFT_TRIM_TAIL} of ${orig.length} chars.]`;
+            }
+          }
+
+          // Phase 2: If still over budget, remove only initial context messages (role/content items
+          // without a 'type' field). NEVER remove function_call or function_call_output items —
+          // orphaning either side of a pair causes API 400 errors.
+          const followupTokenLimit = Math.floor(config.maxContextTokens * 0.6);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const estimateInputTokens = (items: any[]) => items.reduce((sum: number, item: any) => {
+            const content = typeof item === 'string' ? item : JSON.stringify(item);
+            return sum + estimateTokensForModel(content, tokenEstimate.tokensPerChar);
+          }, 0);
+          let followupInputTokens = estimateInputTokens(conversationInput);
+          if (followupInputTokens > followupTokenLimit) {
+            // Only remove initial context messages (no 'type' field = { role, content } format)
+            let trimmed = 0;
+            while (conversationInput.length > 2 && followupInputTokens > followupTokenLimit) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const first = conversationInput[0] as any;
+              if (first?.type) break; // Hit function_call/function_call_output territory — stop
+              conversationInput.splice(0, 1);
+              trimmed++;
+            }
+            if (trimmed > 0) {
+              followupInputTokens = estimateInputTokens(conversationInput);
+              log(`Tool loop: trimmed ${trimmed} context messages, now ${followupInputTokens} tokens`);
+            }
+          }
+
           // Follow-up call with complete context — model sees the full conversation
           const followupResult = openrouter.callModel({
             model: currentModel,
@@ -1276,6 +1307,54 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             lastResponse = await followupResult.getResponse();
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
+            // Context overflow in tool loop: aggressively trim tool results, then retry.
+            // NEVER splice items — that breaks function_call/function_call_output pairs.
+            if (classifyError(err) === 'context_overflow') {
+              log(`Context overflow in tool loop at step ${step}, hard-clearing old tool results`);
+              // Hard-clear all function_call_output content except the most recent round
+              let cleared = 0;
+              for (let i = 0; i < conversationInput.length - toolResults.length; i++) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const item = conversationInput[i] as any;
+                if (item?.type === 'function_call_output' && typeof item.output === 'string' && item.output.length > 200) {
+                  item.output = '[Old tool result cleared to reduce context size.]';
+                  cleared++;
+                }
+              }
+              // Also remove initial context messages (safe — no type field)
+              while (conversationInput.length > 2) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                if ((conversationInput[0] as any)?.type) break;
+                conversationInput.splice(0, 1);
+              }
+              if (cleared > 0) {
+                log(`Hard-cleared ${cleared} tool results, retrying`);
+                try {
+                  const retryResult = openrouter.callModel({
+                    model: currentModel,
+                    instructions: resolvedInstructions,
+                    input: conversationInput,
+                    tools: schemaTools,
+                    maxOutputTokens: resolvedMaxOutputTokens,
+                    temperature: config.temperature,
+                    reasoning: resolvedReasoning
+                  });
+                  lastResponse = await retryResult.getResponse();
+                  const retryText = extractTextFromApiResponse(lastResponse);
+                  if (retryText) {
+                    responseText = retryText;
+                    writeStreamChunk(retryText);
+                  }
+                  pendingCalls = extractFunctionCalls(lastResponse);
+                  continue;
+                } catch (retryErr) {
+                  log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+                  break;
+                }
+              }
+              log(`No tool results to clear, giving up`);
+              break;
+            }
             log(`Follow-up getResponse failed at step ${step}: ${message}`);
             break;
           }
@@ -1306,10 +1385,68 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         break; // Success
       } catch (err) {
         lastError = err;
-        if (classifyError(err)) {
+        const errClass = classifyError(err);
+        // Context overflow: don't try fallback models (same context = same problem).
+        // Emergency compaction: summarize older messages to preserve information,
+        // rebuild system prompt at max trim level, then retry.
+        if (errClass === 'context_overflow' && contextMessages.length > 4) {
+          log(`Context overflow on ${currentModel}, emergency compaction + max trim`);
+          // Split: keep last 4 messages, compact the rest via summary
+          const keepCount = Math.min(4, contextMessages.length);
+          const toCompact = contextMessages.slice(0, contextMessages.length - keepCount);
+          const toKeep = contextMessages.slice(-keepCount);
+          let emergencySummary = '';
+          if (toCompact.length > 0) {
+            try {
+              const compactResult = await updateMemorySummary({
+                openrouter,
+                model: summaryModel,
+                existingSummary: sessionCtx.state.summary,
+                existingFacts: sessionCtx.state.facts,
+                newMessages: toCompact.map((m, i) => ({ role: m.role as 'user' | 'assistant', content: m.content, timestamp: '', seq: i })),
+                maxOutputTokens: config.summaryMaxOutputTokens
+              });
+              if (compactResult) {
+                emergencySummary = compactResult.summary;
+                sessionCtx.state.summary = compactResult.summary;
+                const cappedFacts = compactResult.facts.length > 30 ? compactResult.facts.slice(-30) : compactResult.facts;
+                sessionCtx.state.facts = cappedFacts;
+                saveMemoryState(sessionCtx);
+                log(`Emergency compaction: summarized ${toCompact.length} messages`);
+              }
+            } catch (compactErr) {
+              log(`Emergency compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}`);
+            }
+          }
+          // Rebuild system prompt at max trim level (includes updated summary)
+          const minInstructions = resolveInstructions(4);
+          // Build trimmed input: summary context + recent messages
+          const compactedInput = emergencySummary
+            ? [{ role: 'user' as const, content: `[Previous conversation summary: ${emergencySummary}]` }, ...toKeep.map(m => ({ role: m.role, content: m.content }))]
+            : toKeep.map(m => ({ role: m.role, content: m.content }));
+          try {
+            const retryResult = openrouter.callModel({
+              model: currentModel,
+              instructions: minInstructions,
+              input: compactedInput,
+              tools: schemaTools,
+              maxOutputTokens: resolvedMaxOutputTokens,
+              temperature: config.temperature,
+              reasoning: resolvedReasoning
+            });
+            const retryResponse = await retryResult.getResponse();
+            responseText = extractTextFromApiResponse(retryResponse) || '';
+            lastError = null;
+            break;
+          } catch (retryErr) {
+            log(`Context overflow retry after compaction failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+            throw retryErr;
+          }
+        }
+        if (errClass) {
           cooldownModel(currentModel, err);
           if (attempt < modelChain.length - 1) {
-            log(`${currentModel} failed (${classifyError(err)}): ${err instanceof Error ? err.message : err}`);
+            log(`${currentModel} failed (${errClass}): ${err instanceof Error ? err.message : err}`);
             continue;
           }
         }
