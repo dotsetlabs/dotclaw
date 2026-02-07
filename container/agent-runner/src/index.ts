@@ -779,9 +779,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   // auto-executing tools in its internal loop, which drops conversation context in
   // follow-up API calls (makeFollowupRequest only sends model output + tool results,
   // losing the original user messages). We run the tool loop ourselves instead.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const schemaTools = tools.map(t => {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any
     const { execute, ...rest } = t.function as any;
     return { type: t.type, function: rest };
   }) as typeof tools;
