@@ -13,7 +13,6 @@ test('routeRequest returns flat config from defaults', async () => {
     assert.equal(typeof decision.model, 'string');
     assert.ok(decision.model.length > 0);
     assert.equal(typeof decision.maxOutputTokens, 'number');
-    assert.ok(decision.maxOutputTokens > 0);
     assert.equal(typeof decision.maxToolSteps, 'number');
     assert.ok(decision.maxToolSteps > 0);
     assert.equal(typeof decision.recallMaxResults, 'number');

@@ -232,6 +232,33 @@ function getConfig(config: ReturnType<typeof loadAgentConfig>): MemoryConfig & {
   };
 }
 
+function resolveModelLimits(
+  input: ContainerInput,
+  configDefaults: { maxContextTokens: number; maxOutputTokens: number; compactionTriggerTokens: number; maxContextMessageTokens: number }
+) {
+  const caps = input.modelCapabilities;
+
+  // Context: use model capability, fall back to config
+  const contextLength = caps?.context_length || configDefaults.maxContextTokens;
+
+  // Output tokens: explicit override > model capability > undefined (let SDK decide)
+  let maxOutputTokens: number | undefined;
+  if (input.modelMaxOutputTokens && Number.isFinite(input.modelMaxOutputTokens)) {
+    maxOutputTokens = input.modelMaxOutputTokens;  // Explicit cost-control override
+  } else if (caps?.max_completion_tokens) {
+    maxOutputTokens = caps.max_completion_tokens;   // Model's actual limit
+  }
+  // else: undefined — omit from callModel(), let OpenRouter SDK decide
+
+  // Derive other limits from context length
+  const outputReserve = maxOutputTokens || Math.floor(contextLength * 0.25);
+  const maxContextTokens = contextLength;
+  const compactionTriggerTokens = Math.max(1000, contextLength - outputReserve);
+  const maxContextMessageTokens = Math.max(1000, Math.floor(contextLength * 0.03));
+
+  return { maxContextTokens, maxOutputTokens, compactionTriggerTokens, maxContextMessageTokens };
+}
+
 function getOpenRouterOptions(config: ReturnType<typeof loadAgentConfig>) {
   const timeoutMs = config.agent.openrouter.timeoutMs;
   const retryEnabled = config.agent.openrouter.retry;
@@ -411,7 +438,7 @@ function buildSystemInstructions(params: {
   const hostPlatformNote = params.hostPlatform
     ? (params.hostPlatform.startsWith('linux')
       ? `Host platform: ${params.hostPlatform} (matches container).`
-      : `You are running inside a Linux container, but the user's host machine is ${params.hostPlatform}. Packages with platform-specific native binaries (e.g. esbuild, swc, sharp) installed here won't work on the host. When you create projects with dependencies, delete node_modules before finishing and tell the user to run the install command on their machine.`)
+      : `You are running inside a Linux container, but the user's host machine is ${params.hostPlatform}. Prefer pnpm over npm for installing packages — it generates cross-platform lockfiles. node_modules and package-lock.json are automatically cleaned up after your run finishes (pnpm-lock.yaml is preserved). You do NOT need to delete them yourself. The user will need to run \`pnpm install\` (or \`npx pnpm install\`) on their machine before building. Use node_modules freely during your run for builds and tests.`)
     : '';
 
   const scheduledNote = params.isScheduledTask
@@ -728,14 +755,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const memoryModel = agent.models.memory;
   const assistantName = agent.assistantName;
   const config = getConfig(agentConfig);
-  if (input.modelContextTokens && Number.isFinite(input.modelContextTokens)) {
-    config.maxContextTokens = Math.min(config.maxContextTokens, input.modelContextTokens);
-    const compactionTarget = input.modelContextTokens - config.maxOutputTokens;
-    config.compactionTriggerTokens = Math.max(1000, Math.min(config.compactionTriggerTokens, compactionTarget));
-  }
-  if (input.modelMaxOutputTokens && Number.isFinite(input.modelMaxOutputTokens)) {
-    config.maxOutputTokens = input.modelMaxOutputTokens;
-  }
+  const limits = resolveModelLimits(input, {
+    maxContextTokens: config.maxContextTokens,
+    maxOutputTokens: config.maxOutputTokens,
+    compactionTriggerTokens: config.compactionTriggerTokens,
+    maxContextMessageTokens: agent.context.maxContextMessageTokens,
+  });
+  config.maxContextTokens = limits.maxContextTokens;
+  config.compactionTriggerTokens = limits.compactionTriggerTokens;
+  const resolvedMaxOutputTokens = limits.maxOutputTokens;  // may be undefined
+  const resolvedMaxContextMessageTokens = limits.maxContextMessageTokens;
   if (input.modelTemperature && Number.isFinite(input.modelTemperature)) {
     config.temperature = input.modelTemperature;
   }
@@ -749,7 +778,6 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const memoryExtractionMaxOutputTokens = agent.memory.extraction.maxOutputTokens;
   const memoryExtractScheduled = agent.memory.extractScheduled;
   const memoryArchiveSync = agent.memory.archiveSync;
-  const maxContextMessageTokens = agent.context.maxContextMessageTokens;
 
   const openrouter = getCachedOpenRouter(apiKey, openrouterOptions);
   const tokenEstimate = resolveTokenEstimate(input, agentConfig);
@@ -1011,10 +1039,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   const buildContext = () => {
     const resolvedInstructions = buildInstructions();
     const resolvedInstructionTokens = estimateTokensForModel(resolvedInstructions, tokenEstimate.tokensPerChar);
-    const resolvedMaxContext = Math.max(config.maxContextTokens - config.maxOutputTokens - resolvedInstructionTokens, 2000);
+    const outputReserve = resolvedMaxOutputTokens || Math.floor(config.maxContextTokens * 0.25);
+    const resolvedMaxContext = Math.max(config.maxContextTokens - outputReserve - resolvedInstructionTokens, 2000);
     const resolvedAdjusted = Math.max(1000, Math.floor(resolvedMaxContext * tokenRatio));
     let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, resolvedAdjusted, 6);
-    contextMessages = clampContextMessages(contextMessages, tokenEstimate.tokensPerChar, maxContextMessageTokens);
+    contextMessages = clampContextMessages(contextMessages, tokenEstimate.tokensPerChar, resolvedMaxContextMessageTokens);
     return {
       instructions: resolvedInstructions,
       instructionsTokens: resolvedInstructionTokens,
@@ -1076,7 +1105,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
           input: contextInput,
           tools,
           stopWhen: stepCountIs(maxToolSteps),
-          maxOutputTokens: config.maxOutputTokens,
+          maxOutputTokens: resolvedMaxOutputTokens,
           temperature: config.temperature,
           reasoning: resolvedReasoning
         });

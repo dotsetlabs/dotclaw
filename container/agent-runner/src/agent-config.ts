@@ -147,14 +147,14 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     canaryRate: 0.1
   },
   context: {
-    maxContextTokens: 24_000,
-    compactionTriggerTokens: 20_000,
+    maxContextTokens: 128_000,
+    compactionTriggerTokens: 120_000,
     recentContextTokens: 8000,
     summaryUpdateEveryMessages: 20,
-    maxOutputTokens: 4096,
+    maxOutputTokens: 1024,
     summaryMaxOutputTokens: 2048,
     temperature: 0.2,
-    maxContextMessageTokens: 3000
+    maxContextMessageTokens: 4000
   },
   memory: {
     maxResults: 6,
@@ -173,7 +173,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     memory: 'deepseek/deepseek-v3.2'
   },
   tools: {
-    maxToolSteps: 50,
+    maxToolSteps: 200,
     outputLimitBytes: 400_000,
     enableBash: true,
     enableWebSearch: true,

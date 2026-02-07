@@ -109,3 +109,13 @@ test('validation clamps invalid container mode to daemon', async () => {
     assert.equal(config.host.container.mode, 'daemon', 'Invalid container mode should be clamped to daemon');
   });
 });
+
+test('default routing maxOutputTokens is 0 (auto) and maxToolSteps is 200', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-runtime-defaults-'));
+  await withTempHome(tempDir, async () => {
+    const { loadRuntimeConfig } = await importFresh(distPath('runtime-config.js'));
+    const config = loadRuntimeConfig();
+    assert.equal(config.host.routing.maxOutputTokens, 0, 'maxOutputTokens should default to 0 (auto)');
+    assert.equal(config.host.routing.maxToolSteps, 200, 'maxToolSteps should default to 200');
+  });
+});

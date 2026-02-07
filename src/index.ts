@@ -14,7 +14,7 @@ import {
 } from './config.js';
 
 // Load .env from the canonical location (~/.dotclaw/.env)
-dotenv.config({ path: ENV_PATH });
+dotenv.config({ path: ENV_PATH, quiet: true } as Parameters<typeof dotenv.config>[0]);
 import { RegisteredGroup, Session, MessageAttachment } from './types.js';
 import {
   initDatabase,
@@ -1273,12 +1273,16 @@ async function main(): Promise<void> {
 
     logger.info('DotClaw running (responds to DMs and group mentions/replies)');
   } catch (error) {
-    logger.error({ err: error instanceof Error ? error : new Error(String(error)) }, 'Failed to start DotClaw');
+    const msg = error instanceof Error ? error.message : String(error);
+    logger.error({ err: error instanceof Error ? error : new Error(msg) }, 'Failed to start DotClaw');
+    console.error(`[dotclaw] FATAL: ${msg}`);
     process.exit(1);
   }
 }
 
 main().catch(err => {
+  const msg = err instanceof Error ? err.message : String(err);
   logger.error({ err }, 'Failed to start DotClaw');
+  console.error(`[dotclaw] FATAL: ${msg}`);
   process.exit(1);
 });

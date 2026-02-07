@@ -1,6 +1,6 @@
 {
   "name": "@dotsetlabs/dotclaw",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Personal OpenRouter-based assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
@@ -57,7 +57,8 @@
     "lint": "eslint . --max-warnings=0",
     "test": "npm run build && node --test test/**/*.test.js && npm run test:agent-runner",
     "test:agent-runner": "node scripts/test-agent-runner.js",
-    "prepublishOnly": "npm run build && npm run lint && npm test",
+    "prepare": "tsc",
+    "prepublishOnly": "npm run lint && npm test",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"

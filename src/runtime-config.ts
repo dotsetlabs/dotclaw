@@ -456,8 +456,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     routing: {
       model: 'moonshotai/kimi-k2.5',
       fallbacks: [],
-      maxOutputTokens: 4096,
-      maxToolSteps: 50,
+      maxOutputTokens: 0,
+      maxToolSteps: 200,
       temperature: 0.2,
       recallMaxResults: 8,
       recallMaxTokens: 1500,
@@ -493,14 +493,14 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       canaryRate: 0.1
     },
     context: {
-      maxContextTokens: 24_000,
-      compactionTriggerTokens: 20_000,
+      maxContextTokens: 128_000,
+      compactionTriggerTokens: 120_000,
       recentContextTokens: 8000,
       summaryUpdateEveryMessages: 20,
       maxOutputTokens: 1024,
       summaryMaxOutputTokens: 2048,
       temperature: 0.2,
-      maxContextMessageTokens: 3000
+      maxContextMessageTokens: 4000
     },
     memory: {
       maxResults: 6,
@@ -519,7 +519,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       memory: 'deepseek/deepseek-v3.2',
     },
     tools: {
-      maxToolSteps: 96,
+      maxToolSteps: 200,
       outputLimitBytes: 400_000,
       enableBash: true,
       enableWebSearch: true,
@@ -638,7 +638,7 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   h.messageQueue.maxRetries = clampMin(h.messageQueue.maxRetries, 0, 'host.messageQueue.maxRetries');
 
   // Routing
-  h.routing.maxOutputTokens = clampMin(h.routing.maxOutputTokens, 1, 'host.routing.maxOutputTokens');
+  h.routing.maxOutputTokens = clampMin(h.routing.maxOutputTokens, 0, 'host.routing.maxOutputTokens');
   h.routing.maxToolSteps = clampMin(h.routing.maxToolSteps, 1, 'host.routing.maxToolSteps');
   h.routing.recallMaxResults = clampMin(h.routing.recallMaxResults, 0, 'host.routing.recallMaxResults');
   h.routing.recallMaxTokens = clampMin(h.routing.recallMaxTokens, 0, 'host.routing.recallMaxTokens');

@@ -26,8 +26,8 @@ title: Runtime Config
     "routing": {
       "model": "moonshotai/kimi-k2.5",
       "fallbacks": [],
-      "maxOutputTokens": 4096,
-      "maxToolSteps": 25,
+      "maxOutputTokens": 0,
+      "maxToolSteps": 200,
       "temperature": 0.2
     }
   },
@@ -257,8 +257,8 @@ title: Runtime Config
 |---------|---------|-------------|
 | `model` | `"moonshotai/kimi-k2.5"` | Model for all requests |
 | `fallbacks` | `[]` | Fallback models tried in order when the primary model fails (e.g. rate limit, outage) |
-| `maxOutputTokens` | `4096` | Maximum output tokens per response |
-| `maxToolSteps` | `50` | Maximum tool-call steps per request |
+| `maxOutputTokens` | `0` | Maximum output tokens per response. `0` = auto (use model's native limit from OpenRouter API, cached 24h) |
+| `maxToolSteps` | `200` | Maximum tool-call steps per request |
 | `temperature` | `0.2` | Sampling temperature |
 | `recallMaxResults` | `8` | Maximum memory items returned per recall query |
 | `recallMaxTokens` | `1500` | Maximum tokens for recalled memory content |
@@ -308,16 +308,18 @@ title: Runtime Config
 
 ### `agent.context`
 
+These are fallback defaults. When model capabilities are available (fetched from OpenRouter API, cached 24h), the container automatically derives `maxContextTokens`, `compactionTriggerTokens`, and `maxContextMessageTokens` from the model's actual context window. Set explicit values here to override model-derived limits.
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `maxContextTokens` | `24000` | Maximum context window tokens |
-| `compactionTriggerTokens` | `20000` | Token count that triggers context compaction |
+| `maxContextTokens` | `128000` | Maximum context window tokens (auto-derived from model capabilities) |
+| `compactionTriggerTokens` | `120000` | Token count that triggers context compaction (auto-derived) |
 | `recentContextTokens` | `8000` | Tokens reserved for recent messages |
 | `summaryUpdateEveryMessages` | `20` | Messages between summary updates |
-| `maxOutputTokens` | `1024` | Default max output tokens |
+| `maxOutputTokens` | `1024` | Default max output tokens (for summary/memory calls) |
 | `summaryMaxOutputTokens` | `2048` | Max tokens for summary generation |
 | `temperature` | `0.2` | Default temperature |
-| `maxContextMessageTokens` | `3000` | Max tokens per individual message |
+| `maxContextMessageTokens` | `4000` | Max tokens per individual message (auto-derived) |
 
 ### `agent.memory`
 
@@ -350,7 +352,7 @@ Sub-models used for auxiliary tasks:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `maxToolSteps` | `96` | Default tool step limit |
+| `maxToolSteps` | `200` | Default tool step limit |
 | `outputLimitBytes` | `400000` | Maximum tool output size |
 | `enableBash` | `true` | Enable Bash tool |
 | `enableWebSearch` | `true` | Enable WebSearch tool |

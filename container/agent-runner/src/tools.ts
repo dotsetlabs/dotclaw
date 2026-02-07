@@ -1046,29 +1046,36 @@ export function createTools(
     })
   });
 
-  const npmInstallTool = tool({
-    name: 'NpmInstall',
-    description: 'Install npm packages in the workspace.',
-    inputSchema: z.object({
-      packages: z.array(z.string()).optional().describe('Packages to install (default: install from package.json)'),
-      dev: z.boolean().optional().describe('Install as dev dependencies'),
-      path: z.string().optional().describe('Working directory (relative to /workspace/group)')
-    }),
-    outputSchema: z.object({
-      stdout: z.string(),
-      stderr: z.string(),
-      exitCode: z.number().int().nullable(),
-      durationMs: z.number(),
-      truncated: z.boolean()
-    }),
-    execute: wrapExecute('NpmInstall', async ({ packages, dev, path: workdir }: { packages?: string[]; dev?: boolean; path?: string }) => {
-      const cwd = workdir ? resolvePath(workdir, isMain, true) : WORKSPACE_GROUP;
-      const pkgList = packages && packages.length > 0 ? packages.map(shellEscape).join(' ') : '';
-      const devFlag = dev ? '--save-dev' : '';
-      const command = `npm install ${devFlag} ${pkgList}`.trim();
-      return runCommand(command, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes, cwd);
-    })
+  const packageInstallOutputSchema = z.object({
+    stdout: z.string(),
+    stderr: z.string(),
+    exitCode: z.number().int().nullable(),
+    durationMs: z.number(),
+    truncated: z.boolean()
   });
+
+  const packageInstallInputSchema = z.object({
+    packages: z.array(z.string()).optional().describe('Packages to install (default: install from package.json)'),
+    dev: z.boolean().optional().describe('Install as dev dependencies'),
+    path: z.string().optional().describe('Working directory (relative to /workspace/group)')
+  });
+
+  const packageInstallExecute = async ({ packages, dev, path: workdir }: { packages?: string[]; dev?: boolean; path?: string }) => {
+    const cwd = workdir ? resolvePath(workdir, isMain, true) : WORKSPACE_GROUP;
+    const pkgList = packages && packages.length > 0 ? packages.map(shellEscape).join(' ') : '';
+    const devFlag = dev ? '--save-dev' : '';
+    const command = `pnpm install --no-frozen-lockfile ${devFlag} ${pkgList}`.trim();
+    return runCommand(command, runtime.bashTimeoutMs, runtime.bashOutputLimitBytes, cwd);
+  };
+
+  const packageInstallTool = tool({
+    name: 'PackageInstall',
+    description: 'Install packages using pnpm in the workspace. Generates a cross-platform pnpm-lock.yaml.',
+    inputSchema: packageInstallInputSchema,
+    outputSchema: packageInstallOutputSchema,
+    execute: wrapExecute('PackageInstall', packageInstallExecute)
+  });
+
 
   const readTool = tool({
     name: 'Read',
@@ -2204,7 +2211,7 @@ export function createTools(
     globTool,
     grepTool,
     gitCloneTool,
-    npmInstallTool,
+    packageInstallTool,
     sendMessageTool,
     sendFileTool,
     sendPhotoTool,

@@ -18,7 +18,7 @@ Example:
 {
   "default": {
     "allow": [
-      "Read", "Write", "Edit", "Glob", "Grep", "GitClone", "NpmInstall",
+      "Read", "Write", "Edit", "Glob", "Grep", "GitClone", "PackageInstall",
       "WebSearch", "WebFetch", "Bash", "Python", "Browser",
       "mcp__dotclaw__send_message", "mcp__dotclaw__send_file",
       "mcp__dotclaw__send_photo", "mcp__dotclaw__send_voice",
@@ -147,7 +147,7 @@ The agent has access to the following coding tools:
 - `WebSearch` — Search the web via Brave Search API
 - `WebFetch` — Fetch and extract content from a URL
 - `GitClone` — Clone a git repository
-- `NpmInstall` — Install npm packages
+- `PackageInstall` — Install packages using pnpm
 - `Browser` — In-container Chromium automation (navigate, screenshot, click, fill, extract)
 
 ## Built-in DotClaw tools

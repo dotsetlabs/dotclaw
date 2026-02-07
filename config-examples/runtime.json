@@ -22,8 +22,8 @@
     "routing": {
       "model": "moonshotai/kimi-k2.5",
       "fallbacks": ["anthropic/claude-sonnet-4-5", "openai/gpt-4.1"],
-      "maxOutputTokens": 4096,
-      "maxToolSteps": 50,
+      "maxOutputTokens": 0,
+      "maxToolSteps": 200,
       "temperature": 0.2,
       "recallMaxResults": 8,
       "recallMaxTokens": 1500
@@ -33,6 +33,12 @@
       "chunkFlushIntervalMs": 200,
       "editIntervalMs": 400,
       "maxEditLength": 3800
+    },
+    "telegram": {
+      "enabled": true
+    },
+    "discord": {
+      "enabled": false
     },
     "toolBudgets": {
       "enabled": false

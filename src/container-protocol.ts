@@ -36,6 +36,10 @@ export interface ContainerInput {
   modelOverride?: string;
   modelFallbacks?: string[];
   reasoningEffort?: 'off' | 'low' | 'medium' | 'high';
+  modelCapabilities?: {
+    context_length: number;
+    max_completion_tokens?: number;
+  };
   modelContextTokens?: number;
   modelMaxOutputTokens?: number;
   modelTemperature?: number;

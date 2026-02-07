@@ -74,7 +74,7 @@ Telemetry + traces                  Streaming delivery
 3. `drainQueue()` → `claimBatchForChat()` groups rapid messages within `BATCH_WINDOW_MS` (2s)
 4. `routeRequest()` applies flat routing config (model, token limits, max tool steps)
 5. `executeAgentRun()` builds context (memory recall, tool policy) → `runContainerAgent()`
-6. Container agent-runner calls OpenRouter with streaming, iterates tool calls up to `maxToolSteps` (default 50)
+6. Container agent-runner calls OpenRouter with streaming, iterates tool calls up to `maxToolSteps` (default 200)
 7. Streaming response delivered via edit-in-place → sent back through provider → telemetry recorded
 
 Transient failures re-queue with exponential backoff (base 3s, max 60s, up to 4 retries).

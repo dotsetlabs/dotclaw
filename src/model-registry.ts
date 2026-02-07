@@ -266,10 +266,10 @@ export async function getModelCapabilities(model: string): Promise<ModelCapabili
     return cached;
   }
 
-  // Return conservative defaults if model not found
+  // Generous fallback — most modern models are 128K+
   return {
-    context_length: runtime.agent.context.maxContextTokens,
-    max_completion_tokens: runtime.agent.context.maxOutputTokens
+    context_length: 128_000,
+    max_completion_tokens: undefined,
   };
 }
 

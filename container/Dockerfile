@@ -60,6 +60,9 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser globally
 RUN npm install -g agent-browser
 
+# Enable pnpm via corepack (cross-platform lockfiles)
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
 # Create app directory
 WORKDIR /app
 

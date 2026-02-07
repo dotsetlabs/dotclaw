@@ -369,7 +369,8 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
               file_size: attachment.file_size,
               duration: attachment.duration,
               width: attachment.width,
-              height: attachment.height
+              height: attachment.height,
+              transcript: attachment.transcript
             }];
           });
           if (mapped.length > 0) return mapped;
@@ -457,7 +458,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         modelOverride: routing.model,
         modelFallbacks: routing.fallbacks,
         reasoningEffort: loadRuntimeConfig().agent.reasoning.effort,
-        modelMaxOutputTokens: routing.maxOutputTokens,
+        modelMaxOutputTokens: routing.maxOutputTokens || undefined,
         maxToolSteps: routing.maxToolSteps,
         attachments: containerAttachments,
         abortSignal: abortController.signal,

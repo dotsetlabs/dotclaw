@@ -50,7 +50,7 @@ export function loadToolBudgetConfig(): ToolBudgetConfig {
         Bash: 2000,
         Python: 1500,
         GitClone: 400,
-        NpmInstall: 300
+        PackageInstall: 300
       }
     }
   };

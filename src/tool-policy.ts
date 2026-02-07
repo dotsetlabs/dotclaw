@@ -22,7 +22,7 @@ const DEFAULT_POLICY: ToolPolicy = {
     'Glob',
     'Grep',
     'GitClone',
-    'NpmInstall',
+    'PackageInstall',
     'WebSearch',
     'WebFetch',
     'Bash',
