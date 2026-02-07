@@ -86,7 +86,7 @@ test('humanizeError converts out of memory to friendly message', () => {
 
 test('humanizeError returns default for unknown errors', () => {
   const msg = humanizeError('Something totally unexpected happened');
-  assert.ok(msg.includes('went wrong'));
+  assert.ok(msg.includes('unexpected error'));
 });
 
 test('humanizeError accepts Error objects', () => {

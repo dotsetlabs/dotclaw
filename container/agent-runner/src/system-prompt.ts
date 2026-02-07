@@ -65,6 +65,9 @@ export interface SystemPromptParams {
   // Pack limits
   promptPacksMaxChars: number;
   promptPacksMaxDemos: number;
+
+  // System prompt trim level (0 = full, higher = more aggressive trimming)
+  trimLevel?: number;
 }
 
 const MEMORY_SUMMARY_MAX_CHARS = 2000;
@@ -248,6 +251,14 @@ function buildPromptPackSections(params: SystemPromptParams): string[] {
  * "full" mode includes all sections for user-facing agent calls.
  * "minimal" mode includes only identity + essential context for background tasks.
  */
+/**
+ * Trim levels for progressive system prompt budgeting:
+ * 0 = full (no trimming)
+ * 1 = drop prompt packs
+ * 2 = drop tool reliability stats
+ * 3 = truncate memory section (drop session recall, reduce long-term recall)
+ * 4 = truncate group/global notes
+ */
 export function buildSystemPrompt(params: SystemPromptParams): string {
   if (params.mode === 'minimal') {
     return [
@@ -257,12 +268,18 @@ export function buildSystemPrompt(params: SystemPromptParams): string {
     ].filter(Boolean).join('\n\n');
   }
 
+  const trimLevel = params.trimLevel ?? 0;
+
   const timezoneNote = params.timezone
     ? `Timezone: ${params.timezone}. Use this timezone when interpreting or presenting timestamps unless the user specifies another.`
     : '';
 
-  const groupNotes = params.groupNotes ? `Group notes:\n${params.groupNotes}` : '';
-  const globalNotes = params.globalNotes ? `Global notes:\n${params.globalNotes}` : '';
+  const groupNotes = params.groupNotes
+    ? `Group notes:\n${trimLevel >= 4 ? params.groupNotes.slice(0, 1000) : params.groupNotes}`
+    : '';
+  const globalNotes = params.globalNotes
+    ? `Global notes:\n${trimLevel >= 4 ? params.globalNotes.slice(0, 1000) : params.globalNotes}`
+    : '';
   const skillNotes = params.skillCatalog ? formatSkillCatalog(params.skillCatalog) : '';
 
   const availableGroups = params.availableGroups && params.availableGroups.length > 0
@@ -271,19 +288,28 @@ export function buildSystemPrompt(params: SystemPromptParams): string {
       .join('\n')
     : '';
 
-  const toolReliability = params.toolReliability && params.toolReliability.length > 0
-    ? params.toolReliability
-      .sort((a, b) => a.success_rate - b.success_rate)
-      .slice(0, 20)
-      .map(t => {
-        const pct = `${Math.round(t.success_rate * 100)}%`;
-        const avg = Number.isFinite(t.avg_duration_ms) ? `${Math.round(t.avg_duration_ms!)}ms` : 'n/a';
-        return `- ${t.name}: success ${pct} over ${t.count} calls (avg ${avg})`;
-      })
-      .join('\n')
-    : '';
+  // Trim level 2+: drop tool reliability stats
+  const toolReliability = trimLevel >= 2 ? '' : (
+    params.toolReliability && params.toolReliability.length > 0
+      ? params.toolReliability
+        .sort((a, b) => a.success_rate - b.success_rate)
+        .slice(0, 20)
+        .map(t => {
+          const pct = `${Math.round(t.success_rate * 100)}%`;
+          const avg = Number.isFinite(t.avg_duration_ms) ? `${Math.round(t.avg_duration_ms!)}ms` : 'n/a';
+          return `- ${t.name}: success ${pct} over ${t.count} calls (avg ${avg})`;
+        })
+        .join('\n')
+      : ''
+  );
 
-  const packBlocks = buildPromptPackSections(params);
+  // Trim level 1+: drop prompt packs
+  const packBlocks = trimLevel >= 1 ? [] : buildPromptPackSections(params);
+
+  // Trim level 3+: reduce memory section (drop session recall, limit long-term recall)
+  const memoryParams = trimLevel >= 3
+    ? { ...params, sessionRecall: [], longTermRecall: params.longTermRecall.slice(0, 2) }
+    : params;
 
   const sections = [
     buildIdentitySection(params),
@@ -300,7 +326,7 @@ export function buildSystemPrompt(params: SystemPromptParams): string {
     availableGroups ? section('Available Groups', availableGroups) : '',
     toolReliability ? section('Tool Reliability', toolReliability) : '',
     buildBehaviorSection(params) ? section('Behavior', buildBehaviorSection(params)) : '',
-    section('Memory', buildMemorySection(params)),
+    section('Memory', buildMemorySection(memoryParams)),
     params.maxToolSteps
       ? `You have a budget of ${params.maxToolSteps} tool steps per request. If a task is large, break your work into phases and always finish with a text summary of what you accomplished — never end on a tool call without a response.`
       : '',

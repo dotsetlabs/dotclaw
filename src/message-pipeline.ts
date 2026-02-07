@@ -23,7 +23,7 @@ import { emitHook } from './hooks.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
 import { logger } from './logger.js';
 import { setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
-import { humanizeError } from './error-messages.js';
+import { humanizeError, isTransientError } from './error-messages.js';
 import { routeRequest } from './request-router.js';
 import {
   GROUPS_DIR,
@@ -539,6 +539,13 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
 
     if (!output) {
       const message = errorMessage || 'No output from agent';
+      // Retry transient errors (rate limits, timeouts, 5xx) instead of showing to user
+      if (isTransientError(message)) {
+        if (streaming) {
+          try { await streaming.cleanup(); } catch { /* best effort */ }
+        }
+        throw new RetryableMessageProcessingError(message);
+      }
       if (context) {
         recordAgentTelemetry({
           traceBase,
@@ -579,6 +586,14 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
     }
 
     if (output.status === 'error') {
+      const errorText = errorMessage || output.error || 'Unknown error';
+      // Retry transient errors (rate limits, timeouts, 5xx) instead of showing to user
+      if (isTransientError(errorText)) {
+        if (streaming) {
+          try { await streaming.cleanup(); } catch { /* best effort */ }
+        }
+        throw new RetryableMessageProcessingError(errorText);
+      }
       if (context) {
         recordAgentTelemetry({
           traceBase,
@@ -586,13 +601,12 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
           context,
           metricsSource: providerName,
           toolAuditSource: 'message',
-          errorMessage: errorMessage || output.error || 'Unknown error',
+          errorMessage: errorText,
           errorType: 'agent',
           extraTimings
         });
       }
       logger.error({ group: group.name, error: output.error }, 'Container agent error');
-      const errorText = errorMessage || output.error || 'Unknown error';
       const userMessage = humanizeError(errorText);
       if (streaming) {
         await streaming.finalize(userMessage);

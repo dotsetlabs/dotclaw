@@ -427,6 +427,7 @@ function buildInstructions(params: {
   memoryPolicyPack?: PromptPack | null;
   memoryRecallPack?: PromptPack | null;
   maxToolSteps?: number;
+  trimLevel?: number;
 }): string {
   return buildSystemPrompt({
     mode: 'full',
@@ -458,6 +459,7 @@ function buildInstructions(params: {
     browserEnabled: agentConfig.agent.browser.enabled,
     promptPacksMaxChars: PROMPT_PACKS_MAX_CHARS,
     promptPacksMaxDemos: PROMPT_PACKS_MAX_DEMOS,
+    trimLevel: params.trimLevel,
   });
 }
 
@@ -846,8 +848,12 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     history = limitHistoryTurns(history, agent.context.maxHistoryTurns);
   }
 
+  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate 60% of context window
+  const effectiveRecentTokens = config.recentContextTokens > 0
+    ? config.recentContextTokens
+    : Math.floor(config.maxContextTokens * 0.6);
   const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
-  const adjustedRecentTokens = Math.max(1000, Math.floor(config.recentContextTokens * tokenRatio));
+  const adjustedRecentTokens = Math.max(1000, Math.floor(effectiveRecentTokens * tokenRatio));
 
   const totalTokens = history.reduce(
     (sum, message) => sum + estimateTokensForModel(message.content, tokenEstimate.tokensPerChar) + tokenEstimate.tokensPerMessage,
@@ -1023,7 +1029,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   if (memoryPolicyResult) promptPackVersions['memory-policy'] = memoryPolicyResult.pack.version;
   if (memoryRecallResult) promptPackVersions['memory-recall'] = memoryRecallResult.pack.version;
 
-  const resolveInstructions = () => buildInstructions({
+  const resolveInstructions = (trimLevel = 0) => buildInstructions({
     assistantName,
     groupNotes: claudeNotes.group,
     globalNotes: claudeNotes.global,
@@ -1048,12 +1054,29 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     toolOutcomePack: toolOutcomeResult?.pack || null,
     memoryPolicyPack: memoryPolicyResult?.pack || null,
     memoryRecallPack: memoryRecallResult?.pack || null,
-    maxToolSteps
+    maxToolSteps,
+    trimLevel
   });
 
   const buildContext = () => {
-    const resolvedInstructions = resolveInstructions();
-    const resolvedInstructionTokens = estimateTokensForModel(resolvedInstructions, tokenEstimate.tokensPerChar);
+    // System prompt budget: 25% of context window
+    const maxSystemPromptTokens = Math.floor(config.maxContextTokens * 0.25);
+    const MAX_TRIM_LEVEL = 4;
+
+    let resolvedInstructions = '';
+    let resolvedInstructionTokens = 0;
+    let trimLevel = 0;
+
+    // Progressive trimming loop: build prompt, check size, trim if needed
+    for (trimLevel = 0; trimLevel <= MAX_TRIM_LEVEL; trimLevel++) {
+      resolvedInstructions = resolveInstructions(trimLevel);
+      resolvedInstructionTokens = estimateTokensForModel(resolvedInstructions, tokenEstimate.tokensPerChar);
+      if (resolvedInstructionTokens <= maxSystemPromptTokens || trimLevel === MAX_TRIM_LEVEL) {
+        break;
+      }
+      log(`System prompt ${resolvedInstructionTokens} tokens exceeds budget ${maxSystemPromptTokens}, trimming (level ${trimLevel + 1})`);
+    }
+
     const outputReserve = resolvedMaxOutputTokens || Math.floor(config.maxContextTokens * 0.25);
     const resolvedMaxContext = Math.max(config.maxContextTokens - outputReserve - resolvedInstructionTokens, 2000);
     const resolvedAdjusted = Math.max(1000, Math.floor(resolvedMaxContext * tokenRatio));

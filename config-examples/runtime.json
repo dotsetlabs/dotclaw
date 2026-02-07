@@ -62,7 +62,7 @@
         "softTrimMaxChars": 4000,
         "softTrimHeadChars": 1500,
         "softTrimTailChars": 1500,
-        "keepLastAssistant": 3
+        "keepLastAssistant": 10
       }
     },
     "promptPacks": {

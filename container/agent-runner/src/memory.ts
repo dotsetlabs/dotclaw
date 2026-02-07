@@ -412,7 +412,7 @@ export function retrieveRelevantMemories(params: {
     if (score > 0) candidates.push({ text: fact, score });
   }
 
-  for (const msg of params.olderMessages.slice(-200)) {
+  for (const msg of params.olderMessages.slice(-50)) {
     const snippet = msg.content.length > 300 ? `${msg.content.slice(0, 300)}...` : msg.content;
     const score = scoreCandidate(snippet, queryTokens, 1.0);
     if (score > 0) candidates.push({ text: snippet, score });
@@ -420,9 +420,13 @@ export function retrieveRelevantMemories(params: {
 
   candidates.sort((a, b) => b.score - a.score);
 
+  // Quality gate: filter out low-scoring candidates to prevent noise injection
+  const MIN_SESSION_RECALL_SCORE = 0.5;
+  const filtered = candidates.filter(c => c.score >= MIN_SESSION_RECALL_SCORE);
+
   const results: string[] = [];
   let tokens = 0;
-  for (const candidate of candidates) {
+  for (const candidate of filtered) {
     if (results.length >= params.config.memoryMaxResults) break;
     const nextTokens = estimateTokens(candidate.text);
     if (tokens + nextTokens > params.config.memoryMaxTokens) break;
