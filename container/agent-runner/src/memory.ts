@@ -475,10 +475,25 @@ export function pruneContextMessages(
 }
 
 /**
- * Limit conversation history to the last N messages.
+ * Limit conversation history by counting user turns (not total messages).
+ * maxTurns=40 means keep the last 40 user messages plus all their associated
+ * assistant replies — roughly 80 messages total.
  * Preserves chronological order.
  */
 export function limitHistoryTurns(messages: Message[], maxTurns: number): Message[] {
-  if (maxTurns <= 0 || messages.length <= maxTurns) return messages;
-  return messages.slice(-maxTurns);
+  if (maxTurns <= 0) return messages;
+  // Count user turns from the end
+  let userTurnsSeen = 0;
+  let cutoff = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      userTurnsSeen++;
+      if (userTurnsSeen > maxTurns) {
+        cutoff = i + 1;
+        break;
+      }
+    }
+  }
+  if (cutoff === 0) return messages;
+  return messages.slice(cutoff);
 }

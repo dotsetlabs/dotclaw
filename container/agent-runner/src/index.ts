@@ -22,7 +22,6 @@ import {
   buildMultiPartSummaryPrompt,
   splitMessagesByTokenShare,
   parseSummaryResponse,
-  retrieveRelevantMemories,
   saveMemoryState,
   writeHistory,
   estimateTokens,
@@ -496,25 +495,6 @@ function loadClaudeNotes(): { group: string | null; global: string | null } {
 }
 
 
-function extractQueryFromPrompt(prompt: string): string {
-  if (!prompt) return '';
-  const messageMatches = [...prompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
-  if (messageMatches.length > 0) {
-    const last = messageMatches[messageMatches.length - 1][1];
-    return decodeXml(last).trim();
-  }
-  return prompt.trim();
-}
-
-function decodeXml(value: string): string {
-  return value
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
-}
-
 // ── Image/Vision support ──────────────────────────────────────────────
 
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB per image
@@ -987,15 +967,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   // Recompute split after possible compaction
   ({ recentMessages, olderMessages } = splitRecentHistory(history, adjustedRecentTokens));
 
-  const query = extractQueryFromPrompt(prompt);
-  const sessionRecall = retrieveRelevantMemories({
-    query,
-    summary: sessionCtx.state.summary,
-    facts: sessionCtx.state.facts,
-    olderMessages,
-    config
-  });
-  const sessionRecallCount = sessionRecall.length;
+  // Long-term memory is now tool-based (agent calls mcp__dotclaw__memory_search on demand).
+  // Session recall removed — redundant with summary + facts + recent messages.
+  const sessionRecallCount = 0;
   const memoryRecallCount = input.memoryRecall ? input.memoryRecall.length : 0;
 
   const sharedPromptDir = fs.existsSync(PROMPTS_DIR) ? PROMPTS_DIR : undefined;
@@ -1045,8 +1019,8 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     skillCatalog,
     memorySummary: sessionCtx.state.summary,
     memoryFacts: sessionCtx.state.facts,
-    sessionRecall,
-    longTermRecall: input.memoryRecall || [],
+    sessionRecall: [],
+    longTermRecall: [],
     userProfile: input.userProfile ?? null,
     memoryStats: input.memoryStats,
     availableGroups,
@@ -1277,12 +1251,14 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
           // Phase 1: Soft-trim oversized tool results (like OpenClaw's context-pruning extension).
           // Replace large tool result content with head+tail, preserving pair integrity.
+          // PROTECT the most recent round's tool results — only trim older ones.
           const SOFT_TRIM_MAX_CHARS = 4000;
           const SOFT_TRIM_HEAD = 1500;
           const SOFT_TRIM_TAIL = 1500;
-          for (const item of conversationInput) {
+          const protectedStart = conversationInput.length - toolResults.length;
+          for (let idx = 0; idx < protectedStart; idx++) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const anyItem = item as any;
+            const anyItem = conversationInput[idx] as any;
             if (anyItem?.type === 'function_call_output' && typeof anyItem.output === 'string' && anyItem.output.length > SOFT_TRIM_MAX_CHARS) {
               const orig = anyItem.output;
               anyItem.output = orig.slice(0, SOFT_TRIM_HEAD) + '\n...\n' + orig.slice(-SOFT_TRIM_TAIL)
@@ -1411,19 +1387,48 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
         lastError = err;
         const errClass = classifyError(err);
         // Context overflow: don't try fallback models (same context = same problem).
-        // Rebuild system prompt at max trim level + truncate messages, then retry.
+        // Emergency compaction: summarize older messages to preserve information,
+        // rebuild system prompt at max trim level, then retry.
         if (errClass === 'context_overflow' && contextMessages.length > 4) {
-          log(`Context overflow on ${currentModel}, rebuilding prompt at max trim + truncating messages`);
-          // Rebuild system prompt at maximum trim level to free context
+          log(`Context overflow on ${currentModel}, emergency compaction + max trim`);
+          // Split: keep last 4 messages, compact the rest via summary
+          const keepCount = Math.min(4, contextMessages.length);
+          const toCompact = contextMessages.slice(0, contextMessages.length - keepCount);
+          const toKeep = contextMessages.slice(-keepCount);
+          let emergencySummary = '';
+          if (toCompact.length > 0) {
+            try {
+              const compactResult = await updateMemorySummary({
+                openrouter,
+                model: summaryModel,
+                existingSummary: sessionCtx.state.summary,
+                existingFacts: sessionCtx.state.facts,
+                newMessages: toCompact.map((m, i) => ({ role: m.role as 'user' | 'assistant', content: m.content, timestamp: '', seq: i })),
+                maxOutputTokens: config.summaryMaxOutputTokens
+              });
+              if (compactResult) {
+                emergencySummary = compactResult.summary;
+                sessionCtx.state.summary = compactResult.summary;
+                const cappedFacts = compactResult.facts.length > 30 ? compactResult.facts.slice(-30) : compactResult.facts;
+                sessionCtx.state.facts = cappedFacts;
+                saveMemoryState(sessionCtx);
+                log(`Emergency compaction: summarized ${toCompact.length} messages`);
+              }
+            } catch (compactErr) {
+              log(`Emergency compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}`);
+            }
+          }
+          // Rebuild system prompt at max trim level (includes updated summary)
           const minInstructions = resolveInstructions(4);
-          const trimCount = Math.floor(contextMessages.length / 2);
-          contextMessages.splice(0, trimCount);
-          const trimmedInput = messagesToOpenRouter(contextMessages);
+          // Build trimmed input: summary context + recent messages
+          const compactedInput = emergencySummary
+            ? [{ role: 'user' as const, content: `[Previous conversation summary: ${emergencySummary}]` }, ...toKeep.map(m => ({ role: m.role, content: m.content }))]
+            : toKeep.map(m => ({ role: m.role, content: m.content }));
           try {
             const retryResult = openrouter.callModel({
               model: currentModel,
               instructions: minInstructions,
-              input: trimmedInput,
+              input: compactedInput,
               tools: schemaTools,
               maxOutputTokens: resolvedMaxOutputTokens,
               temperature: config.temperature,
@@ -1434,7 +1439,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
             lastError = null;
             break;
           } catch (retryErr) {
-            log(`Context overflow retry failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
+            log(`Context overflow retry after compaction failed: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`);
             throw retryErr;
           }
         }
