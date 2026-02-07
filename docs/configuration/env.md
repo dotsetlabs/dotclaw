@@ -21,6 +21,7 @@ The `.env` file must be placed at `~/.dotclaw/.env` (or `$DOTCLAW_HOME/.env` if 
 - `BRAVE_SEARCH_API_KEY` (enables WebSearch)
 - `TZ` (override host timezone; affects scheduler timing and agent timestamp interpretation)
 - `DOTCLAW_HOME` (override config/data directory, default: `~/.dotclaw`)
+- `DOTCLAW_VISION_MODEL` (model for the `AnalyzeImage` tool, default: `openai/gpt-4o`)
 
 ## Example
 

@@ -88,7 +88,10 @@ title: Runtime Config
 | `cpus` | `""` | Docker CPU limit (e.g. `"2"`) |
 | `readOnlyRoot` | `false` | Read-only root filesystem |
 | `tmpfsSize` | `"64m"` | tmpfs size when using read-only root |
+| `runUid` | auto | UID for container process (defaults to host user's UID) |
+| `runGid` | auto | GID for container process (defaults to host user's GID) |
 | `instanceId` | `""` | Namespace for daemon container names (multi-instance) |
+| `daemonHeartbeatIntervalMs` | `1000` | How often the daemon container writes heartbeat files |
 
 ### `host.container.daemon`
 
@@ -177,6 +180,12 @@ title: Runtime Config
 | `vacuumEnabled` | `true` | Run SQLite VACUUM periodically |
 | `vacuumIntervalDays` | `7` | Days between VACUUM runs |
 | `analyzeEnabled` | `true` | Run SQLite ANALYZE periodically |
+
+#### `host.memory` (other)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `personalizationCacheMs` | `300000` (5m) | TTL for cached per-user personalization data |
 
 ### `host.voice`
 
@@ -286,7 +295,29 @@ Optional HTTP endpoint for programmatic agent invocation.
 | `port` | `3003` | Webhook server port |
 | `token` | `""` | Bearer token for authentication (required when enabled) |
 
-When enabled, POST to `http://localhost:<port>/webhook/<groupFolder>` with a JSON body containing a `message` field. Include the token as `Authorization: Bearer <token>`.
+When enabled, POST to `http://localhost:<port>/webhook/<groupFolder>` with a JSON body. Include the token as `Authorization: Bearer <token>`.
+
+Request body:
+
+```json
+{
+  "message": "Your prompt text (required)",
+  "userId": "optional-user-id",
+  "metadata": { "key": "optional metadata" }
+}
+```
+
+Response:
+
+```json
+{
+  "status": "success",
+  "result": "Agent's response text",
+  "model": "moonshotai/kimi-k2.5"
+}
+```
+
+A health check endpoint is available at `GET /webhook/health`.
 
 ---
 
@@ -388,6 +419,12 @@ Sub-models used for auxiliary tasks:
 | `maxBytes` | `300000` | Maximum response size |
 | `timeoutMs` | `20000` | Fetch timeout |
 
+#### `agent.tools.websearch`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timeoutMs` | `20000` | Web search timeout |
+
 #### `agent.tools.bash`
 
 | Setting | Default | Description |
@@ -403,12 +440,23 @@ Sub-models used for auxiliary tasks:
 | `maxBytes` | `800000` | Maximum plugin output size |
 | `httpTimeoutMs` | `20000` | HTTP plugin timeout |
 
+#### `agent.tools.progress`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Send progress notifications during long tool operations |
+| `minIntervalMs` | `15000` | Minimum interval between progress notifications |
+| `notifyTools` | `["Bash", "WebFetch", "Browser"]` | Tools that trigger progress notifications |
+| `notifyOnStart` | `false` | Notify when a tool call starts |
+| `notifyOnError` | `true` | Notify when a tool call errors |
+
 #### `agent.tools.toolSummary`
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Summarize large tool outputs |
 | `maxBytes` | `60000` | Threshold for summarization |
+| `maxOutputTokens` | `1024` | Maximum tokens for the summarized output |
 | `tools` | `["WebFetch"]` | Tools eligible for summarization |
 
 ### `agent.promptPacks`
@@ -508,4 +556,12 @@ Each server entry:
 
 Supported events: `message:received`, `message:processing`, `message:responded`, `agent:start`, `agent:complete`, `task:fired`, `task:completed`, `memory:upserted`.
 
-Blocking hooks receive JSON on stdin and can return `{"cancel": true}` to abort the operation.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `hooks.enabled` | `true` | Enable lifecycle hooks |
+| `hooks.maxConcurrent` | `4` | Maximum concurrent hook executions. Additional hooks are silently dropped when the limit is reached. |
+| `hooks.defaultTimeoutMs` | `5000` | Default timeout for hook scripts |
+
+Hook scripts receive the event payload as JSON on stdin. The `DOTCLAW_HOOK_EVENT` environment variable is set to the event name (e.g., `message:received`).
+
+Blocking hooks can return `{"cancel": true}` on stdout to abort the operation. Non-blocking hooks run as fire-and-forget.

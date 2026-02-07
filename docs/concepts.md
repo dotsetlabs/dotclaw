@@ -53,7 +53,7 @@ DotClaw supports incoming voice messages and text-to-speech output. Voice messag
 
 ## Browser automation
 
-Containers include Chromium for browser automation via the `agent-browser` tool. The agent can navigate pages, take screenshots, fill forms, and extract data. Enable/disable via `agent.browser.enabled` in runtime config.
+Containers include Chromium for browser automation via the `Browser` tool. The agent can navigate pages, take screenshots, fill forms, extract data, and run JavaScript. Enable/disable via `agent.browser.enabled` in runtime config.
 
 ## MCP servers
 
@@ -82,3 +82,28 @@ When `host.messageQueue.interruptOnNewMessage` is enabled (default), sending a n
 ## Canceling requests
 
 If a request is taking too long, you can send `cancel`, `stop`, or `abort` in the same chat to cancel the active foreground run.
+
+## Rate limiting
+
+DotClaw enforces a per-user rate limit of 20 messages per 60-second window. If a user exceeds this limit, their messages are silently dropped until the window resets. This prevents runaway message floods from overwhelming the agent pipeline.
+
+## Sub-agents
+
+The agent can spawn sub-agents that run in parallel using the `mcp__dotclaw__subagent` tool. Sub-agents get their own tool budgets and can use a different model. This is useful for parallel research, long-running computations, or tasks that benefit from a specialized model. The parent agent can check status and retrieve results asynchronously.
+
+## Context overflow handling
+
+When conversation history approaches the model's context window limit, DotClaw applies several strategies:
+
+1. **Context pruning**: Old assistant messages over 4K characters are soft-trimmed (keeping the first 1500 and last 1500 characters)
+2. **History turn limit**: Only the most recent 40 user turns (~80 messages) are included
+3. **Context compaction**: When older messages exceed the token budget, they are summarized into a compact representation using a summary model. For very long histories, multi-part compaction splits and summarizes in segments.
+4. **Emergency compaction**: If a context overflow occurs at API call time, older messages are summarized on the fly instead of being dropped
+
+## Model cooldowns
+
+When a model returns a rate limit (429) or server error (5xx/timeout), it enters a cooldown period (60s for rate limits, 300s for server errors). During cooldown, the model is skipped in the fallback chain unless it's the last resort. This prevents hammering an overloaded endpoint.
+
+## Task-type routing
+
+Per-user and per-group model selection can include keyword-based routing rules. When a message contains keywords matching a routing rule, the agent automatically uses the rule's specified model. Rules are checked in priority order. See [Model Selection](/configuration/model) for details.

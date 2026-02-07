@@ -57,10 +57,43 @@ Enable embeddings in `~/.dotclaw/config/runtime.json`:
 
 The embedding worker runs in the background and processes new memory items asynchronously.
 
+## Memory taxonomy
+
+Each memory item has structured metadata:
+
+**Scope** — who the memory belongs to:
+- `user` — Specific to one user (requires `subject_id`)
+- `group` — Shared within a group
+- `global` — Available across all groups
+
+**Type** — what the memory represents:
+- `identity` — Who someone is
+- `preference` — User preferences and settings
+- `fact` — Factual information
+- `relationship` — Connections between entities
+- `project` — Project context and details
+- `task` — Task-related information
+- `note` — General notes
+- `archive` — Archived/historical data
+
+**Kind** (optional) — how the memory is structured:
+- `semantic` — Factual knowledge
+- `episodic` — Event-based (what happened)
+- `procedural` — How-to knowledge
+- `preference` — User preferences
+
+**Other fields:**
+- `conflict_key` — When set, upserts update existing items with the same key instead of creating duplicates
+- `importance` (0-1) — Controls recall priority
+- `ttl_days` — Auto-expire after the specified number of days
+- `target_group` — Store in a different group's memory
+
+See [Tools: Memory item fields](/configuration/tools#memory-item-fields) for the full field reference.
+
 ## Per-group isolation
 
 Memory items are tagged with their source group. Each group's agent only sees memory from:
 - Its own group
-- Memory explicitly shared across groups
+- Memory explicitly shared across groups (global scope)
 
 This maintains privacy boundaries between different chats.
