@@ -315,7 +315,7 @@ These are fallback defaults. When model capabilities are available (fetched from
 |---------|---------|-------------|
 | `maxContextTokens` | `128000` | Maximum context window tokens (auto-derived from model capabilities) |
 | `compactionTriggerTokens` | `120000` | Token count that triggers context compaction (auto-derived) |
-| `recentContextTokens` | `8000` | Tokens reserved for recent messages |
+| `recentContextTokens` | `0` (auto) | Tokens reserved for recent conversation history. `0` = auto (60% of the model's context window, e.g. ~77K on a 128K model). Set an explicit value to override. |
 | `summaryUpdateEveryMessages` | `20` | Messages between summary updates |
 | `maxOutputTokens` | `8192` | Default max output tokens |
 | `summaryMaxOutputTokens` | `2048` | Max tokens for summary generation |
@@ -325,13 +325,13 @@ These are fallback defaults. When model capabilities are available (fetched from
 | `contextPruning.softTrimMaxChars` | `4000` | Maximum characters before soft-trimming old assistant messages |
 | `contextPruning.softTrimHeadChars` | `1500` | Characters to keep from the start when trimming |
 | `contextPruning.softTrimTailChars` | `1500` | Characters to keep from the end when trimming |
-| `contextPruning.keepLastAssistant` | `3` | Number of recent assistant messages to protect from trimming |
+| `contextPruning.keepLastAssistant` | `10` | Number of recent assistant messages to protect from trimming |
 
 ### `agent.memory`
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `maxResults` | `6` | Maximum memory items per recall |
+| `maxResults` | `4` | Maximum memory items per recall |
 | `maxTokens` | `2000` | Maximum tokens for recalled memory |
 | `archiveSync` | `true` | Sync memories to archive files |
 | `extractScheduled` | `false` | Extract memories from scheduled task runs |

@@ -44,6 +44,18 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp | string; message: string }> = [
   { pattern: /Invalid JSON in container output/i, message: "I ran into a technical error while processing. Please try again." },
   { pattern: /stdout truncated/i, message: "The response was too large to deliver. Try asking for a smaller piece." },
   { pattern: /Container output missing/i, message: "I ran into a technical error while processing. Please try again." },
+  { pattern: /container.?spawn/i, message: "I had trouble starting up. Please try again in a moment." },
+  { pattern: /sentinel.?markers/i, message: "I ran into a technical error while processing. Please try again." },
+  { pattern: /daemon.?response/i, message: "I had trouble processing that. Please try again." },
+  { pattern: /Agent run preempted/i, message: "My previous task was interrupted. Please try again." },
+
+  // SDK / API parsing errors
+  { pattern: /getResponse.*failed/i, message: "The AI service returned an unexpected response. Please try again." },
+  { pattern: /Failed to parse/i, message: "I ran into a technical error. Please try again." },
+  { pattern: /invalid.?request/i, message: "There was an issue with the request format. Please try again." },
+  { pattern: /ENOENT/i, message: "A required file or service wasn't found. Please contact the admin." },
+  { pattern: /EACCES|EPERM/i, message: "There's a permission issue. Please contact the admin." },
+  { pattern: /ENOMEM/i, message: "The system ran out of memory. Please try again with a simpler request." },
 
   // Tool errors
   { pattern: /tool.?call.?limit/i, message: "I hit my limit for operations. Please narrow the scope or ask for a specific subtask." },
@@ -82,8 +94,8 @@ export function humanizeError(error: Error | string): string {
     }
   }
 
-  // Default message
-  return "Something went wrong. I'll try to help anyway!";
+  // Default message — include a hint to retry
+  return "I ran into an unexpected error. Please try sending your message again.";
 }
 
 /**
@@ -99,9 +111,15 @@ export function isTransientError(error: Error | string): boolean {
     /rate.?limit/i,
     /429/i,
     /overloaded/i,
-    /502/i,
-    /503/i,
-    /504/i
+    /\b502\b/,
+    /\b503\b/,
+    /\b504\b/,
+    /timeout|timed out|deadline/i,
+    /getResponse.*failed/i,
+    /model.?not.?available|no endpoints|provider error/i,
+    /All models failed/i,
+    /container.?spawn/i,
+    /daemon.?response.*timeout/i
   ];
 
   for (const pattern of transientPatterns) {
