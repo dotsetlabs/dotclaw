@@ -105,6 +105,23 @@ function buildScheduledSection(params: SystemPromptParams): string {
   return `You are running as a scheduled task${params.taskId ? ` (task id: ${params.taskId})` : ''}. If you need to communicate, use \`mcp__dotclaw__send_message\`.`;
 }
 
+function buildResponseGuidanceSection(): string {
+  return [
+    '- Always answer the user\'s question directly before reaching for tools.',
+    '- If the user asks about your previous actions (e.g., "did you use X tool?"), reflect on the conversation history — do not re-execute the task.',
+    '- If the user asks a simple factual question, answer from your knowledge — do not call tools unless you need to verify or act.',
+    '- When you have genuinely nothing to say, respond with ONLY: NO_REPLY (your entire message must be just this token, nothing else).'
+  ].join('\n');
+}
+
+function buildToolCallStyleSection(): string {
+  return [
+    'Default: do not narrate routine, low-risk tool calls — just call the tool.',
+    'Narrate only when it helps: multi-step work, complex/challenging problems, sensitive actions, or when the user explicitly asks.',
+    'Keep narration brief and value-dense; avoid repeating obvious steps.'
+  ].join('\n');
+}
+
 function buildToolGuidanceSection(params: SystemPromptParams): string {
   const lines = [
     'Key tool rules:',
@@ -144,6 +161,7 @@ function buildMemorySection(params: SystemPromptParams): string {
     params.longTermRecall.length > 0 || params.userProfile;
 
   if (hasAny) {
+    parts.push('The following memories may or may not be relevant to the current conversation. Use them only if they directly answer the user\'s question.');
     if (params.memorySummary) {
       parts.push('Long-term memory summary:');
       parts.push(params.memorySummary.slice(0, MEMORY_SUMMARY_MAX_CHARS));
@@ -271,16 +289,18 @@ export function buildSystemPrompt(params: SystemPromptParams): string {
     buildIdentitySection(params),
     buildPlatformSection(params),
     buildScheduledSection(params),
+    section('Response Guidelines', buildResponseGuidanceSection()),
     section('Tools', buildToolGuidanceSection(params)),
+    section('Tool Call Style', buildToolCallStyleSection()),
     groupNotes,
     globalNotes,
     skillNotes,
     timezoneNote,
     ...packBlocks,
-    section('Memory', buildMemorySection(params)),
     availableGroups ? section('Available Groups', availableGroups) : '',
     toolReliability ? section('Tool Reliability', toolReliability) : '',
     buildBehaviorSection(params) ? section('Behavior', buildBehaviorSection(params)) : '',
+    section('Memory', buildMemorySection(params)),
     params.maxToolSteps
       ? `You have a budget of ${params.maxToolSteps} tool steps per request. If a task is large, break your work into phases and always finish with a text summary of what you accomplished — never end on a tool call without a response.`
       : '',

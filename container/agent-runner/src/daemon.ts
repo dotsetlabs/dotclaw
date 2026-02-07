@@ -204,11 +204,8 @@ async function processRequests(): Promise<void> {
       if (!output) {
         throw new Error('Agent worker returned no output');
       }
-      if (fs.existsSync(cancelFile)) {
-        try { fs.unlinkSync(cancelFile); } catch { /* already removed */ }
-        try { fs.unlinkSync(filePath); } catch { /* request file already removed */ }
-        continue;
-      }
+      // Response completed successfully — always write it.
+      // Cancel during execution is already handled by runRequestWithCancellation().
       const responsePath = path.join(RESPONSES_DIR, `${requestId}.json`);
       const tmpPath = responsePath + '.tmp';
       fs.writeFileSync(tmpPath, JSON.stringify(output));

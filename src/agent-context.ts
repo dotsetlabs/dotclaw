@@ -115,7 +115,8 @@ export async function buildAgentContext(params: {
       userId: params.userId ?? null,
       query: params.recallQuery,
       maxResults: params.recallMaxResults,
-      maxTokens: dynamicMemoryBudget
+      maxTokens: dynamicMemoryBudget,
+      minScore: runtime.host.memory.recall.minScore
     });
     memoryRecallMs = Date.now() - recallStart;
   }

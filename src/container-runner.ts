@@ -470,6 +470,17 @@ export function checkDaemonHealth(groupFolder: string): DaemonHealthResult {
 
     if (status && status.state === 'processing' && status.started_at) {
       const processingMs = Date.now() - status.started_at;
+      // Only consider dead if processing exceeds container timeout + grace period.
+      // This prevents killing a container that just finished a long request.
+      if (processingMs > CONTAINER_TIMEOUT + daemonConfig.gracePeriodMs) {
+        return {
+          state: 'dead',
+          lastHeartbeat,
+          ageMs,
+          daemonState: 'processing',
+          processingMs,
+        };
+      }
       return {
         state: 'busy',
         lastHeartbeat,
@@ -530,7 +541,7 @@ export function restartDaemonContainer(group: RegisteredGroup, isMain: boolean):
 // Track daemon health check state
 let healthCheckInterval: NodeJS.Timeout | null = null;
 const unhealthyDaemons = new Map<string, number>(); // Track consecutive dead checks
-const daemonRestartTimestamps = new Map<string, number[]>(); // Track restart timestamps for crash loop detection
+const healthCheckRestartTimestamps = new Map<string, number[]>(); // Track health-check-triggered restarts for crash loop detection
 const CRASH_LOOP_MAX_RESTARTS = 3;
 const CRASH_LOOP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -544,7 +555,7 @@ export function suppressHealthChecks(durationMs: number): void {
 
 export function resetUnhealthyDaemons(): void {
   unhealthyDaemons.clear();
-  daemonRestartTimestamps.clear();
+  healthCheckRestartTimestamps.clear();
 }
 
 /**
@@ -611,7 +622,7 @@ export function performDaemonHealthChecks(
       // Restart after 2 consecutive dead checks, unless in a crash loop
       if (consecutiveFailures >= 2) {
         const now = Date.now();
-        const restarts = (daemonRestartTimestamps.get(group.folder) || [])
+        const restarts = (healthCheckRestartTimestamps.get(group.folder) || [])
           .filter(ts => now - ts < CRASH_LOOP_WINDOW_MS);
 
         if (restarts.length >= CRASH_LOOP_MAX_RESTARTS) {
@@ -623,7 +634,7 @@ export function performDaemonHealthChecks(
           unhealthyDaemons.delete(group.folder);
         } else {
           restarts.push(now);
-          daemonRestartTimestamps.set(group.folder, restarts);
+          healthCheckRestartTimestamps.set(group.folder, restarts);
           logger.info({ groupFolder: group.folder }, 'Restarting dead daemon');
           gracefulRestartDaemonContainer(group, group.folder === mainGroupFolder);
           unhealthyDaemons.delete(group.folder);
@@ -721,11 +732,29 @@ async function waitForAgentResponse(
         }
         throw readErr;
       }
-      fs.unlinkSync(responsePath);
       try {
-        return JSON.parse(raw) as ContainerOutput;
-      } catch (err) {
-        throw new Error(`Failed to parse daemon response: ${err instanceof Error ? err.message : String(err)}`);
+        const parsed = JSON.parse(raw) as ContainerOutput;
+        fs.unlinkSync(responsePath);
+        return parsed;
+      } catch (parseErr) {
+        // Partial read during atomic rename can produce invalid JSON — retry up to 3 times
+        let retryParsed: ContainerOutput | null = null;
+        for (let parseRetry = 0; parseRetry < 3; parseRetry++) {
+          await new Promise(resolve => setTimeout(resolve, CONTAINER_DAEMON_POLL_MS));
+          try {
+            const retryRaw = fs.readFileSync(responsePath, 'utf-8');
+            retryParsed = JSON.parse(retryRaw) as ContainerOutput;
+            break;
+          } catch {
+            // continue retrying
+          }
+        }
+        if (retryParsed) {
+          try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
+          return retryParsed;
+        }
+        try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
+        throw new Error(`Failed to parse daemon response: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
       }
     }
     await new Promise(resolve => setTimeout(resolve, CONTAINER_DAEMON_POLL_MS));

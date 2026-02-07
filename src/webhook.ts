@@ -18,11 +18,24 @@ export interface WebhookDeps {
 }
 
 let server: http.Server | null = null;
+let shuttingDown = false;
+
+const MAX_BODY_SIZE = 1 * 1024 * 1024; // 1MB
+const SAFE_GROUP_FOLDER_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 function parseBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+    let byteLength = 0;
+    req.on('data', (chunk: Buffer) => {
+      byteLength += chunk.length;
+      if (byteLength > MAX_BODY_SIZE) {
+        req.destroy();
+        reject(new Error('Body too large'));
+        return;
+      }
+      data += chunk.toString();
+    });
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
@@ -38,6 +51,12 @@ export function startWebhookServer(config: WebhookConfig, deps: WebhookDeps): vo
   const bind = runtime.host.bind;
 
   server = http.createServer(async (req, res) => {
+    if (shuttingDown) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Server is shutting down' }));
+      return;
+    }
+
     const url = req.url || '/';
 
     // Health check
@@ -62,10 +81,15 @@ export function startWebhookServer(config: WebhookConfig, deps: WebhookDeps): vo
       return;
     }
 
-    const groupFolder = url.replace('/webhook/', '').replace(/\/$/, '');
+    const groupFolder = decodeURIComponent(url.replace('/webhook/', '').replace(/\/$/, ''));
     if (!groupFolder) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing group folder in URL' }));
+      return;
+    }
+    if (!SAFE_GROUP_FOLDER_RE.test(groupFolder)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid group folder name' }));
       return;
     }
 
@@ -82,9 +106,12 @@ export function startWebhookServer(config: WebhookConfig, deps: WebhookDeps): vo
     try {
       const raw = await parseBody(req);
       body = JSON.parse(raw);
-    } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+    } catch (parseErr) {
+      const isBodyTooLarge = parseErr instanceof Error && parseErr.message === 'Body too large';
+      const statusCode = isBodyTooLarge ? 413 : 400;
+      const errorMsg = isBodyTooLarge ? 'Request body too large' : 'Invalid JSON body';
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: errorMsg }));
       return;
     }
 
@@ -165,6 +192,7 @@ function port(p: number): number {
 }
 
 export function stopWebhookServer(): void {
+  shuttingDown = true;
   if (server) {
     server.close();
     server = null;

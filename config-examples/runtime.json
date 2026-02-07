@@ -15,6 +15,9 @@
       "port": 3002
     },
     "memory": {
+      "recall": {
+        "minScore": 0.35
+      },
       "embeddings": {
         "enabled": true
       }
@@ -25,7 +28,7 @@
       "allowedModels": [],
       "maxOutputTokens": 0,
       "maxToolSteps": 200,
-      "temperature": 0.2,
+      "temperature": 0.6,
       "recallMaxResults": 8,
       "recallMaxTokens": 1500
     },
@@ -52,7 +55,16 @@
   },
   "agent": {
     "assistantName": "Rain",
-    "reasoning": { "effort": "low" },
+    "reasoning": { "effort": "medium" },
+    "context": {
+      "maxHistoryTurns": 40,
+      "contextPruning": {
+        "softTrimMaxChars": 4000,
+        "softTrimHeadChars": 1500,
+        "softTrimTailChars": 1500,
+        "keepLastAssistant": 3
+      }
+    },
     "promptPacks": {
       "enabled": true
     },

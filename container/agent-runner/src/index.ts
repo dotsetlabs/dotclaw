@@ -6,8 +6,8 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { OpenRouter, stepCountIs } from '@openrouter/sdk';
-import { createTools, discoverMcpTools, ToolCallRecord } from './tools.js';
+import { OpenRouter } from '@openrouter/sdk';
+import { createTools, discoverMcpTools, ToolCallRecord, type ToolResultRecord } from './tools.js';
 import { createIpcHandlers } from './ipc.js';
 import { loadAgentConfig } from './agent-config.js';
 import { OUTPUT_START_MARKER, OUTPUT_END_MARKER, type ContainerInput, type ContainerOutput } from './container-protocol.js';
@@ -26,6 +26,8 @@ import {
   saveMemoryState,
   writeHistory,
   estimateTokens,
+  pruneContextMessages,
+  limitHistoryTurns,
   MemoryConfig,
   Message
 } from './memory.js';
@@ -168,6 +170,34 @@ async function getResponseText(result: OpenRouterResult, context: string): Promi
   return { text: '' };
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractTextFromApiResponse(response: any): string {
+  if (response?.outputText) return response.outputText;
+  for (const item of response?.output || []) {
+    if (item?.type === 'message') {
+      for (const part of item.content || []) {
+        if (part?.type === 'output_text' && part.text) return part.text;
+      }
+    }
+  }
+  return '';
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractFunctionCalls(response: any): Array<{ id: string; name: string; arguments: any }> {
+  const calls: Array<{ id: string; name: string; arguments: unknown }> = [];
+  for (const item of response?.output || []) {
+    if (item?.type === 'function_call') {
+      let args = item.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { /* keep as string */ }
+      }
+      calls.push({ id: item.callId, name: item.name, arguments: args });
+    }
+  }
+  return calls;
+}
+
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
@@ -290,14 +320,15 @@ function resolveModelLimits(
   // Context: use model capability, fall back to config
   const contextLength = caps?.context_length || configDefaults.maxContextTokens;
 
-  // Output tokens: explicit override > model capability > undefined (let SDK decide)
+  // Output tokens: only set when explicitly configured by user.
+  // DO NOT use caps.max_completion_tokens — for reasoning models, maxOutputTokens covers
+  // both reasoning tokens AND visible text. Setting it to the model's max causes the model
+  // to allocate the entire budget to reasoning with 0 left for visible output.
   let maxOutputTokens: number | undefined;
   if (input.modelMaxOutputTokens && Number.isFinite(input.modelMaxOutputTokens)) {
     maxOutputTokens = input.modelMaxOutputTokens;  // Explicit cost-control override
-  } else if (caps?.max_completion_tokens) {
-    maxOutputTokens = caps.max_completion_tokens;   // Model's actual limit
   }
-  // else: undefined — omit from callModel(), let OpenRouter SDK decide
+  // else: undefined — omit from callModel(), let the API decide token budgeting
 
   // Derive other limits from context length
   const outputReserve = maxOutputTokens || Math.floor(contextLength * 0.25);
@@ -691,6 +722,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
   const { ctx: sessionCtx, isNew } = createSessionContext(SESSION_ROOT, input.sessionId);
   const toolCalls: ToolCallRecord[] = [];
+  const toolOutputs: ToolResultRecord[] = [];
   let memoryItemsUpserted = 0;
   let memoryItemsExtracted = 0;
   const timings: { memory_extraction_ms?: number; tool_ms?: number } = {};
@@ -706,6 +738,9 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   }, agent, {
     onToolCall: (call) => {
       toolCalls.push(call);
+    },
+    onToolResult: (record) => {
+      toolOutputs.push(record);
     },
     policy: input.toolPolicy
   });
@@ -737,6 +772,27 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       }
     } catch (err) {
       log(`MCP discovery failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Build schema-only tools (no execute functions) for SDK — prevents the SDK from
+  // auto-executing tools in its internal loop, which drops conversation context in
+  // follow-up API calls (makeFollowupRequest only sends model output + tool results,
+  // losing the original user messages). We run the tool loop ourselves instead.
+  const schemaTools = tools.map(t => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any
+    const { execute, ...rest } = t.function as any;
+    return { type: t.type, function: rest };
+  }) as typeof tools;
+
+  // Map tool names → original execute functions (with policy/callback wrappers intact)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const toolExecutors = new Map<string, (args: any) => Promise<any>>();
+  for (const t of tools) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const fn = (t.function as any).execute;
+    if (typeof fn === 'function') {
+      toolExecutors.set(t.function.name, fn);
     }
   }
 
@@ -785,6 +841,10 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
 
   appendHistory(sessionCtx, 'user', prompt);
   let history = loadHistory(sessionCtx);
+
+  if (agent.context.maxHistoryTurns > 0) {
+    history = limitHistoryTurns(history, agent.context.maxHistoryTurns);
+  }
 
   const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
   const adjustedRecentTokens = Math.max(1000, Math.floor(config.recentContextTokens * tokenRatio));
@@ -999,6 +1059,7 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     const resolvedAdjusted = Math.max(1000, Math.floor(resolvedMaxContext * tokenRatio));
     let { recentMessages: contextMessages } = splitRecentHistory(recentMessages, resolvedAdjusted, 6);
     contextMessages = clampContextMessages(contextMessages, tokenEstimate.tokensPerChar, resolvedMaxContextMessageTokens);
+    contextMessages = pruneContextMessages(contextMessages, agent.context.contextPruning);
     return {
       instructions: resolvedInstructions,
       instructionsTokens: resolvedInstructionTokens,
@@ -1059,56 +1120,161 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
       try {
         log(`Starting OpenRouter call (${currentModel})...`);
         const startedAt = Date.now();
-        const result = openrouter.callModel({
+        // ── Custom tool execution loop ──────────────────────────────────
+        // The SDK's built-in tool loop (executeToolsIfNeeded) drops conversation
+        // context in follow-up API calls — it only sends [function_calls, function_call_outputs]
+        // without the original user messages or previousResponseId. This causes models to
+        // produce empty text after tools that return minimal results (e.g. sequential-thinking).
+        // We use schema-only tools (no execute functions) so the SDK returns tool calls
+        // without auto-executing, then run the loop ourselves with full context.
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let conversationInput: any[] = [...contextInput];
+        let step = 0;
+        let streamSeq = 0;
+
+        // Helper to write a stream chunk
+        const writeStreamChunk = (text: string) => {
+          if (!input.streamDir) return;
+          streamSeq++;
+          const chunkFile = path.join(input.streamDir, `chunk_${String(streamSeq).padStart(6, '0')}.txt`);
+          const tmpFile = chunkFile + '.tmp';
+          try {
+            fs.writeFileSync(tmpFile, text);
+            fs.renameSync(tmpFile, chunkFile);
+          } catch (writeErr) {
+            log(`Stream write error at seq ${streamSeq}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+          }
+        };
+
+        // Helper to finalize streaming
+        const finalizeStream = () => {
+          if (!input.streamDir) return;
+          try {
+            if (!fs.existsSync(path.join(input.streamDir, 'done'))) {
+              fs.writeFileSync(path.join(input.streamDir, 'done'), '');
+            }
+          } catch { /* ignore */ }
+        };
+
+        // Initial call — uses streaming for real-time delivery
+        const initialResult = openrouter.callModel({
           model: currentModel,
           instructions: resolvedInstructions,
-          input: contextInput,
-          tools,
-          stopWhen: stepCountIs(maxToolSteps),
+          input: conversationInput,
+          tools: schemaTools,
           maxOutputTokens: resolvedMaxOutputTokens,
           temperature: config.temperature,
           reasoning: resolvedReasoning
         });
 
-        // Stream text chunks to IPC if streamDir is provided
+        // Stream text from initial response
         if (input.streamDir) {
-          let seq = 0;
           try {
             fs.mkdirSync(input.streamDir, { recursive: true });
-            for await (const delta of result.getTextStream()) {
-              seq++;
-              const chunkFile = path.join(input.streamDir, `chunk_${String(seq).padStart(6, '0')}.txt`);
-              const tmpFile = chunkFile + '.tmp';
-              fs.writeFileSync(tmpFile, delta);
-              fs.renameSync(tmpFile, chunkFile);
+            for await (const delta of initialResult.getTextStream()) {
+              writeStreamChunk(delta);
             }
-            fs.writeFileSync(path.join(input.streamDir, 'done'), '');
           } catch (streamErr) {
             log(`Stream error: ${streamErr instanceof Error ? streamErr.message : String(streamErr)}`);
             try { fs.writeFileSync(path.join(input.streamDir, 'error'), streamErr instanceof Error ? streamErr.message : String(streamErr)); } catch { /* ignore */ }
           }
         }
 
+        // Get initial response (no auto-execution since schemaTools have no execute fns)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let lastResponse: any;
+        try {
+          lastResponse = await initialResult.getResponse();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log(`Initial getResponse failed: ${message}`);
+          finalizeStream();
+          throw err;
+        }
+
+        responseText = extractTextFromApiResponse(lastResponse);
+        let pendingCalls = extractFunctionCalls(lastResponse);
+
+        // Tool execution loop — execute tools ourselves, include full context in follow-ups
+        while (pendingCalls.length > 0 && step < maxToolSteps) {
+          log(`Step ${step}: executing ${pendingCalls.length} tool call(s): ${pendingCalls.map(c => c.name).join(', ')}`);
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const toolResults: any[] = [];
+          for (const fc of pendingCalls) {
+            const executor = toolExecutors.get(fc.name);
+            if (!executor) {
+              log(`Unknown tool: ${fc.name}`);
+              toolResults.push({
+                type: 'function_call_output',
+                callId: fc.id,
+                output: JSON.stringify({ error: `Unknown tool: ${fc.name}` })
+              });
+              step++;
+              continue;
+            }
+
+            try {
+              // Calling the wrapped execute fires onToolCall/onToolResult callbacks
+              const result = await executor(fc.arguments);
+              toolResults.push({
+                type: 'function_call_output',
+                callId: fc.id,
+                output: JSON.stringify(result)
+              });
+            } catch (err) {
+              const error = err instanceof Error ? err.message : String(err);
+              toolResults.push({
+                type: 'function_call_output',
+                callId: fc.id,
+                output: JSON.stringify({ error })
+              });
+            }
+            step++;
+          }
+
+          // Build follow-up input with FULL conversation context:
+          // original messages + model output + tool results (accumulated each round)
+          conversationInput = [...conversationInput, ...lastResponse.output, ...toolResults];
+
+          // Follow-up call with complete context — model sees the full conversation
+          const followupResult = openrouter.callModel({
+            model: currentModel,
+            instructions: resolvedInstructions,
+            input: conversationInput,
+            tools: schemaTools,
+            maxOutputTokens: resolvedMaxOutputTokens,
+            temperature: config.temperature,
+            reasoning: resolvedReasoning
+          });
+
+          try {
+            lastResponse = await followupResult.getResponse();
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            log(`Follow-up getResponse failed at step ${step}: ${message}`);
+            break;
+          }
+
+          const followupText = extractTextFromApiResponse(lastResponse);
+          if (followupText) {
+            responseText = followupText;
+            writeStreamChunk(followupText);
+          }
+
+          pendingCalls = extractFunctionCalls(lastResponse);
+        }
+
+        finalizeStream();
         latencyMs = Date.now() - startedAt;
 
-        const completionResult = await getResponseText(result, 'completion');
-        responseText = completionResult.text;
-
-        const toolCallsFromModel = await result.getToolCalls();
-        if (toolCallsFromModel.length > 0) {
-          log(`Model made ${toolCallsFromModel.length} tool call(s): ${toolCallsFromModel.map(t => t.name).join(', ')}`);
-        }
-        if (!responseText || !responseText.trim()) {
-          if (completionResult.error) {
-            log(`Tool execution failed: ${completionResult.error}`);
-            responseText = `Something went wrong while processing your request: ${completionResult.error}. Please try again.`;
-          } else if (toolCallsFromModel.length > 0) {
-            responseText = 'I started running tool calls but did not get a final response. If you want me to continue, please ask a narrower subtask or say "continue".';
-          } else {
-            log(`Warning: Model returned empty/whitespace response. tool calls: ${toolCallsFromModel.length}`);
-          }
+        if (responseText && responseText.trim()) {
+          log(`Model returned text response (${responseText.length} chars, ${step} tool steps)`);
+        } else if (toolCalls.length > 0) {
+          log(`Warning: Model returned empty response after ${toolCalls.length} tool call(s) and ${step} steps`);
         } else {
-          log(`Model returned text response (${responseText.length} chars)`);
+          log(`Warning: Model returned empty/whitespace response`);
         }
 
         completionTokens = estimateTokensForModel(responseText || '', tokenEstimate.tokensPerChar);
@@ -1221,7 +1387,16 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
   if (memoryExtractionEnabled && isDaemon && (!input.isScheduledTask || memoryExtractScheduled)) {
     // Fire-and-forget in daemon mode; skip entirely in ephemeral mode
     void runMemoryExtraction().catch((err) => {
-      log(`Memory extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`Memory extraction failed: ${errMsg}`);
+      // Write error to IPC status file so host can detect the failure
+      try {
+        const statusPath = path.join(IPC_DIR, 'memory_extraction_error.json');
+        fs.writeFileSync(statusPath, JSON.stringify({
+          error: errMsg,
+          timestamp: new Date().toISOString(),
+        }));
+      } catch { /* best-effort status write */ }
     });
   }
 

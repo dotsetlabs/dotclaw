@@ -518,7 +518,7 @@ export function createIpcHandlers(ctx: IpcContext, config: IpcConfig) {
         label: args.label,
         maxToolSteps: args.maxToolSteps,
         timeoutMs: args.timeoutMs
-      }, config);
+      }, config, 120_000);
     },
 
     async subagentStatus(args: { subagentId?: string; action?: string }) {

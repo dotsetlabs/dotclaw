@@ -92,4 +92,6 @@ export interface ContainerOutput {
   replyToId?: string;
   /** Set by the host container-runner when stdout was truncated before parsing */
   stdoutTruncated?: boolean;
+  /** Error from fire-and-forget memory extraction in daemon mode */
+  memory_extraction_error?: string;
 }

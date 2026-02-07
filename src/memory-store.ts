@@ -282,7 +282,7 @@ export function closeMemoryStore(): void {
 function normalizeContent(content: string): string {
   return content
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/[^a-z0-9\s.,!?:]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -577,7 +577,10 @@ export function searchMemories(params: {
     return searchMemoriesFallback(params);
   }
   const ftsQuery = buildFtsQuery(params.query);
-  if (!ftsQuery) return [];
+  if (!ftsQuery) {
+    // FTS tokens stripped (e.g. "C++", "F#") — fall back to LIKE search
+    return searchMemoriesFallback(params);
+  }
 
   const now = new Date().toISOString();
   const limit = Math.min(params.limit || 12, 50);

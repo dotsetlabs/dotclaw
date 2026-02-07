@@ -139,6 +139,7 @@ export class TelegramProvider implements MessagingProvider {
   private connected = false;
   private botUsername = '';
   private botId: number | undefined;
+  private lastBotInfoRetryAt = 0;
 
   // Callback data store for inline buttons (5-minute TTL)
   private readonly callbackDataStore = new Map<string, { chatJid: string; data: string; label: string; createdAt: number }>();
@@ -621,6 +622,18 @@ export class TelegramProvider implements MessagingProvider {
   }
 
   isBotMentioned(message: IncomingMessage): boolean {
+    // Lazy retry: if botId is still undefined (startup failure), try once per 60s
+    if (!this.botId && Date.now() - this.lastBotInfoRetryAt > 60_000) {
+      this.lastBotInfoRetryAt = Date.now();
+      try {
+        // Fire-and-forget async retry — won't help for THIS call but will for the next
+        void this.bot.telegram.getMe().then(me => {
+          this.botUsername = me.username || '';
+          this.botId = me.id;
+          logger.info('Bot info recovered via lazy retry');
+        }).catch(() => undefined);
+      } catch { /* ignore */ }
+    }
     const raw = message.rawProviderData as {
       entities?: Array<{ offset: number; length: number; type: string; user?: { id: number } }>;
     } | undefined;

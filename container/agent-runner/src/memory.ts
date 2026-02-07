@@ -431,3 +431,50 @@ export function retrieveRelevantMemories(params: {
   }
   return results;
 }
+
+export interface ContextPruningConfig {
+  softTrimMaxChars: number;
+  softTrimHeadChars: number;
+  softTrimTailChars: number;
+  keepLastAssistant: number;
+}
+
+/**
+ * Soft-trim old assistant messages to prevent context bloat from tool output.
+ * Preserves the last `keepLastAssistant` assistant messages untouched.
+ * User messages are never trimmed.
+ */
+export function pruneContextMessages(
+  messages: Message[],
+  config: ContextPruningConfig
+): Message[] {
+  // Find indices of assistant messages to protect (last N)
+  const assistantIndices: number[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant') {
+      assistantIndices.push(i);
+      if (assistantIndices.length >= config.keepLastAssistant) break;
+    }
+  }
+  const protectedSet = new Set(assistantIndices);
+
+  return messages.map((msg, idx) => {
+    if (msg.role !== 'assistant') return msg;
+    if (protectedSet.has(idx)) return msg;
+    if (msg.content.length <= config.softTrimMaxChars) return msg;
+
+    const head = msg.content.slice(0, config.softTrimHeadChars);
+    const tail = msg.content.slice(-config.softTrimTailChars);
+    const trimmed = `${head}\n...\n[Content trimmed: kept first ${config.softTrimHeadChars} and last ${config.softTrimTailChars} of ${msg.content.length} chars]\n${tail}`;
+    return { ...msg, content: trimmed };
+  });
+}
+
+/**
+ * Limit conversation history to the last N messages.
+ * Preserves chronological order.
+ */
+export function limitHistoryTurns(messages: Message[], maxTurns: number): Message[] {
+  if (maxTurns <= 0 || messages.length <= maxTurns) return messages;
+  return messages.slice(-maxTurns);
+}

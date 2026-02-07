@@ -102,9 +102,11 @@ export async function buildHybridMemoryRecall(params: {
   query: string;
   maxResults?: number;
   maxTokens?: number;
+  minScore?: number;
 }): Promise<string[]> {
   const maxResults = params.maxResults || 8;
   const maxTokens = params.maxTokens || 1200;
+  const minScore = params.minScore ?? 0.35;
 
   const ftsResults = searchMemories({
     groupFolder: params.groupFolder,
@@ -136,6 +138,7 @@ export async function buildHybridMemoryRecall(params: {
   const accessedIds: string[] = [];
   let tokens = 0;
   for (const item of merged) {
+    if (item.score < minScore) continue;
     if (recall.length >= maxResults) break;
     const line = `(${item.type}) ${item.content}`;
     const estimate = estimateTokens(line);

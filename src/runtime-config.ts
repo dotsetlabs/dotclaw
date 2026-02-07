@@ -80,6 +80,7 @@ export type RuntimeConfig = {
       recall: {
         maxResults: number;
         maxTokens: number;
+        minScore: number;
       };
       embeddings: {
         enabled: boolean;
@@ -200,6 +201,13 @@ export type RuntimeConfig = {
       summaryMaxOutputTokens: number;
       temperature: number;
       maxContextMessageTokens: number;
+      maxHistoryTurns: number;
+      contextPruning: {
+        softTrimMaxChars: number;
+        softTrimHeadChars: number;
+        softTrimTailChars: number;
+        keepLastAssistant: number;
+      };
     };
     memory: {
       maxResults: number;
@@ -392,7 +400,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     memory: {
       recall: {
         maxResults: 8,
-        maxTokens: 1000
+        maxTokens: 1000,
+        minScore: 0.35
       },
       embeddings: {
         enabled: true,
@@ -465,7 +474,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       allowedModels: [],
       maxOutputTokens: 0,
       maxToolSteps: 200,
-      temperature: 0.2,
+      temperature: 0.6,
       recallMaxResults: 8,
       recallMaxTokens: 1500,
     },
@@ -509,10 +518,17 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       compactionTriggerTokens: 120_000,
       recentContextTokens: 8000,
       summaryUpdateEveryMessages: 20,
-      maxOutputTokens: 1024,
+      maxOutputTokens: 8192,
       summaryMaxOutputTokens: 2048,
-      temperature: 0.2,
-      maxContextMessageTokens: 4000
+      temperature: 0.6,
+      maxContextMessageTokens: 4000,
+      maxHistoryTurns: 40,
+      contextPruning: {
+        softTrimMaxChars: 4_000,
+        softTrimHeadChars: 1_500,
+        softTrimTailChars: 1_500,
+        keepLastAssistant: 3,
+      },
     },
     memory: {
       maxResults: 6,
@@ -596,7 +612,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       connectionTimeoutMs: 10_000
     },
     reasoning: {
-      effort: 'low',
+      effort: 'medium',
     },
     skills: {
       enabled: true,
@@ -659,6 +675,11 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   h.streaming.editIntervalMs = clampMin(h.streaming.editIntervalMs, 100, 'host.streaming.editIntervalMs');
   h.streaming.maxEditLength = clampMin(h.streaming.maxEditLength, 100, 'host.streaming.maxEditLength');
 
+  // Memory recall
+  if (typeof h.memory.recall.minScore === 'number') {
+    h.memory.recall.minScore = Math.min(1, Math.max(0, h.memory.recall.minScore));
+  }
+
   // Webhook
   h.webhook.port = clampMin(h.webhook.port, 1024, 'host.webhook.port');
   if (h.webhook.enabled && !h.webhook.token) {
@@ -682,6 +703,7 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
 
 let cachedConfig: RuntimeConfig | null = null;
 let cachedHome: string | null = null;
+let cachedMtime: number | null = null;
 
 function cloneConfig<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -700,18 +722,23 @@ function hasTelegramHandlerOverride(value: unknown): boolean {
   return typeof telegram.handlerTimeoutMs === 'number';
 }
 
-function mergeDefaults<T>(base: T, overrides: unknown): T {
+function mergeDefaults<T>(base: T, overrides: unknown, pathPrefix = ''): T {
   if (!isPlainObject(overrides)) return cloneConfig(base);
   const result = cloneConfig(base) as Record<string, unknown>;
   const baseObj = base as Record<string, unknown>;
   for (const [key, value] of Object.entries(overrides)) {
     const current = baseObj[key];
+    const fullPath = pathPrefix ? `${pathPrefix}.${key}` : key;
     if (isPlainObject(current) && isPlainObject(value)) {
-      result[key] = mergeDefaults(current, value);
+      result[key] = mergeDefaults(current, value, fullPath);
       continue;
     }
     if (Array.isArray(current) && Array.isArray(value)) {
       result[key] = value;
+      continue;
+    }
+    if (current !== undefined && typeof value !== typeof current) {
+      console.warn(`[runtime-config] ${fullPath}: expected ${typeof current}, got ${typeof value}. Using default.`);
       continue;
     }
     if (typeof value === typeof current) {
@@ -738,7 +765,19 @@ export function getRuntimeConfigPath(): string {
 
 export function loadRuntimeConfig(): RuntimeConfig {
   const currentHome = process.env.DOTCLAW_HOME || null;
-  if (cachedConfig && cachedHome === currentHome) return cachedConfig;
+  if (cachedConfig && cachedHome === currentHome) {
+    // Check if file has been modified since last load
+    try {
+      const configPath = resolveRuntimeConfigPath();
+      const stat = fs.statSync(configPath);
+      if (cachedMtime !== null && stat.mtimeMs === cachedMtime) {
+        return cachedConfig;
+      }
+    } catch {
+      // File may not exist; use cached config
+      return cachedConfig;
+    }
+  }
   const fromFile = readJson(resolveRuntimeConfigPath());
   const merged = fromFile ? mergeDefaults(DEFAULT_CONFIG, fromFile) : cloneConfig(DEFAULT_CONFIG);
   if (!hasTelegramHandlerOverride(fromFile)) {
@@ -759,5 +798,11 @@ export function loadRuntimeConfig(): RuntimeConfig {
   validateRuntimeConfig(merged);
   cachedConfig = merged;
   cachedHome = currentHome;
+  try {
+    const stat = fs.statSync(resolveRuntimeConfigPath());
+    cachedMtime = stat.mtimeMs;
+  } catch {
+    cachedMtime = null;
+  }
   return merged;
 }

@@ -27,6 +27,13 @@ export type AgentRuntimeConfig = {
       summaryMaxOutputTokens: number;
       temperature: number;
       maxContextMessageTokens: number;
+      maxHistoryTurns: number;
+      contextPruning: {
+        softTrimMaxChars: number;
+        softTrimHeadChars: number;
+        softTrimTailChars: number;
+        keepLastAssistant: number;
+      };
     };
     memory: {
       maxResults: number;
@@ -158,10 +165,17 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     compactionTriggerTokens: 120_000,
     recentContextTokens: 8000,
     summaryUpdateEveryMessages: 20,
-    maxOutputTokens: 1024,
+    maxOutputTokens: 8192,
     summaryMaxOutputTokens: 2048,
-    temperature: 0.2,
-    maxContextMessageTokens: 4000
+    temperature: 0.6,
+    maxContextMessageTokens: 4000,
+    maxHistoryTurns: 40,
+    contextPruning: {
+      softTrimMaxChars: 4_000,
+      softTrimHeadChars: 1_500,
+      softTrimTailChars: 1_500,
+      keepLastAssistant: 3
+    }
   },
   memory: {
     maxResults: 6,
@@ -247,7 +261,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     connectionTimeoutMs: 10_000
   },
   reasoning: {
-    effort: 'low',
+    effort: 'medium',
   },
   skills: {
     enabled: true,
@@ -262,6 +276,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
 };
 
 let cachedConfig: AgentRuntimeConfig | null = null;
+let cachedMtime: number | null = null;
 
 function cloneConfig<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -271,18 +286,23 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function mergeDefaults<T>(base: T, overrides: unknown): T {
+function mergeDefaults<T>(base: T, overrides: unknown, pathPrefix = ''): T {
   if (!isPlainObject(overrides)) return cloneConfig(base);
   const result = cloneConfig(base) as Record<string, unknown>;
   const baseObj = base as Record<string, unknown>;
   for (const [key, value] of Object.entries(overrides)) {
     const current = baseObj[key];
+    const fullPath = pathPrefix ? `${pathPrefix}.${key}` : key;
     if (isPlainObject(current) && isPlainObject(value)) {
-      result[key] = mergeDefaults(current, value);
+      result[key] = mergeDefaults(current, value, fullPath);
       continue;
     }
     if (Array.isArray(current) && Array.isArray(value)) {
       result[key] = value;
+      continue;
+    }
+    if (current !== undefined && typeof value !== typeof current) {
+      console.error(`[agent-config] ${fullPath}: expected ${typeof current}, got ${typeof value}. Using default.`);
       continue;
     }
     if (typeof value === typeof current) {
@@ -305,7 +325,17 @@ function readJson(filePath: string): unknown {
 }
 
 export function loadAgentConfig(): AgentRuntimeConfig {
-  if (cachedConfig) return cachedConfig;
+  if (cachedConfig) {
+    // Check if file has been modified since last load
+    try {
+      const stat = fs.statSync(CONFIG_PATH);
+      if (cachedMtime !== null && stat.mtimeMs === cachedMtime) {
+        return cachedConfig;
+      }
+    } catch {
+      return cachedConfig;
+    }
+  }
   const raw = readJson(CONFIG_PATH);
 
   let defaultModel = DEFAULT_DEFAULT_MODEL;
@@ -340,5 +370,11 @@ export function loadAgentConfig(): AgentRuntimeConfig {
     daemonHeartbeatIntervalMs,
     agent: mergeDefaults(DEFAULT_AGENT_CONFIG, agentOverrides)
   };
+  try {
+    const stat = fs.statSync(CONFIG_PATH);
+    cachedMtime = stat.mtimeMs;
+  } catch {
+    cachedMtime = null;
+  }
   return cachedConfig;
 }

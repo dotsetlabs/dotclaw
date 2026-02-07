@@ -1083,6 +1083,31 @@ async function main(): Promise<void> {
   }
 
   ensureDockerRunning();
+  // Clean up stale stream directories from crashed processes
+  try {
+    const ipcBase = path.join(DATA_DIR, 'ipc');
+    if (fs.existsSync(ipcBase)) {
+      const cutoff = Date.now() - 10 * 60 * 1000; // 10 minutes
+      for (const groupDir of fs.readdirSync(ipcBase)) {
+        const streamBase = path.join(ipcBase, groupDir, 'stream');
+        if (!fs.existsSync(streamBase)) continue;
+        try {
+          for (const traceDir of fs.readdirSync(streamBase)) {
+            const fullPath = path.join(streamBase, traceDir);
+            try {
+              const stat = fs.statSync(fullPath);
+              if (stat.isDirectory() && stat.mtimeMs < cutoff) {
+                fs.rmSync(fullPath, { recursive: true, force: true });
+              }
+            } catch { /* ignore individual dir errors */ }
+          }
+        } catch { /* ignore read errors */ }
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clean up stale stream directories');
+  }
+
   initDatabase();
   const resetCount = resetStalledMessages();
   if (resetCount > 0) {
@@ -1202,7 +1227,8 @@ async function main(): Promise<void> {
       shuttingDown = true;
       logger.info({ signal }, 'Graceful shutdown initiated');
 
-      // 1. Stop accepting new work
+      // 1. Stop accepting new work (webhook + providers)
+      stopWebhookServer();
       setTelegramConnected(false);
       for (const p of providerRegistry.getAllProviders()) {
         try { await p.stop(); } catch { /* ignore */ }
@@ -1221,7 +1247,6 @@ async function main(): Promise<void> {
       // 3. Stop HTTP servers
       stopMetricsServer();
       stopDashboard();
-      stopWebhookServer();
 
       // 4. Abort active agent runs so drain loops can finish quickly
       const activeRuns = getActiveRuns();

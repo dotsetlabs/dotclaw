@@ -163,12 +163,24 @@ export type ToolCallRecord = {
 
 type ToolCallLogger = (record: ToolCallRecord) => void;
 
+export type ToolResultRecord = {
+  name: string;
+  ok: boolean;
+  output?: string;
+  output_truncated?: boolean;
+  error?: string;
+};
+
+type ToolResultLogger = (record: ToolResultRecord) => void;
+
 export type ToolPolicy = {
   allow?: string[];
   deny?: string[];
   max_per_run?: Record<string, number>;
   default_max_per_run?: number;
 };
+
+const TOOL_OUTPUT_PREVIEW_BYTES = 6000;
 
 function getAllowedRoots(isMain: boolean): string[] {
   const roots = [WORKSPACE_GROUP, WORKSPACE_GLOBAL, WORKSPACE_EXTRA];
@@ -224,6 +236,48 @@ function limitText(text: string, maxBytes: number): { text: string; truncated: b
   while (end > 0 && (buf[end] & 0xC0) === 0x80) end--;
   const truncated = buf.subarray(0, end).toString('utf-8');
   return { text: truncated + '\n[OUTPUT TRUNCATED]', truncated: true };
+}
+
+function extractToolOutputText(result: unknown): string | null {
+  if (result === null || result === undefined) return null;
+  if (typeof result === 'string') return result;
+  if (typeof result === 'number' || typeof result === 'boolean') return String(result);
+  if (Array.isArray(result)) {
+    const parts = result
+      .map(item => extractToolOutputText(item))
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+    return parts.length > 0 ? parts.join('\n') : null;
+  }
+  if (typeof result === 'object') {
+    const record = result as Record<string, unknown>;
+    if (Array.isArray(record.content)) {
+      const textParts = record.content
+        .map((item) => {
+          if (!item || typeof item !== 'object') return null;
+          const text = (item as Record<string, unknown>).text;
+          return typeof text === 'string' ? text : null;
+        })
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+      if (textParts.length > 0) return textParts.join('\n');
+    }
+    const directKeys = ['text', 'content', 'message', 'stdout', 'stderr', 'body', 'result', 'output', 'summary'];
+    for (const key of directKeys) {
+      const value = record[key];
+      if (typeof value === 'string' && value.trim().length > 0) {
+        return value;
+      }
+    }
+    if (record.data && typeof record.data === 'object') {
+      const nested = extractToolOutputText(record.data);
+      if (nested) return nested;
+    }
+    try {
+      return JSON.stringify(result);
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function normalizeDomain(value: string): string {
@@ -886,12 +940,13 @@ async function maybeSummarizeToolResult<T>(name: string, result: T, runtime: Too
 export function createTools(
   ctx: IpcContext,
   config: AgentRuntimeConfig['agent'],
-  options?: { onToolCall?: ToolCallLogger; policy?: ToolPolicy }
+  options?: { onToolCall?: ToolCallLogger; onToolResult?: ToolResultLogger; policy?: ToolPolicy }
 ) {
   const runtime = buildToolRuntime(config);
   const ipc = createIpcHandlers(ctx, config.ipc);
   const isMain = ctx.isMain;
   const onToolCall = options?.onToolCall;
+  const onToolResult = options?.onToolResult;
   const policy = options?.policy;
   const hasAllowPolicy = Array.isArray(policy?.allow);
   const allowList = (policy?.allow || []).map(item => item.toLowerCase());
@@ -933,6 +988,20 @@ export function createTools(
 
         const rawResult = await execute(args);
         const result = await maybeSummarizeToolResult(name, rawResult, runtime);
+        if (onToolResult) {
+          const preview = extractToolOutputText(result);
+          if (preview) {
+            const limited = limitText(preview, TOOL_OUTPUT_PREVIEW_BYTES);
+            onToolResult({
+              name,
+              ok: true,
+              output: limited.text,
+              output_truncated: limited.truncated
+            });
+          } else {
+            onToolResult({ name, ok: true });
+          }
+        }
         let outputBytes: number | undefined;
         let outputTruncated: boolean | undefined;
         try {
@@ -961,6 +1030,13 @@ export function createTools(
           duration_ms: Date.now() - start,
           error: err instanceof Error ? err.message : String(err)
         });
+        if (onToolResult) {
+          onToolResult({
+            name,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
         throw err;
       }
     };
