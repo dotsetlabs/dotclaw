@@ -163,7 +163,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
   context: {
     maxContextTokens: 128_000,
     compactionTriggerTokens: 120_000,
-    recentContextTokens: 0, // 0 = auto: 60% of model context window
+    recentContextTokens: 0, // 0 = auto: 50% of model context window
     summaryUpdateEveryMessages: 20,
     maxOutputTokens: 8192,
     summaryMaxOutputTokens: 2048,

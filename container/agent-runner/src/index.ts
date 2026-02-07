@@ -829,11 +829,11 @@ export async function runAgentOnce(input: ContainerInput): Promise<ContainerOutp
     history = limitHistoryTurns(history, agent.context.maxHistoryTurns);
   }
 
-  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate remaining context
-  // after subtracting reserves for system prompt (25%), output (25%), tools (~3%), and safety (12%)
+  // Dynamic context budget: if recentContextTokens is 0 (auto), allocate 50% of context to
+  // conversation history (matches OpenClaw's maxHistoryShare). System prompt gets up to 25%.
   const effectiveRecentTokens = config.recentContextTokens > 0
     ? config.recentContextTokens
-    : Math.floor(config.maxContextTokens * 0.35);
+    : Math.floor(config.maxContextTokens * 0.50);
   const tokenRatio = tokenEstimate.tokensPerChar > 0 ? (0.25 / tokenEstimate.tokensPerChar) : 1;
   const adjustedRecentTokens = Math.max(1000, Math.floor(effectiveRecentTokens * tokenRatio));
 
