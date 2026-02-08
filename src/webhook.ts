@@ -147,6 +147,7 @@ export function startWebhookServer(config: WebhookConfig, deps: WebhookDeps): vo
         maxToolSteps: routing.maxToolSteps,
         useGroupLock: true,
         useSemaphore: true,
+        lane: 'interactive',
       });
 
       recordAgentTelemetry({

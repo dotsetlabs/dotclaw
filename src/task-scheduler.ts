@@ -257,7 +257,8 @@ ${task.prompt}` : task.prompt;
       maxToolSteps: routingDecision.maxToolSteps,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
-      timezone: taskTimezone
+      timezone: taskTimezone,
+      lane: 'scheduled'
     });
     output = execution.output;
     context = execution.context;
@@ -441,7 +442,8 @@ export async function runTaskNow(taskId: string, deps: SchedulerDependencies): P
       maxToolSteps: routingDecision.maxToolSteps,
       abortSignal: abortController.signal,
       timeoutMs: TASK_TIMEOUT_MS,
-      timezone: task.timezone || TIMEZONE
+      timezone: task.timezone || TIMEZONE,
+      lane: 'scheduled'
     });
     output = execution.output;
     context = execution.context;

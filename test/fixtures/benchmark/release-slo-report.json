@@ -1,0 +1,39 @@
+{
+  "window_days": 7,
+  "trace_dir": "/tmp/dotclaw/traces",
+  "records_total": 120,
+  "records_success": 116,
+  "records_error": 4,
+  "success_rate": 0.9667,
+  "empty_success_responses": 1,
+  "latency_ms": {
+    "p50": 6400,
+    "p90": 18000,
+    "p95": 42000,
+    "p99": 76000
+  },
+  "token_usage": {
+    "prompt_total": 124000,
+    "completion_total": 22800,
+    "prompt_p50": 980,
+    "completion_p50": 220
+  },
+  "tool_calls": {
+    "total": 220,
+    "failed": 8,
+    "success_rate": 0.9636
+  },
+  "host_failover": {
+    "attempted_runs": 10,
+    "recovered_runs": 9,
+    "recovery_rate": 0.9
+  },
+  "top_models": [
+    { "key": "moonshotai/kimi-k2.5", "count": 90 },
+    { "key": "deepseek/deepseek-v3.2", "count": 30 }
+  ],
+  "top_errors": [
+    { "key": "Daemon response timeout after 90000ms", "count": 2 },
+    { "key": "429 too many requests", "count": 2 }
+  ]
+}

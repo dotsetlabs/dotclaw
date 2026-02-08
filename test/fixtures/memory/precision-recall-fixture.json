@@ -1,0 +1,64 @@
+{
+  "memories": [
+    {
+      "scope": "user",
+      "subject_id": "user-1",
+      "type": "preference",
+      "content": "User prefers light roast coffee in the morning",
+      "importance": 0.9
+    },
+    {
+      "scope": "user",
+      "subject_id": "user-1",
+      "type": "relationship",
+      "content": "Alice is the product manager for Project Atlas",
+      "importance": 0.85
+    },
+    {
+      "scope": "group",
+      "type": "task",
+      "content": "Project Atlas deployment happens every Friday at 3pm",
+      "importance": 0.8
+    },
+    {
+      "scope": "global",
+      "type": "fact",
+      "content": "Primary office timezone is PST",
+      "importance": 0.7
+    },
+    {
+      "scope": "group",
+      "type": "note",
+      "content": "Favorite movie mention: Blade Runner",
+      "importance": 0.4
+    },
+    {
+      "scope": "group",
+      "type": "note",
+      "content": "Lunch preference note: pepperoni pizza",
+      "importance": 0.35
+    }
+  ],
+  "cases": [
+    {
+      "query": "remember my coffee preference and who manages atlas",
+      "expected_keywords": ["coffee", "alice", "atlas"],
+      "forbidden_keywords": ["blade runner", "pizza"]
+    },
+    {
+      "query": "what is the atlas deployment schedule we discussed",
+      "expected_keywords": ["atlas", "friday", "3pm"],
+      "forbidden_keywords": ["blade runner", "pizza"]
+    },
+    {
+      "query": "what timezone should we assume for office reminders",
+      "expected_keywords": ["timezone", "pst"],
+      "forbidden_keywords": ["blade runner", "pizza"]
+    }
+  ],
+  "thresholds": {
+    "min_avg_recall": 0.9,
+    "min_avg_precision": 0.75,
+    "max_forbidden_hit_rate": 0.1
+  }
+}

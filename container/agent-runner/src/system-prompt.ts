@@ -110,7 +110,9 @@ function buildScheduledSection(params: SystemPromptParams): string {
 
 function buildResponseGuidanceSection(): string {
   return [
-    '- Always answer the user\'s question directly before reaching for tools.',
+    '- Answer directly when the request can be completed from conversation context without external state.',
+    '- When the request requires file/system/network actions or fresh state, execute tools first before finalizing.',
+    '- Never claim an action happened unless corresponding tool calls succeeded in this turn.',
     '- If the user asks about your previous actions (e.g., "did you use X tool?"), reflect on the conversation history — do not re-execute the task.',
     '- If the user asks a simple factual question, answer from your knowledge — do not call tools unless you need to verify or act.',
     '- When you have genuinely nothing to say, respond with ONLY: NO_REPLY (your entire message must be just this token, nothing else).'
@@ -128,6 +130,7 @@ function buildToolCallStyleSection(): string {
 function buildToolGuidanceSection(params: SystemPromptParams): string {
   const lines = [
     'Key tool rules:',
+    '- Never claim file/system/web actions succeeded unless tool calls in this turn confirm them.',
     '- User attachments arrive in /workspace/group/inbox/ (see <attachment> tags). Process with Read/Bash/Python.',
     '- To send media from the web: download_url → send_photo/send_file/send_audio.',
     '- Charts/plots: matplotlib → savefig → send_photo. Graphviz → dot -Tpng → send_photo.',
@@ -285,8 +288,14 @@ export function buildSystemPrompt(params: SystemPromptParams): string {
   const toolReliability = trimLevel >= 2 ? '' : (
     params.toolReliability && params.toolReliability.length > 0
       ? params.toolReliability
-        .sort((a, b) => a.success_rate - b.success_rate)
-        .slice(0, 20)
+        .filter(t => t.count >= 5 && (t.success_rate < 0.98 || (Number.isFinite(t.avg_duration_ms) && (t.avg_duration_ms || 0) > 2500)))
+        .sort((a, b) => {
+          if (a.success_rate !== b.success_rate) return a.success_rate - b.success_rate;
+          const aDur = Number.isFinite(a.avg_duration_ms) ? (a.avg_duration_ms || 0) : 0;
+          const bDur = Number.isFinite(b.avg_duration_ms) ? (b.avg_duration_ms || 0) : 0;
+          return bDur - aDur;
+        })
+        .slice(0, 8)
         .map(t => {
           const pct = `${Math.round(t.success_rate * 100)}%`;
           const avg = Number.isFinite(t.avg_duration_ms) ? `${Math.round(t.avg_duration_ms!)}ms` : 'n/a';

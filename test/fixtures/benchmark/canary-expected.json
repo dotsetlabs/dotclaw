@@ -1,0 +1,23 @@
+{
+  "scenarios": {
+    "memory_carryover": {
+      "min_candidates": 5,
+      "min_pass_rate": 0.95
+    },
+    "tool_heavy": {
+      "min_candidates": 5,
+      "min_pass_rate": 0.95
+    },
+    "transient_recovery": {
+      "min_candidates": 3,
+      "min_pass_rate": 0.9
+    },
+    "context_recovery": {
+      "min_candidates": 2,
+      "min_pass_rate": 0.9
+    }
+  },
+  "totals": {
+    "max_empty_success_rate": 0.01
+  }
+}

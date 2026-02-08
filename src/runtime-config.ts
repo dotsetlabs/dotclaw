@@ -49,6 +49,8 @@ export type RuntimeConfig = {
       maxAgents: number;
       queueTimeoutMs: number;
       warmStart: boolean;
+      laneStarvationMs: number;
+      maxConsecutiveInteractive: number;
     };
     promptPacksDir: string;
     trace: {
@@ -67,6 +69,7 @@ export type RuntimeConfig = {
       retryBaseMs: number;
       retryMaxMs: number;
       interruptOnNewMessage: boolean;
+      promptMaxChars: number;
     };
     metrics: {
       port: number;
@@ -108,6 +111,10 @@ export type RuntimeConfig = {
         analyzeEnabled: boolean;
       };
       personalizationCacheMs: number;
+      backend: {
+        strategy: 'builtin' | 'module';
+        modulePath: string;
+      };
     };
     voice: {
       transcription: {
@@ -156,6 +163,13 @@ export type RuntimeConfig = {
       temperature?: number;
       recallMaxResults: number;
       recallMaxTokens: number;
+      hostFailover: {
+        enabled: boolean;
+        maxRetries: number;
+        cooldownRateLimitMs: number;
+        cooldownTransientMs: number;
+        cooldownInvalidResponseMs: number;
+      };
     };
     streaming: {
       enabled: boolean;
@@ -231,6 +245,14 @@ export type RuntimeConfig = {
       enableBash: boolean;
       enableWebSearch: boolean;
       enableWebFetch: boolean;
+      completionGuard: {
+        idempotentRetryAttempts: number;
+        idempotentRetryBackoffMs: number;
+        repeatedSignatureThreshold: number;
+        repeatedRoundThreshold: number;
+        nonRetryableFailureThreshold: number;
+        forceSynthesisAfterTools: boolean;
+      };
       webfetch: {
         blockPrivate: boolean;
         allowlist: string[];
@@ -279,6 +301,14 @@ export type RuntimeConfig = {
       model: string;
       baseUrl: string;
       defaultVoice: string;
+      provider: 'edge-tts' | 'openai';
+      openaiModel: string;
+      openaiVoice: string;
+    };
+    process: {
+      maxSessions: number;
+      maxOutputBytes: number;
+      defaultTimeoutMs: number;
     };
     browser: {
       enabled: boolean;
@@ -350,7 +380,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       maxOutputBytes: 20 * 1024 * 1024,
       mode: 'daemon',
       privileged: true,
-      daemonPollMs: 200,
+      daemonPollMs: 100,
       pidsLimit: 256,
       memory: '',
       cpus: '',
@@ -369,7 +399,9 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     concurrency: {
       maxAgents: 4,
       queueTimeoutMs: 0,
-      warmStart: true
+      warmStart: true,
+      laneStarvationMs: 15_000,
+      maxConsecutiveInteractive: 3
     },
     promptPacksDir: PROMPTS_DIR,
     trace: {
@@ -387,7 +419,8 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       maxRetries: 4,
       retryBaseMs: 3_000,
       retryMaxMs: 60_000,
-      interruptOnNewMessage: true
+      interruptOnNewMessage: true,
+      promptMaxChars: 24_000
     },
     metrics: {
       port: 3001,
@@ -428,7 +461,11 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         vacuumIntervalDays: 7,
         analyzeEnabled: true
       },
-      personalizationCacheMs: 300_000
+      personalizationCacheMs: 300_000,
+      backend: {
+        strategy: 'builtin',
+        modulePath: ''
+      }
     },
     voice: {
       transcription: {
@@ -477,10 +514,17 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       temperature: 0.6,
       recallMaxResults: 8,
       recallMaxTokens: 1500,
+      hostFailover: {
+        enabled: true,
+        maxRetries: 1,
+        cooldownRateLimitMs: 60_000,
+        cooldownTransientMs: 300_000,
+        cooldownInvalidResponseMs: 120_000,
+      }
     },
     streaming: {
       enabled: true,
-      chunkFlushIntervalMs: 200,
+      chunkFlushIntervalMs: 120,
       editIntervalMs: 400,
       maxEditLength: 3800,
     },
@@ -516,7 +560,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
     context: {
       maxContextTokens: 128_000,
       compactionTriggerTokens: 120_000,
-      recentContextTokens: 0, // 0 = auto: 50% of model context window
+      recentContextTokens: 0, // 0 = auto: 35% of model context window (capped at 24K)
       summaryUpdateEveryMessages: 20,
       maxOutputTokens: 8192,
       summaryMaxOutputTokens: 2048,
@@ -552,6 +596,14 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       enableBash: true,
       enableWebSearch: true,
       enableWebFetch: true,
+      completionGuard: {
+        idempotentRetryAttempts: 2,
+        idempotentRetryBackoffMs: 500,
+        repeatedSignatureThreshold: 3,
+        repeatedRoundThreshold: 2,
+        nonRetryableFailureThreshold: 3,
+        forceSynthesisAfterTools: true
+      },
       webfetch: {
         blockPrivate: true,
         allowlist: [],
@@ -563,7 +615,7 @@ const DEFAULT_CONFIG: RuntimeConfig = {
         timeoutMs: 20_000
       },
       bash: {
-        timeoutMs: 120_000,
+        timeoutMs: 600_000,
         outputLimitBytes: 200_000
       },
       grepMaxFileBytes: 1_000_000,
@@ -599,7 +651,15 @@ const DEFAULT_CONFIG: RuntimeConfig = {
       enabled: true,
       model: 'edge-tts',
       baseUrl: '',
-      defaultVoice: 'en-US-AriaNeural'
+      defaultVoice: 'en-US-AriaNeural',
+      provider: 'edge-tts',
+      openaiModel: 'tts-1',
+      openaiVoice: 'alloy',
+    },
+    process: {
+      maxSessions: 16,
+      maxOutputBytes: 1_048_576,
+      defaultTimeoutMs: 1_800_000,
     },
     browser: {
       enabled: true,
@@ -648,6 +708,7 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
 
   // Container
   h.container.timeoutMs = clampMin(h.container.timeoutMs, 1000, 'host.container.timeoutMs');
+  h.container.daemonPollMs = clampMin(h.container.daemonPollMs, 25, 'host.container.daemonPollMs');
   if (h.container.mode !== 'daemon' && h.container.mode !== 'ephemeral') {
     console.warn(`[runtime-config] host.container.mode = "${h.container.mode}" is invalid, defaulting to "daemon"`);
     h.container.mode = 'daemon';
@@ -657,6 +718,8 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
 
   // Concurrency
   h.concurrency.maxAgents = clampMin(h.concurrency.maxAgents, 1, 'host.concurrency.maxAgents');
+  h.concurrency.laneStarvationMs = clampMin(h.concurrency.laneStarvationMs, 1000, 'host.concurrency.laneStarvationMs');
+  h.concurrency.maxConsecutiveInteractive = clampMin(h.concurrency.maxConsecutiveInteractive, 1, 'host.concurrency.maxConsecutiveInteractive');
 
   // Maintenance
   h.maintenance.intervalMs = clampMin(h.maintenance.intervalMs, 60_000, 'host.maintenance.intervalMs');
@@ -664,20 +727,33 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   // Message queue
   h.messageQueue.batchWindowMs = clampMin(h.messageQueue.batchWindowMs, 0, 'host.messageQueue.batchWindowMs');
   h.messageQueue.maxRetries = clampMin(h.messageQueue.maxRetries, 0, 'host.messageQueue.maxRetries');
+  h.messageQueue.promptMaxChars = clampMin(h.messageQueue.promptMaxChars, 2000, 'host.messageQueue.promptMaxChars');
 
   // Routing
   h.routing.maxOutputTokens = clampMin(h.routing.maxOutputTokens, 0, 'host.routing.maxOutputTokens');
   h.routing.maxToolSteps = clampMin(h.routing.maxToolSteps, 1, 'host.routing.maxToolSteps');
   h.routing.recallMaxResults = clampMin(h.routing.recallMaxResults, 0, 'host.routing.recallMaxResults');
   h.routing.recallMaxTokens = clampMin(h.routing.recallMaxTokens, 0, 'host.routing.recallMaxTokens');
+  h.routing.hostFailover.maxRetries = clampMin(h.routing.hostFailover.maxRetries, 0, 'host.routing.hostFailover.maxRetries');
+  h.routing.hostFailover.cooldownRateLimitMs = clampMin(h.routing.hostFailover.cooldownRateLimitMs, 0, 'host.routing.hostFailover.cooldownRateLimitMs');
+  h.routing.hostFailover.cooldownTransientMs = clampMin(h.routing.hostFailover.cooldownTransientMs, 0, 'host.routing.hostFailover.cooldownTransientMs');
+  h.routing.hostFailover.cooldownInvalidResponseMs = clampMin(h.routing.hostFailover.cooldownInvalidResponseMs, 0, 'host.routing.hostFailover.cooldownInvalidResponseMs');
 
   // Streaming
+  h.streaming.chunkFlushIntervalMs = clampMin(h.streaming.chunkFlushIntervalMs, 25, 'host.streaming.chunkFlushIntervalMs');
   h.streaming.editIntervalMs = clampMin(h.streaming.editIntervalMs, 100, 'host.streaming.editIntervalMs');
   h.streaming.maxEditLength = clampMin(h.streaming.maxEditLength, 100, 'host.streaming.maxEditLength');
 
   // Memory recall
   if (typeof h.memory.recall.minScore === 'number') {
     h.memory.recall.minScore = Math.min(1, Math.max(0, h.memory.recall.minScore));
+  }
+  if (h.memory.backend.strategy !== 'builtin' && h.memory.backend.strategy !== 'module') {
+    console.warn(`[runtime-config] host.memory.backend.strategy = "${h.memory.backend.strategy}" is invalid, defaulting to "builtin"`);
+    h.memory.backend.strategy = 'builtin';
+  }
+  if (typeof h.memory.backend.modulePath !== 'string') {
+    h.memory.backend.modulePath = '';
   }
 
   // Webhook
@@ -699,6 +775,38 @@ function validateRuntimeConfig(config: RuntimeConfig): void {
   // Agent IPC
   config.agent.ipc.requestTimeoutMs = clampMin(config.agent.ipc.requestTimeoutMs, 1000, 'agent.ipc.requestTimeoutMs');
   config.agent.ipc.requestPollMs = clampMin(config.agent.ipc.requestPollMs, 10, 'agent.ipc.requestPollMs');
+  if (config.agent.tts.provider !== 'edge-tts' && config.agent.tts.provider !== 'openai') {
+    console.warn(`[runtime-config] agent.tts.provider = "${config.agent.tts.provider}" is invalid, defaulting to "edge-tts"`);
+    config.agent.tts.provider = 'edge-tts';
+  }
+  config.agent.process.maxSessions = clampMin(config.agent.process.maxSessions, 1, 'agent.process.maxSessions');
+  config.agent.process.maxOutputBytes = clampMin(config.agent.process.maxOutputBytes, 1024, 'agent.process.maxOutputBytes');
+  config.agent.process.defaultTimeoutMs = clampMin(config.agent.process.defaultTimeoutMs, 1000, 'agent.process.defaultTimeoutMs');
+  config.agent.tools.completionGuard.idempotentRetryAttempts = clampMin(
+    config.agent.tools.completionGuard.idempotentRetryAttempts,
+    1,
+    'agent.tools.completionGuard.idempotentRetryAttempts'
+  );
+  config.agent.tools.completionGuard.idempotentRetryBackoffMs = clampMin(
+    config.agent.tools.completionGuard.idempotentRetryBackoffMs,
+    0,
+    'agent.tools.completionGuard.idempotentRetryBackoffMs'
+  );
+  config.agent.tools.completionGuard.repeatedSignatureThreshold = clampMin(
+    config.agent.tools.completionGuard.repeatedSignatureThreshold,
+    2,
+    'agent.tools.completionGuard.repeatedSignatureThreshold'
+  );
+  config.agent.tools.completionGuard.repeatedRoundThreshold = clampMin(
+    config.agent.tools.completionGuard.repeatedRoundThreshold,
+    2,
+    'agent.tools.completionGuard.repeatedRoundThreshold'
+  );
+  config.agent.tools.completionGuard.nonRetryableFailureThreshold = clampMin(
+    config.agent.tools.completionGuard.nonRetryableFailureThreshold,
+    1,
+    'agent.tools.completionGuard.nonRetryableFailureThreshold'
+  );
 }
 
 let cachedConfig: RuntimeConfig | null = null;
@@ -763,6 +871,56 @@ export function getRuntimeConfigPath(): string {
   return resolveRuntimeConfigPath();
 }
 
+function clearRuntimeConfigCacheIfNeeded(configPath: string): void {
+  const activePath = resolveRuntimeConfigPath();
+  if (path.resolve(configPath) !== path.resolve(activePath)) return;
+  cachedConfig = null;
+  cachedMtime = null;
+}
+
+function stripDeprecatedRuntimeKeys(config: Record<string, unknown>): void {
+  const host = config.host;
+  if (!isPlainObject(host)) return;
+  if (Object.prototype.hasOwnProperty.call(host, 'backgroundJobs')) {
+    delete host.backgroundJobs;
+  }
+  const routing = host.routing;
+  if (isPlainObject(routing) && Object.prototype.hasOwnProperty.call(routing, 'profiles')) {
+    delete routing.profiles;
+  }
+}
+
+export function readRuntimeConfigDocument(configPath = resolveRuntimeConfigPath()): Record<string, unknown> {
+  const parsed = readJson(configPath);
+  if (!isPlainObject(parsed)) return {};
+  return parsed;
+}
+
+export function writeRuntimeConfigDocument(
+  document: Record<string, unknown>,
+  configPath = resolveRuntimeConfigPath()
+): void {
+  const normalized = cloneConfig(document);
+  stripDeprecatedRuntimeKeys(normalized);
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const tmpPath = `${configPath}.tmp`;
+  fs.writeFileSync(tmpPath, `${JSON.stringify(normalized, null, 2)}\n`);
+  fs.renameSync(tmpPath, configPath);
+  clearRuntimeConfigCacheIfNeeded(configPath);
+}
+
+export function updateRuntimeConfigDocument(
+  mutator: (draft: Record<string, unknown>) => void | boolean,
+  configPath = resolveRuntimeConfigPath()
+): Record<string, unknown> {
+  const draft = readRuntimeConfigDocument(configPath);
+  const shouldWrite = mutator(draft);
+  if (shouldWrite !== false) {
+    writeRuntimeConfigDocument(draft, configPath);
+  }
+  return draft;
+}
+
 export function loadRuntimeConfig(): RuntimeConfig {
   const currentHome = process.env.DOTCLAW_HOME || null;
   if (cachedConfig && cachedHome === currentHome) {
@@ -778,7 +936,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
       return cachedConfig;
     }
   }
-  const fromFile = readJson(resolveRuntimeConfigPath());
+  const fromFile = readRuntimeConfigDocument();
   const merged = fromFile ? mergeDefaults(DEFAULT_CONFIG, fromFile) : cloneConfig(DEFAULT_CONFIG);
   if (!hasTelegramHandlerOverride(fromFile)) {
     merged.host.telegram.handlerTimeoutMs = Math.max(merged.host.container.timeoutMs + 30_000, 120_000);

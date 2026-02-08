@@ -705,6 +705,7 @@ async function runHeartbeatOnce(): Promise<void> {
       availableGroups: buildAvailableGroupsSnapshot(),
       modelMaxOutputTokens: routingDecision.maxOutputTokens,
       maxToolSteps: routingDecision.maxToolSteps,
+      lane: 'maintenance',
     });
     output = execution.output;
     context = execution.context;

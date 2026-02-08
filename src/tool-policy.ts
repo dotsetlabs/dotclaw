@@ -89,15 +89,35 @@ function normalizeList(value?: string[]): string[] {
   return value.map(item => item.trim()).filter(Boolean);
 }
 
+function dedupeCaseInsensitive(values: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(value);
+  }
+  return output;
+}
+
 function mergePolicy(base: ToolPolicy, override?: ToolPolicy): ToolPolicy {
   if (!override) return base;
   const baseAllow = normalizeList(base.allow);
   const overrideAllow = normalizeList(override.allow);
-  const allow = baseAllow.length > 0
-    ? (overrideAllow.length > 0 ? baseAllow.filter(item => overrideAllow.includes(item)) : baseAllow)
-    : overrideAllow;
+  let allow: string[];
+  if (baseAllow.length > 0) {
+    if (overrideAllow.length > 0) {
+      const baseAllowByLower = new Map(baseAllow.map(item => [item.toLowerCase(), item]));
+      allow = dedupeCaseInsensitive(overrideAllow.map(item => baseAllowByLower.get(item.toLowerCase()) || item));
+    } else {
+      allow = baseAllow;
+    }
+  } else {
+    allow = dedupeCaseInsensitive(overrideAllow);
+  }
 
-  const deny = Array.from(new Set([...normalizeList(base.deny), ...normalizeList(override.deny)]));
+  const deny = dedupeCaseInsensitive([...normalizeList(base.deny), ...normalizeList(override.deny)]);
   const maxPerRun = { ...(base.max_per_run || {}), ...(override.max_per_run || {}) };
   const defaultMax = override.default_max_per_run ?? base.default_max_per_run;
 

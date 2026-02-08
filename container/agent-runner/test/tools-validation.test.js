@@ -4,11 +4,12 @@ import assert from 'node:assert/strict';
 import { loadAgentConfig } from '../dist/agent-config.js';
 import { createTools } from '../dist/tools.js';
 
-function buildTools() {
+function buildTools(policy) {
   const config = loadAgentConfig().agent;
   return createTools(
     { chatJid: '123456', groupFolder: 'main', isMain: true },
-    config
+    config,
+    policy ? { policy } : undefined
   );
 }
 
@@ -17,6 +18,19 @@ function getTool(name) {
   assert.ok(tool, `Tool not found: ${name}`);
   return tool.function;
 }
+
+test('createTools filters schema list by allow/deny policy', () => {
+  const tools = buildTools({
+    allow: ['Read', 'Bash', 'WebSearch'],
+    deny: ['Bash']
+  });
+  const names = tools.map(entry => entry.function?.name);
+
+  assert.ok(names.includes('Read'));
+  assert.ok(names.includes('WebSearch'));
+  assert.equal(names.includes('Bash'), false);
+  assert.equal(names.includes('Write'), false);
+});
 
 test('send_buttons schema rejects invalid button definitions', () => {
   const sendButtons = getTool('mcp__dotclaw__send_buttons');
@@ -98,5 +112,30 @@ test('send_file execution rejects paths outside /workspace/group', async () => {
   await assert.rejects(
     () => sendFile.execute({ path: '/workspace/global/secrets.txt' }),
     /Path must be inside \/workspace\/group/
+  );
+});
+
+test('tool execution normalizes stringified and aliased arguments', async () => {
+  const write = getTool('Write');
+  const read = getTool('Read');
+
+  await assert.rejects(
+    () => write.execute('{"filePath":"/tmp/normalized-args.txt","text":"hello from normalized args"}'),
+    (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.match(message, /outside allowed roots/);
+      assert.equal(/Path is required/.test(message), false);
+      return true;
+    }
+  );
+
+  await assert.rejects(
+    () => read.execute({ filePath: '/workspace/group/missing.txt', maxBytes: -128 }),
+    (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.match(message, /does not exist|outside allowed roots/);
+      assert.equal(/Path is required/.test(message), false);
+      return true;
+    }
   );
 });

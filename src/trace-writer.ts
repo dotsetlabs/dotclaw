@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { TRACE_DIR, TRACE_SAMPLE_RATE } from './config.js';
+import type { FailoverEnvelope } from './failover-policy.js';
 
 export type TraceRecord = {
   trace_id: string;
@@ -36,6 +37,17 @@ export type TraceRecord = {
   session_recall_count?: number;
   memory_items_upserted?: number;
   memory_items_extracted?: number;
+  host_failover_attempts?: number;
+  host_failover_recovered?: boolean;
+  host_failover_category?: string;
+  host_failover_source?: 'container_output' | 'runtime_exception';
+  host_failover_status_code?: number;
+  host_failover_envelopes?: FailoverEnvelope[];
+  tool_retry_attempts?: number;
+  tool_outcome_verification_forced?: boolean;
+  tool_loop_breaker_triggered?: boolean;
+  tool_loop_breaker_reason?: string;
+  memory_extraction_error?: string;
   timings?: Record<string, number>;
   error_code?: string;
   source?: string;

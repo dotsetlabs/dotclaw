@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import type { MessagingProvider } from './providers/types.js';
 import { logger } from './logger.js';
+import { loadRuntimeConfig } from './runtime-config.js';
 
 export interface StreamingConfig {
   enabled: boolean;
@@ -13,6 +14,82 @@ export interface StreamingConfig {
 export interface StreamingOptions {
   threadId?: string;
   replyToMessageId?: string;
+}
+
+const runtime = loadRuntimeConfig();
+const STREAM_CHUNK_POLL_MS = Math.max(25, runtime.host.streaming.chunkFlushIntervalMs || 50);
+
+class DirectoryWakeSignal {
+  private watcher: fs.FSWatcher | null = null;
+  private pending = false;
+  private waiter: (() => void) | null = null;
+  private readonly abortHandler: (() => void) | null;
+
+  constructor(
+    streamDir: string,
+    private readonly abortSignal?: AbortSignal
+  ) {
+    try {
+      this.watcher = fs.watch(streamDir, { persistent: false }, () => this.notify());
+      this.watcher.on('error', () => {
+        if (this.watcher) {
+          try { this.watcher.close(); } catch { /* ignore */ }
+          this.watcher = null;
+        }
+        this.notify();
+      });
+    } catch {
+      this.watcher = null;
+    }
+
+    if (this.abortSignal) {
+      this.abortHandler = () => this.notify();
+      this.abortSignal.addEventListener('abort', this.abortHandler);
+    } else {
+      this.abortHandler = null;
+    }
+  }
+
+  private notify(): void {
+    if (this.waiter) {
+      const wake = this.waiter;
+      this.waiter = null;
+      wake();
+      return;
+    }
+    this.pending = true;
+  }
+
+  async wait(timeoutMs: number): Promise<void> {
+    if (this.pending) {
+      this.pending = false;
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (this.waiter === finish) this.waiter = null;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, Math.max(10, timeoutMs));
+      this.waiter = finish;
+    });
+  }
+
+  close(): void {
+    if (this.abortSignal && this.abortHandler) {
+      this.abortSignal.removeEventListener('abort', this.abortHandler);
+    }
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    this.notify();
+  }
 }
 
 /**
@@ -153,57 +230,76 @@ export async function* watchStreamChunks(
   abortSignal?: AbortSignal
 ): AsyncGenerator<string> {
   let seq = 0;
-  const pollMs = 50;
+  const wakeSignal = new DirectoryWakeSignal(streamDir, abortSignal);
+  const pollMs = STREAM_CHUNK_POLL_MS;
 
-  while (!abortSignal?.aborted) {
-    // Check for sentinel files
-    if (fs.existsSync(path.join(streamDir, 'done'))) {
-      // Yield any remaining chunks before exiting
-      yield* drainRemainingChunks(streamDir, seq);
-      return;
-    }
-    if (fs.existsSync(path.join(streamDir, 'error'))) {
-      // Yield any remaining chunks, then stop
-      yield* drainRemainingChunks(streamDir, seq);
-      return;
-    }
-
-    const nextSeq = seq + 1;
-    const chunkFile = path.join(streamDir, `chunk_${String(nextSeq).padStart(6, '0')}.txt`);
-    if (fs.existsSync(chunkFile)) {
-      try {
-        const content = fs.readFileSync(chunkFile, 'utf-8');
-        seq = nextSeq;
-        yield content;
-      } catch {
-        // File might be partially written; retry next poll
-        await sleep(pollMs);
+  try {
+    while (!abortSignal?.aborted) {
+      // Check for sentinel files
+      if (fs.existsSync(path.join(streamDir, 'done'))) {
+        // Yield remaining chunks, including chunks that arrive just after
+        // the done sentinel due to filesystem scheduling races.
+        yield* drainRemainingChunksWithGrace(streamDir, seq, wakeSignal, pollMs, abortSignal);
+        return;
       }
-    } else {
-      await sleep(pollMs);
+      if (fs.existsSync(path.join(streamDir, 'error'))) {
+        // Yield remaining chunks before exiting on error sentinel.
+        yield* drainRemainingChunksWithGrace(streamDir, seq, wakeSignal, pollMs, abortSignal);
+        return;
+      }
+
+      const nextSeq = seq + 1;
+      const chunkFile = path.join(streamDir, `chunk_${String(nextSeq).padStart(6, '0')}.txt`);
+      if (fs.existsSync(chunkFile)) {
+        try {
+          const content = fs.readFileSync(chunkFile, 'utf-8');
+          seq = nextSeq;
+          yield content;
+        } catch {
+          // File might be partially written; retry shortly.
+          await wakeSignal.wait(pollMs);
+        }
+      } else {
+        await wakeSignal.wait(pollMs);
+      }
     }
+  } finally {
+    wakeSignal.close();
   }
 
   // Aborted
   throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
 }
 
-async function* drainRemainingChunks(streamDir: string, startSeq: number): AsyncGenerator<string> {
+async function* drainRemainingChunksWithGrace(
+  streamDir: string,
+  startSeq: number,
+  wakeSignal: DirectoryWakeSignal,
+  pollMs: number,
+  abortSignal?: AbortSignal
+): AsyncGenerator<string> {
   let seq = startSeq;
+  let misses = 0;
+  const maxMisses = 3;
   for (;;) {
+    if (abortSignal?.aborted) return;
     const nextSeq = seq + 1;
     const chunkFile = path.join(streamDir, `chunk_${String(nextSeq).padStart(6, '0')}.txt`);
-    if (!fs.existsSync(chunkFile)) break;
+    if (!fs.existsSync(chunkFile)) {
+      if (misses >= maxMisses) break;
+      misses += 1;
+      await wakeSignal.wait(pollMs);
+      continue;
+    }
     try {
       const content = fs.readFileSync(chunkFile, 'utf-8');
       seq = nextSeq;
+      misses = 0;
       yield content;
     } catch {
-      break;
+      if (misses >= maxMisses) break;
+      misses += 1;
+      await wakeSignal.wait(pollMs);
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }

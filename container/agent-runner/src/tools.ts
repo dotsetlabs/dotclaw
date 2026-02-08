@@ -180,6 +180,22 @@ export type ToolPolicy = {
   default_max_per_run?: number;
 };
 
+function applyPolicyToolFilter(tools: Tool[], policy?: ToolPolicy): Tool[] {
+  if (!policy) return tools;
+  const allowSet = Array.isArray(policy.allow)
+    ? new Set(policy.allow.map(name => String(name || '').trim().toLowerCase()).filter(Boolean))
+    : null;
+  const denySet = new Set((policy.deny || []).map(name => String(name || '').trim().toLowerCase()).filter(Boolean));
+  return tools.filter((entry) => {
+    const name = entry?.function?.name;
+    if (!name) return false;
+    const normalized = name.toLowerCase();
+    if (denySet.has(normalized)) return false;
+    if (allowSet && !allowSet.has(normalized)) return false;
+    return true;
+  });
+}
+
 const TOOL_OUTPUT_PREVIEW_BYTES = 6000;
 
 function getAllowedRoots(isMain: boolean): string[] {
@@ -449,7 +465,188 @@ async function assertUrlAllowed(params: {
   }
 }
 
+function parseLooseJson(value: string): unknown {
+  let parsed: unknown = value;
+  for (let i = 0; i < 2 && typeof parsed === 'string'; i += 1) {
+    parsed = JSON.parse(parsed);
+  }
+  return parsed;
+}
+
+function toPositiveInt(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const rounded = Math.floor(value);
+    return rounded > 0 ? rounded : undefined;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (!Number.isFinite(parsed)) return undefined;
+    const rounded = Math.floor(parsed);
+    return rounded > 0 ? rounded : undefined;
+  }
+  return undefined;
+}
+
+function toNonNegativeInt(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const rounded = Math.floor(value);
+    return rounded >= 0 ? rounded : undefined;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim());
+    if (!Number.isFinite(parsed)) return undefined;
+    const rounded = Math.floor(parsed);
+    return rounded >= 0 ? rounded : undefined;
+  }
+  return undefined;
+}
+
+function setAlias(record: Record<string, unknown>, canonical: string, aliases: string[]): void {
+  const existing = record[canonical];
+  if (typeof existing === 'string' && existing.trim()) return;
+  for (const alias of aliases) {
+    const value = record[alias];
+    if (typeof value === 'string' && value.trim()) {
+      record[canonical] = value;
+      return;
+    }
+  }
+}
+
+function sanitizeNumericField(
+  record: Record<string, unknown>,
+  field: string,
+  mode: 'positive' | 'nonnegative'
+): void {
+  if (!(field in record)) return;
+  const coerced = mode === 'positive'
+    ? toPositiveInt(record[field])
+    : toNonNegativeInt(record[field]);
+  if (coerced === undefined) {
+    delete record[field];
+    return;
+  }
+  record[field] = coerced;
+}
+
+function normalizeToolArgs(name: string, args: unknown): unknown {
+  const normalizedName = name.trim().toLowerCase();
+  let value = args;
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+      try {
+        value = parseLooseJson(trimmed);
+      } catch {
+        // Keep the original string if JSON is malformed/truncated.
+      }
+    }
+    if (typeof value === 'string') {
+      switch (normalizedName) {
+        case 'bash':
+        case 'process':
+          return { command: value };
+        case 'python':
+          return { code: value };
+        case 'webfetch':
+          return { url: value.trim() };
+        case 'websearch':
+          return { query: value };
+        case 'read':
+          return { path: value };
+        case 'glob':
+          return { pattern: value };
+        case 'grep':
+          return { pattern: value };
+        default:
+          return value;
+      }
+    }
+  }
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+
+  const record = { ...(value as Record<string, unknown>) };
+  const pathAliases = ['file', 'filePath', 'filepath', 'file_path', 'targetPath', 'target_path'];
+
+  switch (normalizedName) {
+    case 'read':
+    case 'write':
+    case 'edit':
+    case 'analyzeimage':
+      setAlias(record, 'path', pathAliases);
+      break;
+    case 'bash':
+    case 'process':
+      setAlias(record, 'command', ['cmd', 'shell', 'script', 'input']);
+      break;
+    case 'python':
+      setAlias(record, 'code', ['script', 'input', 'content', 'text']);
+      break;
+    case 'glob':
+      setAlias(record, 'pattern', ['glob', 'path']);
+      break;
+    case 'grep':
+      setAlias(record, 'pattern', ['query', 'search', 'text']);
+      setAlias(record, 'path', pathAliases);
+      break;
+    case 'websearch':
+      setAlias(record, 'query', ['q', 'search', 'text', 'input']);
+      break;
+    case 'webfetch':
+      setAlias(record, 'url', ['uri', 'href', 'link']);
+      break;
+    case 'sendfile':
+    case 'sendphoto':
+    case 'sendvoice':
+    case 'sendaudio':
+      setAlias(record, 'path', pathAliases);
+      break;
+    default:
+      break;
+  }
+
+  if (normalizedName === 'write') {
+    setAlias(record, 'content', ['text', 'body', 'data', 'value']);
+  }
+
+  if (normalizedName === 'python' && typeof record.code !== 'string' && record.code !== undefined) {
+    record.code = String(record.code);
+  }
+  if ((normalizedName === 'bash' || normalizedName === 'process') && typeof record.command !== 'string' && record.command !== undefined) {
+    record.command = String(record.command);
+  }
+  if (normalizedName === 'write' && typeof record.content !== 'string' && record.content !== undefined) {
+    record.content = String(record.content);
+  }
+
+  const positiveFields = [
+    'maxBytes', 'maxResults', 'timeoutMs', 'count', 'depth', 'duration', 'reply_to_message_id', 'message_id', 'limit'
+  ];
+  for (const field of positiveFields) {
+    sanitizeNumericField(record, field, 'positive');
+  }
+  sanitizeNumericField(record, 'offset', 'nonnegative');
+
+  return record;
+}
+
 function sanitizeToolArgs(args: unknown): unknown {
+  if (typeof args === 'string') {
+    const trimmed = args.trim();
+    if ((trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) && trimmed.length <= 64_000) {
+      try {
+        return sanitizeToolArgs(parseLooseJson(trimmed));
+      } catch {
+        // Fall through to length-limited string handling.
+      }
+    }
+    return args.length > 512 ? `${args.slice(0, 512)}…` : args;
+  }
   if (!args || typeof args !== 'object') return args;
   const record = { ...(args as Record<string, unknown>) };
 
@@ -713,13 +910,14 @@ async function runCommand(command: string, timeoutMs: number, outputLimit: numbe
 }
 
 async function readFileSafe(filePath: string, maxBytes: number) {
+  const safeMaxBytes = Math.max(1, Math.floor(Number.isFinite(maxBytes) ? maxBytes : 1));
   const stat = fs.statSync(filePath);
-  if (stat.size <= maxBytes) {
+  if (stat.size <= safeMaxBytes) {
     return { content: fs.readFileSync(filePath, 'utf-8'), truncated: false, size: stat.size };
   }
   const fd = fs.openSync(filePath, 'r');
-  const buffer = Buffer.allocUnsafe(maxBytes);
-  const bytesRead = fs.readSync(fd, buffer, 0, maxBytes, 0);
+  const buffer = Buffer.allocUnsafe(safeMaxBytes);
+  const bytesRead = fs.readSync(fd, buffer, 0, safeMaxBytes, 0);
   fs.closeSync(fd);
   return { content: buffer.subarray(0, bytesRead).toString('utf-8'), truncated: true, size: stat.size };
 }
@@ -972,6 +1170,7 @@ export function createTools(
     return async (args: TInput): Promise<TOutput> => {
       const start = Date.now();
       const normalizedName = name.toLowerCase();
+      const normalizedArgs = normalizeToolArgs(name, args) as TInput;
       try {
         if (denyList.includes(normalizedName)) {
           throw new Error(`Tool is disabled by policy: ${name}`);
@@ -986,7 +1185,7 @@ export function createTools(
         }
         usageCounts.set(name, currentCount + 1);
 
-        const rawResult = await execute(args);
+        const rawResult = await execute(normalizedArgs);
         const result = await maybeSummarizeToolResult(name, rawResult, runtime);
         if (onToolResult) {
           const preview = extractToolOutputText(result);
@@ -1015,7 +1214,7 @@ export function createTools(
         }
         onToolCall?.({
           name,
-          args: sanitizeToolArgs(args),
+          args: sanitizeToolArgs(normalizedArgs),
           ok: true,
           duration_ms: Date.now() - start,
           output_bytes: outputBytes,
@@ -1025,7 +1224,7 @@ export function createTools(
       } catch (err) {
         onToolCall?.({
           name,
-          args: sanitizeToolArgs(args),
+          args: sanitizeToolArgs(normalizedArgs),
           ok: false,
           duration_ms: Date.now() - start,
           error: err instanceof Error ? err.message : String(err)
@@ -1173,7 +1372,11 @@ export function createTools(
     }),
     execute: wrapExecute('Read', async ({ path: inputPath, maxBytes }: { path: string; maxBytes?: number }) => {
       const resolved = resolvePath(inputPath, isMain, true);
-      const { content, truncated, size } = await readFileSafe(resolved, Math.min(maxBytes || runtime.outputLimitBytes, runtime.outputLimitBytes));
+      const requestedMaxBytes = Number.isFinite(maxBytes)
+        ? Math.floor(maxBytes as number)
+        : runtime.outputLimitBytes;
+      const clampedMaxBytes = Math.max(1, Math.min(requestedMaxBytes, runtime.outputLimitBytes));
+      const { content, truncated, size } = await readFileSafe(resolved, clampedMaxBytes);
       return { path: resolved, content, truncated, size };
     })
   });
@@ -2603,7 +2806,7 @@ export function createTools(
   }
   tools.push(analyzeImageTool as Tool);
 
-  return tools;
+  return applyPolicyToolFilter(tools, policy);
 }
 
 /**

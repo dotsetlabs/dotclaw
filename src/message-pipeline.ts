@@ -21,26 +21,62 @@ import { recordMessage, recordError, recordStageLatency } from './metrics.js';
 import { synthesizeSpeechHost } from './transcription.js';
 import { emitHook } from './hooks.js';
 import { createTraceBase, executeAgentRun, recordAgentTelemetry, AgentExecutionError } from './agent-execution.js';
+import { applyTurnHygiene } from './turn-hygiene.js';
 import { logger } from './logger.js';
 import { setLastMessageTime, setMessageQueueDepth } from './dashboard.js';
 import { humanizeError, isTransientError } from './error-messages.js';
 import { routeRequest } from './request-router.js';
 import {
   GROUPS_DIR,
-  BATCH_WINDOW_MS,
-  MAX_BATCH_SIZE,
 } from './config.js';
 import { loadRuntimeConfig } from './runtime-config.js';
 import { ProviderRegistry as ProviderRegistryClass } from './providers/registry.js';
 import { StreamingDelivery, watchStreamChunks } from './streaming.js';
 
-const runtime = loadRuntimeConfig();
-
-const INTERRUPT_ON_NEW_MESSAGE = runtime.host.messageQueue.interruptOnNewMessage ?? true;
-const MESSAGE_QUEUE_MAX_RETRIES = Math.max(1, runtime.host.messageQueue.maxRetries ?? 4);
-const MESSAGE_QUEUE_RETRY_BASE_MS = Math.max(250, runtime.host.messageQueue.retryBaseMs ?? 3_000);
-const MESSAGE_QUEUE_RETRY_MAX_MS = Math.max(MESSAGE_QUEUE_RETRY_BASE_MS, runtime.host.messageQueue.retryMaxMs ?? 60_000);
 const MAX_DRAIN_ITERATIONS = 50;
+
+type MessagePipelineRuntime = {
+  queue: {
+    interruptOnNewMessage: boolean;
+    maxRetries: number;
+    retryBaseMs: number;
+    retryMaxMs: number;
+    promptMaxChars: number;
+    batchWindowMs: number;
+    maxBatchSize: number;
+  };
+  streaming: {
+    enabled: boolean;
+    chunkFlushIntervalMs: number;
+    editIntervalMs: number;
+    maxEditLength: number;
+  };
+  reasoningEffort: 'off' | 'low' | 'medium' | 'high';
+};
+
+export function resolveMessagePipelineRuntime(): MessagePipelineRuntime {
+  const runtime = loadRuntimeConfig();
+  const queue = runtime.host.messageQueue;
+  const retryBaseMs = Math.max(250, queue.retryBaseMs ?? 3_000);
+  return {
+    queue: {
+      interruptOnNewMessage: queue.interruptOnNewMessage ?? true,
+      maxRetries: Math.max(1, queue.maxRetries ?? 4),
+      retryBaseMs,
+      retryMaxMs: Math.max(retryBaseMs, queue.retryMaxMs ?? 60_000),
+      promptMaxChars: Math.max(2_000, queue.promptMaxChars ?? 24_000),
+      batchWindowMs: Math.max(0, queue.batchWindowMs ?? 2_000),
+      maxBatchSize: Math.max(1, queue.maxBatchSize ?? 50),
+    },
+    streaming: {
+      enabled: runtime.host.streaming.enabled,
+      chunkFlushIntervalMs: runtime.host.streaming.chunkFlushIntervalMs,
+      editIntervalMs: runtime.host.streaming.editIntervalMs,
+      maxEditLength: runtime.host.streaming.maxEditLength,
+    },
+    reasoningEffort: runtime.agent.reasoning.effort
+  };
+}
 
 const CANCEL_PHRASES = new Set([
   'cancel', 'stop', 'abort', 'cancel request', 'stop request'
@@ -68,11 +104,37 @@ function clampInputMessage(content: string, maxChars: number): string {
   return `${content.slice(0, maxChars)}\n\n[Message truncated for length]`;
 }
 
-function computeMessageQueueRetryDelayMs(attempt: number): number {
+function computeMessageQueueRetryDelayMs(attempt: number, runtime: MessagePipelineRuntime): number {
   const exp = Math.max(0, attempt - 1);
-  const base = Math.min(MESSAGE_QUEUE_RETRY_MAX_MS, MESSAGE_QUEUE_RETRY_BASE_MS * Math.pow(2, exp));
+  const base = Math.min(runtime.queue.retryMaxMs, runtime.queue.retryBaseMs * Math.pow(2, exp));
   const jitter = base * (0.8 + Math.random() * 0.4);
   return Math.max(250, Math.round(jitter));
+}
+
+export function selectPromptLineIndicesWithinBudget(lines: string[], maxChars: number): { indices: number[]; omitted: number } {
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return { indices: [], omitted: 0 };
+  }
+  if (!Number.isFinite(maxChars) || maxChars <= 0) {
+    return { indices: lines.map((_, idx) => idx), omitted: 0 };
+  }
+
+  const keptDescending: number[] = [];
+  let usedChars = 0;
+  let omitted = 0;
+  for (let idx = lines.length - 1; idx >= 0; idx -= 1) {
+    const line = lines[idx] || '';
+    const candidateChars = line.length + 1;
+    if (keptDescending.length > 0 && usedChars + candidateChars > maxChars) {
+      omitted += 1;
+      continue;
+    }
+    keptDescending.push(idx);
+    usedChars += candidateChars;
+  }
+
+  keptDescending.reverse();
+  return { indices: keptDescending, omitted };
 }
 
 class RetryableMessageProcessingError extends Error {
@@ -180,6 +242,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
   }
 
   function enqueueMessage(msg: PipelineMessage): void {
+    const runtime = resolveMessagePipelineRuntime();
     if (isCancelMessage(msg.content)) {
       const controller = activeRuns.get(msg.chatId);
       if (controller) {
@@ -193,7 +256,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       void provider.sendMessage(msg.chatId, "Nothing's running right now.", { threadId: msg.threadId });
       return;
     }
-    if (INTERRUPT_ON_NEW_MESSAGE) {
+    if (runtime.queue.interruptOnNewMessage) {
       const controller = activeRuns.get(msg.chatId);
       if (controller) {
         logger.info({ chatId: msg.chatId }, 'Interrupting active run for new message');
@@ -221,13 +284,14 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
 
   async function drainQueue(chatId: string): Promise<void> {
     if (activeDrains.has(chatId)) return;
+    const runtime = resolveMessagePipelineRuntime();
     activeDrains.add(chatId);
     setMessageQueueDepth(getPendingMessageCount());
     let reschedule = false;
     try {
       let iterations = 0;
       while (iterations < MAX_DRAIN_ITERATIONS) {
-        const batch = claimBatchForChat(chatId, BATCH_WINDOW_MS, MAX_BATCH_SIZE);
+        const batch = claimBatchForChat(chatId, runtime.queue.batchWindowMs, runtime.queue.maxBatchSize);
         if (batch.length === 0) break;
         iterations++;
         const last = batch[batch.length - 1];
@@ -256,13 +320,13 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
             })
           );
           const isRetryable = err instanceof RetryableMessageProcessingError;
-          if (isRetryable && attempt < MESSAGE_QUEUE_MAX_RETRIES) {
+          if (isRetryable && attempt < runtime.queue.maxRetries) {
             requeueQueuedMessages(batchIds, errMsg);
-            const delayMs = computeMessageQueueRetryDelayMs(attempt);
+            const delayMs = computeMessageQueueRetryDelayMs(attempt, runtime);
             logger.warn({
               chatId,
               attempt,
-              maxRetries: MESSAGE_QUEUE_MAX_RETRIES,
+              maxRetries: runtime.queue.maxRetries,
               delayMs,
               error: errMsg
             }, 'Retryable batch failure; re-queued for retry');
@@ -290,6 +354,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
   }
 
   async function processMessage(msg: PipelineMessage): Promise<boolean> {
+    const runtime = resolveMessagePipelineRuntime();
     const registeredGroups = deps.registeredGroups();
     const sessions = deps.sessions();
     const group = registeredGroups[msg.chatId];
@@ -334,6 +399,39 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       }];
     }
 
+    const hygiene = applyTurnHygiene(missedMessages);
+    missedMessages = hygiene.messages;
+    if (
+      hygiene.stats.droppedMalformed > 0
+      || hygiene.stats.droppedDuplicates > 0
+      || hygiene.stats.droppedStalePartials > 0
+      || hygiene.stats.normalizedToolEnvelopes > 0
+    ) {
+      logger.debug({
+        chatId: msg.chatId,
+        inputCount: hygiene.stats.inputCount,
+        outputCount: hygiene.stats.outputCount,
+        droppedMalformed: hygiene.stats.droppedMalformed,
+        droppedDuplicates: hygiene.stats.droppedDuplicates,
+        droppedStalePartials: hygiene.stats.droppedStalePartials,
+        normalizedToolEnvelopes: hygiene.stats.normalizedToolEnvelopes
+      }, 'Applied turn hygiene');
+    }
+    if (missedMessages.length === 0) {
+      const fallbackAttachments = msg.attachments && msg.attachments.length > 0
+        ? JSON.stringify(msg.attachments)
+        : null;
+      missedMessages = [{
+        id: msg.messageId,
+        chat_jid: msg.chatId,
+        sender: msg.senderId,
+        sender_name: msg.senderName,
+        content: msg.content,
+        timestamp: msg.timestamp,
+        attachments_json: fallbackAttachments
+      }];
+    }
+
     const inputMaxChars = deps.registry.getProviderForChat(msg.chatId).capabilities.maxMessageLength;
     const lines = missedMessages.map(m => {
       const escapeXml = (s: string) => s
@@ -352,11 +450,25 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         : escapeXml(safeContent);
       return `<message sender="${escapeXml(m.sender_name)}" sender_id="${escapeXml(m.sender)}" time="${m.timestamp}">${inner}</message>`;
     });
-    const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
+
+    const { indices: promptLineIndices, omitted: omittedPromptMessages } =
+      selectPromptLineIndicesWithinBudget(lines, runtime.queue.promptMaxChars);
+    const selectedMessages = promptLineIndices.map(idx => missedMessages[idx]);
+    const selectedLines = promptLineIndices.map(idx => lines[idx]);
+
+    if (omittedPromptMessages > 0) {
+      selectedLines.unshift(
+        `<message sender="system" sender_id="system" time="${msg.timestamp}">` +
+          `[${omittedPromptMessages} earlier message(s) omitted due to context budget. Focus on the most recent intent.]` +
+          `</message>`
+      );
+    }
+
+    const prompt = `<messages>\n${selectedLines.join('\n')}\n</messages>`;
     const replyToMessageId = msg.messageId;
     const containerAttachments = (() => {
-      for (let idx = missedMessages.length - 1; idx >= 0; idx -= 1) {
-        const raw = missedMessages[idx].attachments_json;
+      for (let idx = selectedMessages.length - 1; idx >= 0; idx -= 1) {
+        const raw = selectedMessages[idx].attachments_json;
         if (!raw) continue;
         try {
           const parsed = JSON.parse(raw) as MessageAttachment[];
@@ -404,28 +516,34 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       source: 'dotclaw'
     });
 
-    logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
+    logger.info({
+      group: group.name,
+      messageCount: missedMessages.length,
+      promptMessageCount: selectedMessages.length,
+      omittedPromptMessages
+    }, 'Processing message');
 
     void emitHook('message:processing', {
       chat_id: msg.chatId,
       message_id: msg.messageId,
       sender_id: msg.senderId,
       group_folder: group.folder,
-      message_count: missedMessages.length
+      message_count: missedMessages.length,
+      prompt_message_count: selectedMessages.length,
+      omitted_prompt_messages: omittedPromptMessages
     });
 
     const provider = deps.registry.getProviderForChat(msg.chatId);
     await provider.setTyping(msg.chatId);
-    const recallQuery = missedMessages.map(entry => entry.content).join('\n');
+    const recallQuery = selectedMessages.map(entry => entry.content).join('\n');
 
     let output: ContainerOutput | null = null;
     let context: AgentContext | null = null;
     let errorMessage: string | null = null;
 
     // Set up streaming delivery
-    const streamingConfig = runtime.host.streaming;
-    const streaming = streamingConfig.enabled
-      ? new StreamingDelivery(provider, msg.chatId, streamingConfig, {
+    const streaming = runtime.streaming.enabled
+      ? new StreamingDelivery(provider, msg.chatId, runtime.streaming, {
         threadId: msg.threadId,
         replyToMessageId,
       })
@@ -439,7 +557,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
 
     // Prepare stream directory for IPC-based streaming
     let streamDir: string | undefined;
-    if (streamingConfig.enabled) {
+    if (runtime.streaming.enabled) {
       const { DATA_DIR } = await import('./config.js');
       streamDir = path.join(DATA_DIR, 'ipc', group.folder, 'stream', traceBase.trace_id);
       fs.mkdirSync(streamDir, { recursive: true });
@@ -460,9 +578,10 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         onSessionUpdate: (sessionId) => { deps.setSession(group.folder, sessionId); },
         availableGroups: deps.buildAvailableGroupsSnapshot(),
         modelFallbacks: routing.fallbacks,
-        reasoningEffort: loadRuntimeConfig().agent.reasoning.effort,
+        reasoningEffort: runtime.reasoningEffort,
         modelMaxOutputTokens: routing.maxOutputTokens || undefined,
         maxToolSteps: routing.maxToolSteps,
+        lane: 'interactive',
         attachments: containerAttachments,
         abortSignal: abortController.signal,
         streamDir,
@@ -632,7 +751,7 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
       }
       // Skip sending; still record telemetry below
     } else if (output.result && output.result.trim()) {
-      const hasVoiceAttachment = missedMessages.some(m => {
+      const hasVoiceAttachment = selectedMessages.some(m => {
         if (!m.attachments_json) return false;
         try {
           const atts = JSON.parse(m.attachments_json) as MessageAttachment[];
@@ -693,14 +812,26 @@ export function createMessagePipeline(deps: MessagePipelineDeps) {
         );
       }
     } else if (output.tool_calls && output.tool_calls.length > 0) {
-      await sendMessageForQueue(
-        msg.chatId,
-        "I used some tools but wasn't able to produce a final response. Could you try rephrasing or ask me to continue?",
-        { threadId: msg.threadId, replyToMessageId: resolvedReplyTo }
-      );
+      const fallbackText = "I used some tools but wasn't able to produce a final response. Could you try rephrasing or ask me to continue?";
+      output.result = fallbackText;
+      if (streaming) {
+        await streaming.finalize(fallbackText);
+      } else {
+        await sendMessageForQueue(
+          msg.chatId,
+          fallbackText,
+          { threadId: msg.threadId, replyToMessageId: resolvedReplyTo }
+        );
+      }
     } else {
       logger.warn({ chatId: msg.chatId }, 'Agent returned empty/whitespace response');
-      await sendMessageForQueue(msg.chatId, "I wasn't able to come up with a response. Could you try rephrasing?", { threadId: msg.threadId, replyToMessageId: resolvedReplyTo });
+      const fallbackText = "I wasn't able to come up with a response. Could you try rephrasing?";
+      output.result = fallbackText;
+      if (streaming) {
+        await streaming.finalize(fallbackText);
+      } else {
+        await sendMessageForQueue(msg.chatId, fallbackText, { threadId: msg.threadId, replyToMessageId: resolvedReplyTo });
+      }
     }
 
     if (context) {

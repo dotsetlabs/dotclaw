@@ -11,26 +11,49 @@ import {
 import { STORE_DIR } from './config.js';
 import { generateId } from './id.js';
 
-let db: Database.Database;
+let dbInstance: Database.Database | null = null;
 let dbInitialized = false;
 
-export function closeDatabase(): void {
-  if (db && dbInitialized) {
-    db.close();
-    dbInitialized = false;
+function getDb(): Database.Database {
+  if (!dbInitialized || !dbInstance) {
+    initDatabase();
   }
+  if (!dbInstance) {
+    throw new Error('Database is not initialized');
+  }
+  return dbInstance;
+}
+
+const db: Database.Database = new Proxy({} as Database.Database, {
+  get(_target, prop) {
+    const instance = getDb() as unknown as Record<string, unknown>;
+    const value = instance[prop as keyof typeof instance];
+    if (typeof value === 'function') {
+      return (value as (...args: unknown[]) => unknown).bind(instance);
+    }
+    return value;
+  }
+});
+
+export function closeDatabase(): void {
+  if (!dbInstance || !dbInitialized) return;
+  dbInstance.close();
+  dbInstance = null;
+  dbInitialized = false;
 }
 
 export function initDatabase(): void {
-  if (dbInitialized) return;
+  if (dbInitialized && dbInstance) return;
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-  db = new Database(dbPath);
+  const database = new Database(dbPath);
+  dbInstance = database;
   dbInitialized = true;
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
-  db.exec(`
+  try {
+    database.pragma('journal_mode = WAL');
+    database.pragma('busy_timeout = 3000');
+    database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
       name TEXT,
@@ -206,8 +229,16 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_mq_chat_status ON message_queue(chat_jid, status);
   `);
 
-  // Chat JID prefix migration: add 'telegram:' prefix to all existing unprefixed IDs
-  migrateChatJidPrefixes();
+    // Chat JID prefix migration: add 'telegram:' prefix to all existing unprefixed IDs
+    migrateChatJidPrefixes();
+  } catch (err) {
+    dbInitialized = false;
+    if (dbInstance) {
+      try { dbInstance.close(); } catch { /* ignore */ }
+    }
+    dbInstance = null;
+    throw err;
+  }
 }
 
 function migrateChatJidPrefixes(): void {
