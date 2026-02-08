@@ -51,7 +51,8 @@ export default defineConfig({
             { text: 'Containers', link: '/operations/containers' },
             { text: 'Scheduler', link: '/operations/scheduler' },
             { text: 'Memory', link: '/operations/memory' },
-            { text: 'Autotune', link: '/operations/autotune' }
+            { text: 'Autotune', link: '/operations/autotune' },
+            { text: 'Release Checklist', link: '/operations/release-checklist' }
           ]
         }
       ],

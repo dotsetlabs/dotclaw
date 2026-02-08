@@ -13,6 +13,7 @@ export interface ContainerInput {
   userName?: string;
   maxToolSteps?: number;
   memoryRecall?: string[];
+  memoryRecallAttempted?: boolean;
   userProfile?: string | null;
   memoryStats?: {
     total: number;
@@ -92,4 +93,14 @@ export interface ContainerOutput {
   replyToId?: string;
   /** Set by the host container-runner when stdout was truncated before parsing */
   stdoutTruncated?: boolean;
+  /** Number of in-loop idempotent tool retries attempted */
+  tool_retry_attempts?: number;
+  /** True when a forced final synthesis pass was used after tool execution */
+  tool_outcome_verification_forced?: boolean;
+  /** True when repeated tool signatures triggered loop-break protection */
+  tool_loop_breaker_triggered?: boolean;
+  /** Reason emitted when the tool loop breaker triggered */
+  tool_loop_breaker_reason?: string;
+  /** Error from fire-and-forget memory extraction in daemon mode */
+  memory_extraction_error?: string;
 }

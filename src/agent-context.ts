@@ -1,14 +1,15 @@
-import { buildHybridMemoryRecall } from './memory-recall.js';
-import { buildUserProfile, getMemoryStats } from './memory-store.js';
+import { resolveMemoryBackend } from './memory-backend.js';
 import { loadPersonalizedBehaviorConfig } from './personalization.js';
 import { getEffectiveToolPolicy, mergeToolPolicyDeny, ToolPolicy } from './tool-policy.js';
 import { applyToolBudgets } from './tool-budgets.js';
 import { getToolReliability } from './db.js';
 import { resolveModel, loadModelRegistry, getTokenEstimateConfig, getModelPricing, getModelCapabilities, ModelCapabilities } from './model-registry.js';
 import { loadRuntimeConfig } from './runtime-config.js';
+import { optimizeRecallQuery, resolveRecallBudget, shouldRunMemoryRecall } from './recall-policy.js';
 
 export type AgentContext = {
   memoryRecall: string[];
+  memoryRecallAttempted: boolean;
   userProfile: string | null;
   memoryStats: { total: number; user: number; group: number; global: number };
   behaviorConfig: Record<string, unknown>;
@@ -84,6 +85,7 @@ export async function buildAgentContext(params: {
 }): Promise<AgentContext> {
   const startedAt = Date.now();
   const runtime = loadRuntimeConfig();
+  const memoryBackend = await resolveMemoryBackend();
   // Use routing.model as the base — model.json per_user/per_group overrides take priority
   const defaultModel = runtime.host.routing.model || runtime.host.defaultModel;
   const modelRegistry = loadModelRegistry(defaultModel);
@@ -108,25 +110,35 @@ export async function buildAgentContext(params: {
 
   let memoryRecall: string[] = [];
   let memoryRecallMs: number | undefined;
-  if (params.recallEnabled !== false && params.recallMaxResults > 0 && params.recallMaxTokens > 0) {
+  const optimizedRecallQuery = optimizeRecallQuery(params.recallQuery, params.messageText || '');
+  const recallBudget = resolveRecallBudget({
+    query: optimizedRecallQuery,
+    maxResults: params.recallMaxResults,
+    maxTokens: params.recallMaxTokens
+  });
+  const recallEnabled = params.recallEnabled !== false
+    && recallBudget.maxResults > 0
+    && recallBudget.maxTokens > 0
+    && shouldRunMemoryRecall(optimizedRecallQuery);
+  if (recallEnabled) {
     const recallStart = Date.now();
-    memoryRecall = await buildHybridMemoryRecall({
+    memoryRecall = await memoryBackend.buildRecall({
       groupFolder: params.groupFolder,
       userId: params.userId ?? null,
-      query: params.recallQuery,
-      maxResults: params.recallMaxResults,
-      maxTokens: dynamicMemoryBudget,
+      query: optimizedRecallQuery,
+      maxResults: recallBudget.maxResults,
+      maxTokens: Math.min(dynamicMemoryBudget, recallBudget.maxTokens),
       minScore: runtime.host.memory.recall.minScore
     });
     memoryRecallMs = Date.now() - recallStart;
   }
 
-  const userProfile = buildUserProfile({
+  const userProfile = memoryBackend.buildUserProfile({
     groupFolder: params.groupFolder,
     userId: params.userId ?? null
   });
 
-  const memoryStats = getMemoryStats({
+  const memoryStats = memoryBackend.getStats({
     groupFolder: params.groupFolder,
     userId: params.userId ?? null
   });
@@ -161,6 +173,7 @@ export async function buildAgentContext(params: {
 
   return {
     memoryRecall,
+    memoryRecallAttempted: recallEnabled,
     userProfile,
     memoryStats,
     behaviorConfig,

@@ -107,6 +107,29 @@ test('watchStreamChunks yields chunks in order and stops on done', async () => {
   fs.rmSync(streamDir, { recursive: true, force: true });
 });
 
+test('watchStreamChunks drains late chunk written after done sentinel race', async () => {
+  const streamDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-stream-'));
+
+  const writeChunks = async () => {
+    fs.writeFileSync(path.join(streamDir, 'chunk_000001.txt'), 'first ');
+    await wait(20);
+    fs.writeFileSync(path.join(streamDir, 'done'), '');
+    // Simulate race: final chunk lands just after sentinel.
+    await wait(20);
+    fs.writeFileSync(path.join(streamDir, 'chunk_000002.txt'), 'second');
+  };
+
+  void writeChunks();
+
+  const chunks = [];
+  for await (const chunk of watchStreamChunks(streamDir)) {
+    chunks.push(chunk);
+  }
+
+  assert.deepEqual(chunks, ['first ', 'second']);
+  fs.rmSync(streamDir, { recursive: true, force: true });
+});
+
 test('watchStreamChunks stops on abort signal', async () => {
   const streamDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dotclaw-stream-'));
   const ac = new AbortController();

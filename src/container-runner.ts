@@ -410,6 +410,10 @@ function isContainerRunning(name: string): boolean {
 }
 
 const daemonConfig = runtime.host.container.daemon;
+const DAEMON_BOOTSTRAP_GRACE_MS = Math.max(
+  daemonConfig.gracePeriodMs,
+  daemonConfig.heartbeatMaxAgeMs
+);
 
 type DaemonHealthState = 'healthy' | 'busy' | 'dead';
 
@@ -429,8 +433,44 @@ interface DaemonHealthResult {
   processingMs?: number;
 }
 
-function readDaemonStatus(groupFolder: string): DaemonStatus | null {
-  const statusPath = path.join(DATA_DIR, 'ipc', groupFolder, 'daemon_status.json');
+const daemonBootstrapUntil = new Map<string, number>();
+
+function markDaemonBootstrapping(groupFolder: string): void {
+  daemonBootstrapUntil.set(groupFolder, Date.now() + DAEMON_BOOTSTRAP_GRACE_MS);
+}
+
+function isDaemonBootstrapping(groupFolder: string, nowMs = Date.now()): boolean {
+  const until = daemonBootstrapUntil.get(groupFolder);
+  if (!until) return false;
+  if (until <= nowMs) {
+    daemonBootstrapUntil.delete(groupFolder);
+    return false;
+  }
+  return true;
+}
+
+function consumeMemoryExtractionError(groupFolder: string): string | undefined {
+  const statusPath = path.join(DATA_DIR, 'ipc', groupFolder, 'memory_extraction_error.json');
+  try {
+    if (!fs.existsSync(statusPath)) return undefined;
+    const raw = fs.readFileSync(statusPath, 'utf-8').trim();
+    try {
+      const parsed = JSON.parse(raw) as { error?: unknown };
+      if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        return parsed.error.trim();
+      }
+    } catch {
+      if (raw) return raw;
+    }
+  } catch {
+    return undefined;
+  } finally {
+    try { fs.unlinkSync(statusPath); } catch { /* ignore */ }
+  }
+  return undefined;
+}
+
+function readDaemonStatusFromPath(statusPath: string): DaemonStatus | null {
   try {
     if (!fs.existsSync(statusPath)) return null;
     const raw = fs.readFileSync(statusPath, 'utf-8').trim();
@@ -438,6 +478,11 @@ function readDaemonStatus(groupFolder: string): DaemonStatus | null {
   } catch {
     return null;
   }
+}
+
+function readDaemonStatus(groupFolder: string): DaemonStatus | null {
+  const statusPath = path.join(DATA_DIR, 'ipc', groupFolder, 'daemon_status.json');
+  return readDaemonStatusFromPath(statusPath);
 }
 
 /**
@@ -516,8 +561,7 @@ export function gracefulRestartDaemonContainer(group: RegisteredGroup, isMain: b
   }
 
   // Start new container
-  const mounts = buildVolumeMounts(group, isMain);
-  ensureDaemonContainer(mounts, group.folder);
+  ensureDaemonContainer(group, isMain);
   logger.info({ groupFolder: group.folder }, 'Daemon container restarted (graceful)');
 }
 
@@ -533,8 +577,7 @@ export function restartDaemonContainer(group: RegisteredGroup, isMain: boolean):
     // Ignore if container doesn't exist
   }
 
-  const mounts = buildVolumeMounts(group, isMain);
-  ensureDaemonContainer(mounts, group.folder);
+  ensureDaemonContainer(group, isMain);
   logger.info({ groupFolder: group.folder }, 'Daemon container restarted (force)');
 }
 
@@ -556,6 +599,7 @@ export function suppressHealthChecks(durationMs: number): void {
 export function resetUnhealthyDaemons(): void {
   unhealthyDaemons.clear();
   healthCheckRestartTimestamps.clear();
+  daemonBootstrapUntil.clear();
 }
 
 /**
@@ -582,6 +626,7 @@ export function performDaemonHealthChecks(
     // Skip if container isn't running (may be intentionally stopped)
     if (!isContainerRunning(containerName)) {
       unhealthyDaemons.delete(group.folder);
+      daemonBootstrapUntil.delete(group.folder);
       continue;
     }
 
@@ -671,28 +716,60 @@ export function stopDaemonHealthCheckLoop(): void {
   }
 }
 
-function ensureDaemonContainer(mounts: VolumeMount[], groupFolder: string): void {
+function ensureDaemonContainer(group: RegisteredGroup, isMain: boolean): void {
+  sanitizeGroupFolder(group.folder);
+  const groupFolder = group.folder;
   const containerName = getDaemonContainerName(groupFolder);
-  if (isContainerRunning(containerName)) return;
 
-  try {
-    execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 15_000 });
-  } catch {
-    // ignore if container doesn't exist
+  const health = checkDaemonHealth(groupFolder);
+  if (health.state === 'healthy' || health.state === 'busy') {
+    return;
+  }
+
+  const running = isContainerRunning(containerName);
+  if (running && isDaemonBootstrapping(groupFolder)) {
+    return;
+  }
+
+  const mounts = buildVolumeMounts(group, isMain);
+
+  if (running) {
+    logger.warn({
+      groupFolder,
+      ageMs: health.ageMs,
+      daemonState: health.daemonState
+    }, 'Daemon container running but unhealthy; restarting before request');
+    try {
+      execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 15_000 });
+    } catch {
+      // ignore cleanup failure and attempt fresh start
+    }
+  } else {
+    daemonBootstrapUntil.delete(groupFolder);
+    try {
+      execSync(`docker rm -f ${containerName}`, { stdio: 'ignore', timeout: 15_000 });
+    } catch {
+      // ignore if container doesn't exist
+    }
   }
 
   const args = buildDaemonArgs(mounts, containerName, groupFolder);
   const result = spawnSync('docker', args, { stdio: 'ignore' });
   if (result.status !== 0) {
+    // Concurrent starts can lose the name race while the daemon is actually up.
+    if (isContainerRunning(containerName)) {
+      markDaemonBootstrapping(groupFolder);
+      return;
+    }
     logger.error({ groupFolder, status: result.status }, 'Failed to start daemon container');
     throw new Error(`Failed to start daemon container for ${groupFolder}`);
   }
+  markDaemonBootstrapping(groupFolder);
 }
 
 export function warmGroupContainer(group: RegisteredGroup, isMain: boolean): void {
   if (CONTAINER_MODE !== 'daemon') return;
-  const mounts = buildVolumeMounts(group, isMain);
-  ensureDaemonContainer(mounts, group.folder);
+  ensureDaemonContainer(group, isMain);
 }
 
 function writeAgentRequest(groupFolder: string, payload: object): { id: string; requestPath: string; responsePath: string } {
@@ -704,60 +781,216 @@ function writeAgentRequest(groupFolder: string, payload: object): { id: string; 
   const requestPath = path.join(requestsDir, `${id}.json`);
   const responsePath = path.join(responsesDir, `${id}.json`);
   const tempPath = `${requestPath}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify({ id, input: payload }, null, 2));
+  fs.writeFileSync(tempPath, JSON.stringify({ id, input: payload }));
   fs.renameSync(tempPath, requestPath);
   return { id, requestPath, responsePath };
 }
 
-async function waitForAgentResponse(
+class FileChangeSignal {
+  private watcher: fs.FSWatcher | null = null;
+  private pending = false;
+  private waiter: (() => void) | null = null;
+  private readonly abortHandler: (() => void) | null;
+
+  constructor(
+    watchDir: string,
+    private readonly abortSignal?: AbortSignal
+  ) {
+    try {
+      this.watcher = fs.watch(watchDir, { persistent: false }, () => this.notify());
+      this.watcher.on('error', () => {
+        if (this.watcher) {
+          try { this.watcher.close(); } catch { /* ignore */ }
+          this.watcher = null;
+        }
+        this.notify();
+      });
+    } catch {
+      this.watcher = null;
+    }
+
+    if (this.abortSignal) {
+      this.abortHandler = () => this.notify();
+      this.abortSignal.addEventListener('abort', this.abortHandler);
+    } else {
+      this.abortHandler = null;
+    }
+  }
+
+  private notify(): void {
+    if (this.waiter) {
+      const wake = this.waiter;
+      this.waiter = null;
+      wake();
+      return;
+    }
+    this.pending = true;
+  }
+
+  async wait(timeoutMs: number): Promise<void> {
+    if (this.pending) {
+      this.pending = false;
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (this.waiter === finish) this.waiter = null;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, Math.max(10, timeoutMs));
+      this.waiter = finish;
+    });
+  }
+
+  close(): void {
+    if (this.abortSignal && this.abortHandler) {
+      this.abortSignal.removeEventListener('abort', this.abortHandler);
+    }
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    this.notify();
+  }
+}
+
+function isContainerOutputPayload(value: unknown): value is ContainerOutput {
+  if (!value || typeof value !== 'object') return false;
+  const status = (value as { status?: unknown }).status;
+  return status === 'success' || status === 'error';
+}
+
+export async function waitForAgentResponse(
   responsePath: string,
   timeoutMs: number,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  options?: {
+    groupFolder?: string;
+    requestId?: string;
+    maxExtensionMs?: number;
+    daemonStatusPath?: string;
+  }
 ): Promise<ContainerOutput> {
+  const RESPONSE_PARSE_MAX_RETRIES = 8;
+  const pollMs = Math.max(25, CONTAINER_DAEMON_POLL_MS);
+  const parseRetryMs = Math.max(20, Math.floor(pollMs / 2));
+  const maxExtensionMs = Math.max(
+    0,
+    Math.floor(
+      options?.maxExtensionMs
+      ?? Math.min(120_000, Math.max(30_000, Math.floor(timeoutMs * 0.5)))
+    )
+  );
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (abortSignal?.aborted) {
-      throw new Error('Agent run preempted');
-    }
-    if (fs.existsSync(responsePath)) {
-      let raw: string;
-      try {
-        raw = fs.readFileSync(responsePath, 'utf-8');
-      } catch (readErr: unknown) {
-        const code = (readErr as NodeJS.ErrnoException)?.code;
-        if (code === 'ENOENT') {
-          // File disappeared between existsSync and readFileSync; continue polling
-          await new Promise(resolve => setTimeout(resolve, CONTAINER_DAEMON_POLL_MS));
-          continue;
+  let deadline = start + timeoutMs;
+  let extendedMs = 0;
+  const waitSignal = new FileChangeSignal(path.dirname(responsePath), abortSignal);
+  let parseFailures = 0;
+  let lastParseError = '';
+
+  try {
+    for (;;) {
+      while (Date.now() < deadline) {
+        if (abortSignal?.aborted) {
+          throw new Error('Agent run preempted');
         }
-        throw readErr;
-      }
-      try {
-        const parsed = JSON.parse(raw) as ContainerOutput;
-        fs.unlinkSync(responsePath);
-        return parsed;
-      } catch (parseErr) {
-        // Partial read during atomic rename can produce invalid JSON — retry up to 3 times
-        let retryParsed: ContainerOutput | null = null;
-        for (let parseRetry = 0; parseRetry < 3; parseRetry++) {
-          await new Promise(resolve => setTimeout(resolve, CONTAINER_DAEMON_POLL_MS));
+        if (fs.existsSync(responsePath)) {
+          let raw: string;
           try {
-            const retryRaw = fs.readFileSync(responsePath, 'utf-8');
-            retryParsed = JSON.parse(retryRaw) as ContainerOutput;
-            break;
-          } catch {
-            // continue retrying
+            raw = fs.readFileSync(responsePath, 'utf-8');
+          } catch (readErr: unknown) {
+            const code = (readErr as NodeJS.ErrnoException)?.code;
+            if (code === 'ENOENT') {
+              await waitSignal.wait(pollMs);
+              continue;
+            }
+            throw readErr;
+          }
+
+          try {
+            const parsed = JSON.parse(raw) as unknown;
+            if (!isContainerOutputPayload(parsed)) {
+              throw new Error('Missing required "status" field');
+            }
+            try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
+            return parsed;
+          } catch (parseErr) {
+            parseFailures += 1;
+            lastParseError = parseErr instanceof Error ? parseErr.message : String(parseErr);
+            if (parseFailures >= RESPONSE_PARSE_MAX_RETRIES) {
+              try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
+              throw new Error(`Failed to parse daemon response after ${parseFailures} attempts: ${lastParseError}`);
+            }
+            await waitSignal.wait(parseRetryMs);
+            if (fs.existsSync(responsePath)) {
+              let stat: fs.Stats;
+              try {
+                stat = fs.statSync(responsePath);
+              } catch (statErr: unknown) {
+                const code = (statErr as NodeJS.ErrnoException)?.code;
+                if (code === 'ENOENT') continue;
+                throw statErr;
+              }
+              if (Date.now() - stat.mtimeMs > 5_000) {
+                try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
+                throw new Error(`Stale daemon response file: ${lastParseError}`);
+              }
+            }
+            continue;
           }
         }
-        if (retryParsed) {
-          try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
-          return retryParsed;
-        }
-        try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
-        throw new Error(`Failed to parse daemon response: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
+        await waitSignal.wait(pollMs);
       }
+
+      // Soft timeout extension: if daemon is actively processing this request with fresh heartbeat,
+      // grant bounded extra time to avoid false timeout/restart thrash on long turns.
+      const groupFolder = options?.groupFolder;
+      const requestId = options?.requestId;
+      const daemonStatusPath = options?.daemonStatusPath;
+      if ((groupFolder || daemonStatusPath) && maxExtensionMs > 0 && extendedMs < maxExtensionMs) {
+        const status = daemonStatusPath
+          ? readDaemonStatusFromPath(daemonStatusPath)
+          : readDaemonStatus(groupFolder as string);
+        if (status && status.state === 'processing') {
+          if (!requestId || !status.request_id || status.request_id === requestId) {
+            const now = Date.now();
+            const heartbeatAgeMs = Number.isFinite(status.ts) ? now - status.ts : Number.POSITIVE_INFINITY;
+            const freshnessBudgetMs = Math.max(daemonConfig.heartbeatMaxAgeMs * 2, 15_000);
+            if (heartbeatAgeMs <= freshnessBudgetMs) {
+              const remainingExtensionMs = maxExtensionMs - extendedMs;
+              if (remainingExtensionMs > 0) {
+                const stepExtensionMs = Math.min(
+                  remainingExtensionMs,
+                  Math.max(15_000, Math.floor(timeoutMs * 0.25))
+                );
+                extendedMs += stepExtensionMs;
+                deadline = now + stepExtensionMs;
+                logger.warn({
+                  groupFolder,
+                  requestId: requestId || status.request_id || null,
+                  heartbeatAgeMs,
+                  extendedMs,
+                  maxExtensionMs
+                }, 'Extending daemon response wait for active processing request');
+                continue;
+              }
+            }
+          }
+        }
+      }
+      break;
     }
-    await new Promise(resolve => setTimeout(resolve, CONTAINER_DAEMON_POLL_MS));
+  } finally {
+    waitSignal.close();
+  }
+
+  if (lastParseError) {
+    throw new Error(`Daemon response timeout after ${timeoutMs}ms (last parse error: ${lastParseError})`);
   }
   throw new Error(`Daemon response timeout after ${timeoutMs}ms`);
 }
@@ -775,6 +1008,20 @@ function removeContainerById(containerId: string, reason: string): void {
   if (!containerId) return;
   logger.warn({ containerId, reason }, 'Removing container');
   spawn('docker', ['rm', '-f', containerId], { stdio: 'ignore' });
+}
+
+export function shouldRetryDaemonRequestError(errorMessage: string): boolean {
+  if (!errorMessage) return false;
+  const lower = errorMessage.toLowerCase();
+  if (/preempted|aborted|interrupted|cancelled|canceled/.test(lower)) {
+    return false;
+  }
+  return /daemon response timeout|failed to parse daemon response|stale daemon response file/.test(lower);
+}
+
+function isDaemonTimeoutError(errorMessage: string): boolean {
+  if (!errorMessage) return false;
+  return /daemon response timeout/i.test(errorMessage);
 }
 
 export async function runContainerAgent(
@@ -925,61 +1172,65 @@ export async function runContainerAgent(
       cleanupCid();
       const duration = Date.now() - startTime;
 
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logFile = path.join(logsDir, `container-${timestamp}.log`);
       const isVerbose = runtime.host.logLevel === 'debug' || runtime.host.logLevel === 'trace';
+      const shouldWriteLog = isVerbose || code !== 0 || stdoutTruncated || stderrTruncated;
+      let logFile: string | undefined;
 
-      const logLines = [
-        `=== Container Run Log ===`,
-        `Timestamp: ${new Date().toISOString()}`,
-        `Group: ${group.name}`,
-        `IsMain: ${input.isMain}`,
-        `Duration: ${duration}ms`,
-        `Exit Code: ${code}`,
-        `Stdout Truncated: ${stdoutTruncated}`,
-        `Stderr Truncated: ${stderrTruncated}`,
-        ``
-      ];
-
-      if (isVerbose) {
-        logLines.push(
-          `=== Input ===`,
-          JSON.stringify(input, null, 2),
-          ``,
-          `=== Container Args ===`,
-          containerArgs.join(' '),
-          ``,
-          `=== Mounts ===`,
-          mounts.map(m => `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`).join('\n'),
-          ``,
-          `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
-          stderr,
-          ``,
-          `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
-          stdout
-        );
-      } else {
-        logLines.push(
-          `=== Input Summary ===`,
-          `Prompt length: ${input.prompt.length} chars`,
-          `Session ID: ${input.sessionId || 'new'}`,
-          ``,
-          `=== Mounts ===`,
-          mounts.map(m => `${m.containerPath}${m.readonly ? ' (ro)' : ''}`).join('\n'),
+      if (shouldWriteLog) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        logFile = path.join(logsDir, `container-${timestamp}.log`);
+        const logLines = [
+          `=== Container Run Log ===`,
+          `Timestamp: ${new Date().toISOString()}`,
+          `Group: ${group.name}`,
+          `IsMain: ${input.isMain}`,
+          `Duration: ${duration}ms`,
+          `Exit Code: ${code}`,
+          `Stdout Truncated: ${stdoutTruncated}`,
+          `Stderr Truncated: ${stderrTruncated}`,
           ``
-        );
+        ];
 
-        if (code !== 0) {
+        if (isVerbose) {
           logLines.push(
-            `=== Stderr (last 500 chars) ===`,
-            stderr.slice(-500),
+            `=== Input ===`,
+            JSON.stringify(input, null, 2),
+            ``,
+            `=== Container Args ===`,
+            containerArgs.join(' '),
+            ``,
+            `=== Mounts ===`,
+            mounts.map(m => `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`).join('\n'),
+            ``,
+            `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
+            stderr,
+            ``,
+            `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
+            stdout
+          );
+        } else {
+          logLines.push(
+            `=== Input Summary ===`,
+            `Prompt length: ${input.prompt.length} chars`,
+            `Session ID: ${input.sessionId || 'new'}`,
+            ``,
+            `=== Mounts ===`,
+            mounts.map(m => `${m.containerPath}${m.readonly ? ' (ro)' : ''}`).join('\n'),
             ``
           );
-        }
-      }
 
-      fs.writeFileSync(logFile, logLines.join('\n'));
-      logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
+          if (code !== 0) {
+            logLines.push(
+              `=== Stderr (last 500 chars) ===`,
+              stderr.slice(-500),
+              ``
+            );
+          }
+        }
+
+        fs.writeFileSync(logFile, logLines.join('\n'));
+        logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
+      }
 
       if (code !== 0) {
         logger.error({
@@ -1073,72 +1324,109 @@ async function runContainerAgentDaemon(
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
-  ensureDaemonContainer(mounts, group.folder);
-
-  const { id: requestId, responsePath, requestPath } = writeAgentRequest(group.folder, input);
-  const requestsDir = path.join(DATA_DIR, 'ipc', group.folder, 'agent_requests');
   const timeoutMs = options?.timeoutMs || group.containerConfig?.timeout || CONTAINER_TIMEOUT;
   const abortSignal = options?.abortSignal;
+  const requestsDir = path.join(DATA_DIR, 'ipc', group.folder, 'agent_requests');
+  const maxAttempts = 2;
 
-  const abortHandler = () => {
-    logger.warn({ group: group.name }, 'Daemon run preempted');
-    // Write cancel sentinel so daemon can detect the abort
-    const cancelPath = path.join(requestsDir, `${requestId}.cancel`);
-    try { fs.writeFileSync(cancelPath, ''); } catch { /* ignore */ }
-    try {
-      if (fs.existsSync(requestPath)) fs.unlinkSync(requestPath);
-    } catch {
-      // ignore cleanup failure
-    }
-    try {
-      if (fs.existsSync(responsePath)) fs.unlinkSync(responsePath);
-    } catch {
-      // ignore cleanup failure
-    }
-  };
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    ensureDaemonContainer(group, input.isMain);
+    const { id: requestId, responsePath, requestPath } = writeAgentRequest(group.folder, input);
+    let aborted = false;
 
-  if (abortSignal) {
-    if (abortSignal.aborted) {
-      abortHandler();
+    const abortHandler = () => {
+      aborted = true;
+      logger.warn({ group: group.name }, 'Daemon run preempted');
+      const cancelPath = path.join(requestsDir, `${requestId}.cancel`);
+      try { fs.writeFileSync(cancelPath, ''); } catch { /* ignore */ }
+      try {
+        if (fs.existsSync(requestPath)) fs.unlinkSync(requestPath);
+      } catch {
+        // ignore cleanup failure
+      }
+      try {
+        if (fs.existsSync(responsePath)) fs.unlinkSync(responsePath);
+      } catch {
+        // ignore cleanup failure
+      }
+    };
+
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        abortHandler();
+        return {
+          status: 'error',
+          result: null,
+          error: 'Daemon run preempted'
+        };
+      }
+      abortSignal.addEventListener('abort', abortHandler, { once: true });
+    }
+
+    try {
+      const output = await waitForAgentResponse(responsePath, timeoutMs, abortSignal, {
+        groupFolder: group.folder,
+        requestId
+      });
+      const memoryExtractionError = consumeMemoryExtractionError(group.folder);
+      return {
+        ...output,
+        memory_extraction_error: output.memory_extraction_error || memoryExtractionError,
+        latency_ms: output.latency_ms ?? (Date.now() - startTime)
+      };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      logger.error({ group: group.name, error: errorMessage, attempt }, 'Daemon agent error');
+      try {
+        if (fs.existsSync(requestPath)) fs.unlinkSync(requestPath);
+      } catch {
+        // ignore cleanup failure
+      }
+      try {
+        if (fs.existsSync(responsePath)) fs.unlinkSync(responsePath);
+      } catch {
+        // ignore cleanup failure
+      }
+      if (!aborted && !abortSignal?.aborted && attempt < maxAttempts && shouldRetryDaemonRequestError(errorMessage)) {
+        logger.warn({ group: group.name, attempt, error: errorMessage }, 'Retrying daemon request after restart');
+        try {
+          gracefulRestartDaemonContainer(group, input.isMain);
+          // Timeout errors usually indicate a stuck/slow daemon turn.
+          // Avoid spending another full request timeout on the same model;
+          // restart once and return the timeout so host-level failover can act.
+          if (isDaemonTimeoutError(errorMessage)) {
+            return {
+              status: 'error',
+              result: null,
+              error: errorMessage
+            };
+          }
+          continue;
+        } catch (restartErr) {
+          logger.error({
+            group: group.name,
+            attempt,
+            error: restartErr instanceof Error ? restartErr.message : String(restartErr)
+          }, 'Daemon restart failed during retry recovery');
+        }
+      }
       return {
         status: 'error',
         result: null,
-        error: 'Daemon run preempted'
+        error: errorMessage
       };
+    } finally {
+      if (abortSignal) {
+        abortSignal.removeEventListener('abort', abortHandler);
+      }
     }
-    abortSignal.addEventListener('abort', abortHandler, { once: true });
   }
 
-  try {
-    const output = await waitForAgentResponse(responsePath, timeoutMs, abortSignal);
-    return {
-      ...output,
-      latency_ms: output.latency_ms ?? (Date.now() - startTime)
-    };
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    logger.error({ group: group.name, error: errorMessage }, 'Daemon agent error');
-    try {
-      if (fs.existsSync(requestPath)) fs.unlinkSync(requestPath);
-    } catch {
-      // ignore cleanup failure
-    }
-    try {
-      if (fs.existsSync(responsePath)) fs.unlinkSync(responsePath);
-    } catch {
-      // ignore cleanup failure
-    }
-    return {
-      status: 'error',
-      result: null,
-      error: errorMessage
-    };
-  } finally {
-    if (abortSignal) {
-      abortSignal.removeEventListener('abort', abortHandler);
-    }
-  }
+  return {
+    status: 'error',
+    result: null,
+    error: 'Daemon request failed'
+  };
 }
 
 /**
@@ -1147,6 +1435,7 @@ async function runContainerAgentDaemon(
  */
 export function cleanupInstanceContainers(): void {
   try {
+    daemonBootstrapUntil.clear();
     let filterArgs: string;
     if (CONTAINER_INSTANCE_ID) {
       filterArgs = `--filter "label=dotclaw.instance=${CONTAINER_INSTANCE_ID}"`;

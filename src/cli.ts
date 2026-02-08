@@ -18,6 +18,7 @@ import {
   SCRIPTS_DIR,
   ensureDirectoryStructure,
 } from './paths.js';
+import { readRuntimeConfigDocument, writeRuntimeConfigDocument } from './runtime-config.js';
 
 const PLATFORM = process.platform;
 const IS_MACOS = PLATFORM === 'darwin';
@@ -848,14 +849,7 @@ async function cmdAddInstance(instanceId: string): Promise<void> {
     }
   }
 
-  let runtimeConfig: Record<string, unknown> = {};
-  if (fs.existsSync(RUNTIME_CONFIG_PATH)) {
-    try {
-      runtimeConfig = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_PATH, 'utf-8'));
-    } catch {
-      warn('Failed to parse existing runtime.json; starting fresh');
-    }
-  }
+  const runtimeConfig = readRuntimeConfigDocument(RUNTIME_CONFIG_PATH);
 
   const host = typeof runtimeConfig.host === 'object' && runtimeConfig.host ? runtimeConfig.host as Record<string, unknown> : {};
   const container = typeof host.container === 'object' && host.container ? host.container as Record<string, unknown> : {};
@@ -879,8 +873,7 @@ async function cmdAddInstance(instanceId: string): Promise<void> {
     host.dashboard = dashboard;
     runtimeConfig.host = host;
 
-    fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
-    fs.writeFileSync(runtimePath, JSON.stringify(runtimeConfig, null, 2));
+    writeRuntimeConfigDocument(runtimeConfig, runtimePath);
     log(`Wrote runtime config: ${runtimePath}`);
   });
 

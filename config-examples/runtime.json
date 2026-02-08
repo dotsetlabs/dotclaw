@@ -4,7 +4,16 @@
     "container": {
       "mode": "daemon",
       "privileged": true,
+      "daemonPollMs": 100,
       "instanceId": ""
+    },
+    "messageQueue": {
+      "promptMaxChars": 24000
+    },
+    "concurrency": {
+      "maxAgents": 4,
+      "laneStarvationMs": 15000,
+      "maxConsecutiveInteractive": 3
     },
     "metrics": {
       "port": 3001,
@@ -20,6 +29,10 @@
       },
       "embeddings": {
         "enabled": true
+      },
+      "backend": {
+        "strategy": "builtin",
+        "modulePath": ""
       }
     },
     "routing": {
@@ -30,7 +43,11 @@
       "maxToolSteps": 200,
       "temperature": 0.6,
       "recallMaxResults": 8,
-      "recallMaxTokens": 1500
+      "recallMaxTokens": 1500,
+      "hostFailover": {
+        "enabled": true,
+        "maxRetries": 1
+      }
     },
     "webhook": {
       "enabled": false,
@@ -39,7 +56,7 @@
     },
     "streaming": {
       "enabled": true,
-      "chunkFlushIntervalMs": 200,
+      "chunkFlushIntervalMs": 120,
       "editIntervalMs": 400,
       "maxEditLength": 3800
     },
@@ -57,6 +74,7 @@
     "assistantName": "Rain",
     "reasoning": { "effort": "medium" },
     "context": {
+      "recentContextTokens": 0,
       "maxHistoryTurns": 40,
       "contextPruning": {
         "softTrimMaxChars": 4000,
@@ -72,6 +90,14 @@
       "enableBash": true,
       "enableWebSearch": true,
       "enableWebFetch": true,
+      "completionGuard": {
+        "idempotentRetryAttempts": 2,
+        "idempotentRetryBackoffMs": 500,
+        "repeatedSignatureThreshold": 3,
+        "repeatedRoundThreshold": 2,
+        "nonRetryableFailureThreshold": 3,
+        "forceSynthesisAfterTools": true
+      },
       "bash": {
         "timeoutMs": 600000
       },
@@ -87,7 +113,7 @@
       "openaiVoice": "alloy"
     },
     "mcp": {
-      "enabled": true,
+      "enabled": false,
       "servers": []
     }
   }

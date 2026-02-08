@@ -1,3 +1,5 @@
+import type { FailoverEnvelope } from './failover-policy.js';
+
 export const OUTPUT_START_MARKER = '---DOTCLAW_OUTPUT_START---';
 export const OUTPUT_END_MARKER = '---DOTCLAW_OUTPUT_END---';
 
@@ -13,6 +15,7 @@ export interface ContainerInput {
   userName?: string;
   maxToolSteps?: number;
   memoryRecall?: string[];
+  memoryRecallAttempted?: boolean;
   userProfile?: string | null;
   memoryStats?: {
     total: number;
@@ -92,6 +95,26 @@ export interface ContainerOutput {
   replyToId?: string;
   /** Set by the host container-runner when stdout was truncated before parsing */
   stdoutTruncated?: boolean;
+  /** Set by host failover policy when host-level retries were attempted */
+  host_failover_attempts?: number;
+  /** True when host-level retries recovered an otherwise failing run */
+  host_failover_recovered?: boolean;
+  /** Last host failover category observed during this run */
+  host_failover_category?: string;
+  /** Source of the last host failover envelope */
+  host_failover_source?: 'container_output' | 'runtime_exception';
+  /** Parsed HTTP status code from the last host failover envelope, when present */
+  host_failover_status_code?: number;
+  /** Request-scoped failover envelopes emitted by host retry logic */
+  host_failover_envelopes?: FailoverEnvelope[];
+  /** Number of in-loop idempotent tool retries attempted */
+  tool_retry_attempts?: number;
+  /** True when a forced final synthesis pass was used after tool execution */
+  tool_outcome_verification_forced?: boolean;
+  /** True when repeated tool signatures triggered loop-break protection */
+  tool_loop_breaker_triggered?: boolean;
+  /** Reason emitted when the tool loop breaker triggered */
+  tool_loop_breaker_reason?: string;
   /** Error from fire-and-forget memory extraction in daemon mode */
   memory_extraction_error?: string;
 }

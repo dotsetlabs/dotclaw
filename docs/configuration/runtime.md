@@ -16,7 +16,16 @@ title: Runtime Config
     "container": {
       "mode": "daemon",
       "privileged": true,
+      "daemonPollMs": 100,
       "instanceId": ""
+    },
+    "messageQueue": {
+      "promptMaxChars": 24000
+    },
+    "concurrency": {
+      "maxAgents": 4,
+      "laneStarvationMs": 15000,
+      "maxConsecutiveInteractive": 3
     },
     "telegram": { "enabled": true },
     "discord": { "enabled": false },
@@ -28,7 +37,11 @@ title: Runtime Config
       "fallbacks": [],
       "maxOutputTokens": 0,
       "maxToolSteps": 200,
-      "temperature": 0.6
+      "temperature": 0.6,
+      "hostFailover": {
+        "enabled": true,
+        "maxRetries": 1
+      }
     }
   },
   "agent": {
@@ -82,7 +95,7 @@ title: Runtime Config
 | `maxOutputBytes` | `20971520` (20 MB) | Maximum output size from container |
 | `mode` | `"daemon"` | `daemon` (persistent) or `ephemeral` (per-request) |
 | `privileged` | `true` | Run containers with `--privileged` |
-| `daemonPollMs` | `200` | Daemon IPC poll interval |
+| `daemonPollMs` | `100` | Daemon IPC poll interval |
 | `pidsLimit` | `256` | Maximum PIDs in container |
 | `memory` | `""` | Docker memory limit (e.g. `"512m"`) |
 | `cpus` | `""` | Docker CPU limit (e.g. `"2"`) |
@@ -108,6 +121,8 @@ title: Runtime Config
 | `maxAgents` | `4` | Maximum concurrent agent containers |
 | `queueTimeoutMs` | `0` | Maximum queue wait time (0 = no timeout) |
 | `warmStart` | `true` | Keep daemon containers warm between requests |
+| `laneStarvationMs` | `15000` | How long lower-priority queued work can wait before being force-scheduled |
+| `maxConsecutiveInteractive` | `3` | Maximum back-to-back interactive dispatches before allowing lower-priority lanes |
 
 ### `host.messageQueue`
 
@@ -120,6 +135,7 @@ title: Runtime Config
 | `retryBaseMs` | `3000` | Base delay between retries |
 | `retryMaxMs` | `60000` | Maximum retry delay |
 | `interruptOnNewMessage` | `true` | Auto-cancel the active run when a new message arrives in the same chat |
+| `promptMaxChars` | `24000` | Maximum total chars included from queued inbound messages when building a single prompt |
 
 ### `host.scheduler`
 
@@ -186,6 +202,13 @@ title: Runtime Config
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `personalizationCacheMs` | `300000` (5m) | TTL for cached per-user personalization data |
+
+#### `host.memory.backend`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `strategy` | `"builtin"` | Memory backend strategy: `builtin` or `module` |
+| `modulePath` | `""` | Optional module path for custom backend (resolved relative to `DOTCLAW_HOME` when not absolute) |
 
 ### `host.voice`
 
@@ -274,6 +297,20 @@ title: Runtime Config
 | `recallMaxResults` | `8` | Maximum memory items returned per recall query |
 | `recallMaxTokens` | `1500` | Maximum tokens for recalled memory content |
 
+For non-memory-intent prompts, DotClaw automatically applies a leaner recall budget to reduce prompt bloat and latency. Explicit memory-intent prompts keep full configured limits.
+
+#### `host.routing.hostFailover`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable host-level retry/failover orchestration when a full container attempt fails |
+| `maxRetries` | `1` | Maximum host-level retries after the initial attempt |
+| `cooldownRateLimitMs` | `60000` | Cooldown applied to models that fail due to rate limits |
+| `cooldownTransientMs` | `300000` | Base cooldown applied to models that fail due to transient transport/service errors |
+| `cooldownInvalidResponseMs` | `120000` | Cooldown applied when model/container responses are malformed |
+
+Timeout-class failures use stricter cooldown shaping (minimum 15 minutes, capped at 6 hours) to prevent repeated long-stall retries on unstable models.
+
 ### `host.streaming`
 
 `host.streaming` controls real-time streaming delivery of agent responses with edit-in-place updates.
@@ -281,7 +318,7 @@ title: Runtime Config
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable streaming responses |
-| `chunkFlushIntervalMs` | `200` | Interval between flushing accumulated chunks (ms) |
+| `chunkFlushIntervalMs` | `120` | Chunk watcher wake interval fallback (used with FS change notifications) |
 | `editIntervalMs` | `400` | Minimum interval between message edits (ms) |
 | `maxEditLength` | `3800` | Maximum message length before truncating edits |
 
@@ -359,7 +396,7 @@ These are fallback defaults. When model capabilities are available (fetched from
 |---------|---------|-------------|
 | `maxContextTokens` | `128000` | Maximum context window tokens (auto-derived from model capabilities) |
 | `compactionTriggerTokens` | `120000` | Token count that triggers context compaction (auto-derived) |
-| `recentContextTokens` | `0` (auto) | Tokens reserved for recent conversation history. `0` = auto (50% of the model's context window, e.g. ~64K on a 128K model). Set an explicit value to override. |
+| `recentContextTokens` | `0` (auto) | Tokens reserved for recent conversation history. `0` = auto (35% of the model's context window, capped at 24K). Set an explicit value to override. |
 | `summaryUpdateEveryMessages` | `20` | Messages between summary updates |
 | `maxOutputTokens` | `8192` | Default max output tokens |
 | `summaryMaxOutputTokens` | `2048` | Max tokens for summary generation |
@@ -408,6 +445,17 @@ Sub-models used for auxiliary tasks:
 | `enableWebSearch` | `true` | Enable WebSearch tool |
 | `enableWebFetch` | `true` | Enable WebFetch tool |
 | `grepMaxFileBytes` | `1000000` | Maximum file size for Grep tool |
+
+#### `agent.tools.completionGuard`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `idempotentRetryAttempts` | `2` | Retry attempts for idempotent fetch/search/read tool calls on transient failures |
+| `idempotentRetryBackoffMs` | `500` | Base backoff delay between idempotent retries |
+| `repeatedSignatureThreshold` | `3` | Break tool loop when the same tool call signature repeats this many times |
+| `repeatedRoundThreshold` | `2` | Break tool loop when the same round signature repeats consecutively |
+| `nonRetryableFailureThreshold` | `3` | Break tool loop when this many non-retryable tool failures occur in a single run |
+| `forceSynthesisAfterTools` | `true` | Force one final synthesis pass when tool loop exits with unresolved/empty outcome |
 
 #### `agent.tools.webfetch`
 
@@ -491,7 +539,7 @@ Sub-models used for auxiliary tasks:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `true` | Enable MCP server connections |
+| `enabled` | `false` | Enable MCP server connections |
 | `connectionTimeoutMs` | `10000` | Connection timeout |
 | `servers` | `[]` | Array of MCP server configs |
 
@@ -558,7 +606,7 @@ Supported events: `message:received`, `message:processing`, `message:responded`,
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `hooks.enabled` | `true` | Enable lifecycle hooks |
+| `hooks.enabled` | `false` | Enable lifecycle hooks |
 | `hooks.maxConcurrent` | `4` | Maximum concurrent hook executions. Additional hooks are silently dropped when the limit is reached. |
 | `hooks.defaultTimeoutMs` | `5000` | Default timeout for hook scripts |
 

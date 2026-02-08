@@ -56,6 +56,14 @@ export type AgentRuntimeConfig = {
       enableBash: boolean;
       enableWebSearch: boolean;
       enableWebFetch: boolean;
+      completionGuard: {
+        idempotentRetryAttempts: number;
+        idempotentRetryBackoffMs: number;
+        repeatedSignatureThreshold: number;
+        repeatedRoundThreshold: number;
+        nonRetryableFailureThreshold: number;
+        forceSynthesisAfterTools: boolean;
+      };
       webfetch: {
         blockPrivate: boolean;
         allowlist: string[];
@@ -143,7 +151,7 @@ export type AgentRuntimeConfig = {
 
 const CONFIG_PATH = '/workspace/config/runtime.json';
 const DEFAULT_DEFAULT_MODEL = 'moonshotai/kimi-k2.5';
-const DEFAULT_DAEMON_POLL_MS = 200;
+const DEFAULT_DAEMON_POLL_MS = 100;
 const DEFAULT_DAEMON_HEARTBEAT_INTERVAL_MS = 1_000;
 
 const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
@@ -163,7 +171,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
   context: {
     maxContextTokens: 128_000,
     compactionTriggerTokens: 120_000,
-    recentContextTokens: 0, // 0 = auto: 50% of model context window
+    recentContextTokens: 0, // 0 = auto: 35% of model context window (capped at 24K)
     summaryUpdateEveryMessages: 20,
     maxOutputTokens: 8192,
     summaryMaxOutputTokens: 2048,
@@ -198,6 +206,14 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     enableBash: true,
     enableWebSearch: true,
     enableWebFetch: true,
+    completionGuard: {
+      idempotentRetryAttempts: 2,
+      idempotentRetryBackoffMs: 500,
+      repeatedSignatureThreshold: 3,
+      repeatedRoundThreshold: 2,
+      nonRetryableFailureThreshold: 3,
+      forceSynthesisAfterTools: true
+    },
     webfetch: {
       blockPrivate: true,
       allowlist: [],
@@ -256,7 +272,7 @@ const DEFAULT_AGENT_CONFIG: AgentRuntimeConfig['agent'] = {
     screenshotQuality: 80
   },
   mcp: {
-    enabled: true,
+    enabled: false,
     servers: [],
     connectionTimeoutMs: 10_000
   },

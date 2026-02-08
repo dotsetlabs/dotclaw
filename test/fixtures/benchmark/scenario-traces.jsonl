@@ -1,0 +1,16 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","chat_id":"memory:1","input_text":"[SCENARIO:memory] recall preference","output_text":"Remembered your preference and applied it.","memory_recall_count":2,"tool_calls":[{"name":"search","ok":true},{"name":"fetch","ok":true},{"name":"bash","ok":true}]}
+{"timestamp":"2026-01-01T00:01:00.000Z","chat_id":"memory:2","input_text":"[SCENARIO:memory] continue","output_text":"Pulled memory and continued correctly.","memory_recall_count":1,"tool_calls":[{"name":"search","ok":true},{"name":"fetch","ok":true},{"name":"bash","ok":true}]}
+{"timestamp":"2026-01-01T00:02:00.000Z","chat_id":"memory:3","input_text":"[SCENARIO:memory] context","output_text":"Used recalled details to answer.","memory_recall_count":3,"tool_calls":[{"name":"search","ok":true},{"name":"fetch","ok":true},{"name":"bash","ok":true}]}
+{"timestamp":"2026-01-01T00:03:00.000Z","chat_id":"memory:4","input_text":"[SCENARIO:memory] state","output_text":"Carried over prior state accurately.","memory_recall_count":2,"tool_calls":[{"name":"search","ok":true},{"name":"fetch","ok":true},{"name":"bash","ok":true}]}
+{"timestamp":"2026-01-01T00:04:00.000Z","chat_id":"memory:5","input_text":"[SCENARIO:memory] profile","output_text":"Respected user profile from memory.","memory_recall_count":1,"tool_calls":[{"name":"search","ok":true},{"name":"fetch","ok":true},{"name":"bash","ok":true}]}
+{"timestamp":"2026-01-01T00:05:00.000Z","chat_id":"memory:6","input_text":"[SCENARIO:memory] task","output_text":"Applied stored task context.","memory_recall_count":2,"tool_calls":[{"name":"search","ok":true},{"name":"fetch","ok":true},{"name":"bash","ok":true}]}
+{"timestamp":"2026-01-01T01:00:00.000Z","chat_id":"recover:transient:1","input_text":"task A","output_text":null,"error_code":"429 rate limit from provider"}
+{"timestamp":"2026-01-01T01:02:00.000Z","chat_id":"recover:transient:1","input_text":"task A retry","output_text":"Recovered after rate limit."}
+{"timestamp":"2026-01-01T01:10:00.000Z","chat_id":"recover:transient:2","input_text":"task B","output_text":null,"error_code":"Daemon response timeout after 90000ms"}
+{"timestamp":"2026-01-01T01:13:00.000Z","chat_id":"recover:transient:2","input_text":"task B retry","output_text":"Recovered after timeout."}
+{"timestamp":"2026-01-01T01:20:00.000Z","chat_id":"recover:transient:3","input_text":"task C","output_text":null,"error_code":"503 service unavailable"}
+{"timestamp":"2026-01-01T01:23:00.000Z","chat_id":"recover:transient:3","input_text":"task C retry","output_text":"Recovered after provider outage."}
+{"timestamp":"2026-01-01T02:00:00.000Z","chat_id":"recover:context:1","input_text":"huge context","output_text":null,"error_code":"maximum context length exceeded"}
+{"timestamp":"2026-01-01T02:04:00.000Z","chat_id":"recover:context:1","input_text":"huge context retry","output_text":"Recovered after context compaction."}
+{"timestamp":"2026-01-01T02:10:00.000Z","chat_id":"recover:context:2","input_text":"long thread","output_text":null,"error_code":"context length exceeded for model"}
+{"timestamp":"2026-01-01T02:15:00.000Z","chat_id":"recover:context:2","input_text":"long thread retry","output_text":"Recovered after trimming context."}

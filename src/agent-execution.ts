@@ -3,12 +3,21 @@ import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './co
 import { getAllTasks, setGroupSession, logToolCalls } from './db.js';
 import { MAIN_GROUP_FOLDER, TIMEZONE } from './config.js';
 import { generateId } from './id.js';
-import { runWithAgentSemaphore } from './agent-semaphore.js';
+import { runWithAgentSemaphore, AgentExecutionLane } from './agent-semaphore.js';
 import { withGroupLock } from './locks.js';
 import { getModelPricing } from './model-registry.js';
 import { computeCostUSD } from './cost.js';
 import { writeTrace } from './trace-writer.js';
-import { recordLatency, recordTokenUsage, recordCost, recordMemoryRecall, recordMemoryUpsert, recordMemoryExtract, recordToolCall, recordError, recordStageLatency } from './metrics.js';
+import { recordLatency, recordTokenUsage, recordCost, recordMemoryRecall, recordMemoryUpsert, recordMemoryExtract, recordToolCall, recordError, recordStageLatency, recordFailover } from './metrics.js';
+import { loadRuntimeConfig } from './runtime-config.js';
+import {
+  buildFailoverEnvelope,
+  chooseNextHostModelChain,
+  downgradeReasoningEffort,
+  type FailoverEnvelope,
+  reduceToolStepBudget,
+  registerModelFailureCooldown
+} from './failover-policy.js';
 import { emitHook } from './hooks.js';
 import type { ContainerOutput } from './container-protocol.js';
 import type { RegisteredGroup } from './types.js';
@@ -70,6 +79,18 @@ function buildTaskSnapshot() {
   }));
 }
 
+function buildModelChain(primary: string, fallbacks?: string[]): string[] {
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of [primary, ...(fallbacks || [])]) {
+    const normalized = (candidate || '').trim();
+    if (!normalized || seen.has(normalized)) continue;
+    deduped.push(normalized);
+    seen.add(normalized);
+  }
+  return deduped;
+}
+
 export async function executeAgentRun(params: {
   group: RegisteredGroup;
   prompt: string;
@@ -97,6 +118,7 @@ export async function executeAgentRun(params: {
   maxToolSteps?: number;
   timeoutMs?: number;
   timezone?: string;
+  lane?: AgentExecutionLane;
   streamDir?: string;
   attachments?: Array<{
     type: 'photo' | 'document' | 'voice' | 'video' | 'audio';
@@ -110,6 +132,7 @@ export async function executeAgentRun(params: {
     transcript?: string;
   }>;
 }): Promise<{ output: ContainerOutput; context: AgentContext }> {
+  const runStartedAt = Date.now();
   const group = params.group;
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const persistSession = params.persistSession !== false;
@@ -151,7 +174,73 @@ export async function executeAgentRun(params: {
     ? Math.min(...outputCandidates)
     : Infinity;
 
-  const runContainer = () => runContainerAgent(group, {
+  const runtime = loadRuntimeConfig();
+  const hostFailover = runtime.host.routing.hostFailover;
+  const maxHostRetries = hostFailover.enabled ? Math.max(0, hostFailover.maxRetries) : 0;
+  const lane: AgentExecutionLane = params.lane || (params.isScheduledTask ? 'scheduled' : 'interactive');
+  const initialModelChain = buildModelChain(
+    params.modelOverride || context.resolvedModel.model,
+    params.modelFallbacks
+  );
+  const initialChainSelection = chooseNextHostModelChain({
+    modelChain: initialModelChain,
+    attemptedPrimaryModels: new Set<string>()
+  });
+  const initialPrimary = initialModelChain[0] || context.resolvedModel.model;
+  if (initialChainSelection && initialChainSelection.model !== initialPrimary) {
+    logger.info({
+      chatJid: params.chatJid,
+      groupFolder: group.folder,
+      skippedModel: initialPrimary,
+      selectedModel: initialChainSelection.model
+    }, 'Skipping primary model due to active host cooldown');
+  }
+  const attemptedPrimaryModels = new Set<string>();
+  let activeModelChain = initialChainSelection
+    ? [initialChainSelection.model, ...initialChainSelection.fallbacks]
+    : [...initialModelChain];
+  let activeReasoningEffort = params.reasoningEffort;
+  let activeMaxToolSteps = params.maxToolSteps;
+  let hostAttempts = 0;
+  let hostRecovered = false;
+  let lastFailoverCategory: string | undefined;
+  let lastFailoverEnvelope: FailoverEnvelope | undefined;
+  const failoverEnvelopes: FailoverEnvelope[] = [];
+  const markFailoverExhaustedIfNeeded = () => {
+    if (hostAttempts > 1 && lastFailoverCategory) {
+      recordFailover('exhausted', lastFailoverCategory);
+    }
+  };
+  const planHostRetry = (hostAttempt: number, envelope: FailoverEnvelope) => {
+    const canRetry = hostAttempt < maxHostRetries && envelope.retryable;
+    if (!canRetry) return null;
+    return chooseNextHostModelChain({
+      modelChain: initialModelChain,
+      attemptedPrimaryModels
+    });
+  };
+  const applyHostRetry = (
+    hostAttempt: number,
+    envelope: FailoverEnvelope,
+    nextChain: { model: string; fallbacks: string[] },
+    message: string
+  ) => {
+    recordFailover('attempt', envelope.category);
+    activeModelChain = [nextChain.model, ...nextChain.fallbacks];
+    activeReasoningEffort = downgradeReasoningEffort(activeReasoningEffort);
+    activeMaxToolSteps = reduceToolStepBudget(activeMaxToolSteps);
+    logger.warn({
+      chatJid: params.chatJid,
+      groupFolder: group.folder,
+      attempt: hostAttempt + 1,
+      category: envelope.category,
+      source: envelope.source,
+      statusCode: envelope.statusCode,
+      retryModel: nextChain.model
+    }, message);
+  };
+
+  const runContainer = (modelOverride: string, modelFallbacks: string[]) => runContainerAgent(group, {
     prompt: params.prompt,
     sessionId: params.sessionId,
     groupFolder: group.folder,
@@ -162,15 +251,16 @@ export async function executeAgentRun(params: {
     userId: params.userId ?? undefined,
     userName: params.userName,
     memoryRecall: context.memoryRecall,
+    memoryRecallAttempted: context.memoryRecallAttempted,
     userProfile: context.userProfile,
     memoryStats: context.memoryStats,
     tokenEstimate: context.tokenEstimate,
     toolReliability: context.toolReliability,
     behaviorConfig: context.behaviorConfig as Record<string, unknown>,
     toolPolicy: context.toolPolicy as Record<string, unknown>,
-    modelOverride: params.modelOverride || context.resolvedModel.model,
-    modelFallbacks: params.modelFallbacks,
-    reasoningEffort: params.reasoningEffort,
+    modelOverride,
+    modelFallbacks,
+    reasoningEffort: activeReasoningEffort,
     modelCapabilities: {
       context_length: context.modelCapabilities.context_length,
       max_completion_tokens: context.modelCapabilities.max_completion_tokens,
@@ -180,7 +270,7 @@ export async function executeAgentRun(params: {
     modelTemperature: context.resolvedModel.override?.temperature,
     timezone: params.timezone || TIMEZONE,
     hostPlatform: `${process.platform}/${process.arch}`,
-    maxToolSteps: params.maxToolSteps,
+    maxToolSteps: activeMaxToolSteps,
     streamDir: params.streamDir,
     attachments: params.attachments
   }, { abortSignal: params.abortSignal, timeoutMs: params.timeoutMs });
@@ -194,16 +284,88 @@ export async function executeAgentRun(params: {
     source: params.isScheduledTask ? 'scheduler' : 'message'
   });
 
-  let output: ContainerOutput;
-  try {
-    const runner = () => (useGroupLock ? withGroupLock(group.folder, () => runContainer()) : runContainer());
-    output = useSemaphore
-      ? await runWithAgentSemaphore(runner)
-      : await runner();
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+  let output: ContainerOutput | null = null;
+  let lastException: unknown = null;
+  for (let hostAttempt = 0; hostAttempt <= maxHostRetries; hostAttempt += 1) {
+    const nextPrimary = activeModelChain[0] || context.resolvedModel.model;
+    const nextFallbacks = activeModelChain.slice(1);
+    attemptedPrimaryModels.add(nextPrimary);
+    hostAttempts = hostAttempt + 1;
+
+    try {
+      const runner = () => (
+        useGroupLock
+          ? withGroupLock(group.folder, () => runContainer(nextPrimary, nextFallbacks))
+          : runContainer(nextPrimary, nextFallbacks)
+      );
+      const attemptOutput = useSemaphore
+        ? await runWithAgentSemaphore(runner, { lane })
+        : await runner();
+
+      if (attemptOutput.status !== 'error') {
+        output = attemptOutput;
+        hostRecovered = hostAttempts > 1;
+        if (hostRecovered && lastFailoverCategory) {
+          recordFailover('recovered', lastFailoverCategory);
+        }
+        break;
+      }
+
+      const envelope = buildFailoverEnvelope({
+        error: attemptOutput.error || 'Unknown error',
+        source: 'container_output',
+        attempt: hostAttempts,
+        model: attemptOutput.model || nextPrimary
+      });
+      failoverEnvelopes.push(envelope);
+      lastFailoverEnvelope = envelope;
+      lastFailoverCategory = envelope.category;
+      registerModelFailureCooldown(envelope.model || nextPrimary, envelope.category, hostFailover);
+
+      const nextChain = planHostRetry(hostAttempt, envelope);
+      if (!nextChain) {
+        markFailoverExhaustedIfNeeded();
+        output = attemptOutput;
+        break;
+      }
+      applyHostRetry(hostAttempt, envelope, nextChain, 'Host-level failover retry');
+      continue;
+    } catch (err) {
+      lastException = err;
+      const envelope = buildFailoverEnvelope({
+        error: err instanceof Error ? err.message : String(err),
+        source: 'runtime_exception',
+        attempt: hostAttempts,
+        model: nextPrimary
+      });
+      failoverEnvelopes.push(envelope);
+      lastFailoverEnvelope = envelope;
+      lastFailoverCategory = envelope.category;
+      registerModelFailureCooldown(nextPrimary, envelope.category, hostFailover);
+      const nextChain = planHostRetry(hostAttempt, envelope);
+      if (!nextChain) {
+        markFailoverExhaustedIfNeeded();
+        break;
+      }
+      applyHostRetry(hostAttempt, envelope, nextChain, 'Host-level failover retry after runtime error');
+    }
+  }
+
+  if (!output && lastException) {
+    const message = lastException instanceof Error ? lastException.message : String(lastException);
     throw new AgentExecutionError(message, context);
   }
+  if (!output) {
+    throw new AgentExecutionError('No output from agent run', context);
+  }
+
+  output.host_failover_attempts = hostAttempts;
+  output.host_failover_recovered = hostRecovered;
+  output.host_failover_category = lastFailoverCategory;
+  output.host_failover_source = lastFailoverEnvelope?.source;
+  output.host_failover_status_code = lastFailoverEnvelope?.statusCode;
+  output.host_failover_envelopes = failoverEnvelopes.length > 0 ? failoverEnvelopes : undefined;
+  output.latency_ms = Math.max(1, Date.now() - runStartedAt);
 
   void emitHook('agent:complete', {
     group_folder: group.folder,
@@ -271,6 +433,17 @@ export function recordAgentTelemetry(params: {
     session_recall_count: output?.session_recall_count,
     memory_items_upserted: output?.memory_items_upserted,
     memory_items_extracted: output?.memory_items_extracted,
+    host_failover_attempts: output?.host_failover_attempts,
+    host_failover_recovered: output?.host_failover_recovered,
+    host_failover_category: output?.host_failover_category,
+    host_failover_source: output?.host_failover_source,
+    host_failover_status_code: output?.host_failover_status_code,
+    host_failover_envelopes: output?.host_failover_envelopes,
+    tool_retry_attempts: output?.tool_retry_attempts,
+    tool_outcome_verification_forced: output?.tool_outcome_verification_forced,
+    tool_loop_breaker_triggered: output?.tool_loop_breaker_triggered,
+    tool_loop_breaker_reason: output?.tool_loop_breaker_reason,
+    memory_extraction_error: output?.memory_extraction_error,
     timings: Object.keys(timingBundle).length > 0 ? timingBundle : undefined,
     error_code: params.errorMessage || (output?.status === 'error' ? output?.error : undefined)
   });

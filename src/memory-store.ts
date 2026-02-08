@@ -559,11 +559,43 @@ export function upsertMemoryItems(groupFolder: string, items: MemoryItemInput[],
   return results;
 }
 
+const MEMORY_SEARCH_STOP_WORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'being', 'but', 'by', 'can', 'did', 'do', 'does',
+  'for', 'from', 'had', 'has', 'have', 'how', 'i', 'if', 'in', 'into', 'is', 'it', 'its', 'me', 'my',
+  'of', 'on', 'or', 'our', 'please', 're', 'remember', 's', 'said', 'should',
+  'so', 'that', 'the', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'to', 'us',
+  'was', 'we', 'were', 'what', 'when', 'where', 'which', 'who', 'why', 'will', 'with', 'you', 'your'
+]);
+
+function extractMemorySearchTokens(text: string): string[] {
+  const rawTokens = text.toLowerCase().match(/[a-z0-9]+/g) || [];
+  if (rawTokens.length === 0) return [];
+
+  const seen = new Set<string>();
+  const preferred: string[] = [];
+  const fallback: string[] = [];
+
+  for (const token of rawTokens) {
+    if (seen.has(token)) continue;
+    seen.add(token);
+    if (token.length < 2) continue;
+
+    fallback.push(token);
+
+    const containsDigit = /\d/.test(token);
+    if (!containsDigit && token.length < 3) continue;
+    if (MEMORY_SEARCH_STOP_WORDS.has(token)) continue;
+    preferred.push(token);
+  }
+
+  if (preferred.length > 0) return preferred.slice(0, 10);
+  return fallback.slice(0, 10);
+}
+
 function buildFtsQuery(text: string): string | null {
-  const tokens = text.toLowerCase().match(/[a-z0-9]+/g) || [];
+  const tokens = extractMemorySearchTokens(text);
   if (tokens.length === 0) return null;
-  const unique = Array.from(new Set(tokens)).slice(0, 10);
-  return unique.map(token => `${token}*`).join(' OR ');
+  return tokens.map(token => `${token}*`).join(' OR ');
 }
 
 export function searchMemories(params: {
@@ -616,8 +648,7 @@ function searchMemoriesFallback(params: {
   limit?: number;
 }): MemorySearchResult[] {
   const db = getDb();
-  const normalizedQuery = normalizeContent(params.query);
-  const tokens = normalizedQuery.split(' ').filter(Boolean).slice(0, 10);
+  const tokens = extractMemorySearchTokens(params.query);
   if (tokens.length === 0) return [];
 
   const clauses = tokens.map(() => '(m.normalized LIKE ? OR m.tags_text LIKE ?)');
@@ -897,6 +928,8 @@ export function buildUserProfile(params: {
   if (!params.userId) return null;
   const db = getDb();
   const limit = Math.min(params.limit || 8, 20);
+  const maxEntryChars = 220;
+  const maxTotalChars = 1200;
   const rows = db.prepare(`
     SELECT content, type
     FROM memory_items
@@ -906,7 +939,22 @@ export function buildUserProfile(params: {
     LIMIT ?
   `).all(params.groupFolder, params.userId, limit) as Array<{ content: string; type: string }>;
   if (rows.length === 0) return null;
-  return rows.map(row => `- (${row.type}) ${row.content}`).join('\n');
+  const lines: string[] = [];
+  let totalChars = 0;
+  for (const row of rows) {
+    const normalized = String(row.content || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) continue;
+    const truncatedContent = normalized.length > maxEntryChars
+      ? `${normalized.slice(0, maxEntryChars - 1)}…`
+      : normalized;
+    const line = `- (${row.type}) ${truncatedContent}`;
+    if (totalChars + line.length > maxTotalChars) {
+      break;
+    }
+    lines.push(line);
+    totalChars += line.length + 1;
+  }
+  return lines.length > 0 ? lines.join('\n') : null;
 }
 
 export function listMemoriesMissingEmbeddings(params: {
@@ -976,12 +1024,12 @@ export function listEmbeddedMemories(params: {
   groupFolder: string;
   userId?: string | null;
   limit?: number;
-}): Array<{ id: string; content: string; type: MemoryType; importance: number; updated_at: string; embedding_json: string }> {
+}): Array<{ id: string; content: string; type: MemoryType; scope: MemoryScope; importance: number; updated_at: string; embedding_json: string }> {
   const db = getDb();
   const limit = Math.min(params.limit || 2000, 5000);
   const now = new Date().toISOString();
   return db.prepare(`
-    SELECT id, content, type, importance, updated_at, embedding_json
+    SELECT id, content, type, scope, importance, updated_at, embedding_json
     FROM memory_items
     WHERE (group_folder = ? OR group_folder = 'global')
       AND (scope != 'user' OR subject_id = ?)
@@ -989,7 +1037,7 @@ export function listEmbeddedMemories(params: {
       AND embedding_json IS NOT NULL
     ORDER BY updated_at DESC
     LIMIT ?
-  `).all(params.groupFolder, params.userId || '', now, limit) as Array<{ id: string; content: string; type: MemoryType; importance: number; updated_at: string; embedding_json: string }>;
+  `).all(params.groupFolder, params.userId || '', now, limit) as Array<{ id: string; content: string; type: MemoryType; scope: MemoryScope; importance: number; updated_at: string; embedding_json: string }>;
 }
 
 export function listPreferenceMemories(params: {

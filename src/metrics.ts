@@ -82,6 +82,12 @@ const stageLatency = new Histogram({
   buckets: [10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000]
 });
 
+const failoverTotal = new Counter({
+  name: 'dotclaw_failover_total',
+  help: 'Host-level failover events',
+  labelNames: ['outcome', 'category']
+});
+
 registry.registerMetric(messagesTotal);
 registry.registerMetric(errorsTotal);
 registry.registerMetric(toolCallsTotal);
@@ -94,6 +100,7 @@ registry.registerMetric(memoryUpsertTotal);
 registry.registerMetric(memoryExtractTotal);
 registry.registerMetric(responseLatency);
 registry.registerMetric(stageLatency);
+registry.registerMetric(failoverTotal);
 
 export function recordMessage(source: string): void {
   messagesTotal.inc({ source });
@@ -118,6 +125,10 @@ export function recordLatency(ms: number): void {
 export function recordStageLatency(stage: string, ms: number, source: string = 'telegram'): void {
   if (!stage || !Number.isFinite(ms)) return;
   stageLatency.observe({ stage, source }, ms);
+}
+
+export function recordFailover(outcome: 'attempt' | 'recovered' | 'exhausted', category: string): void {
+  failoverTotal.inc({ outcome, category: category || 'unknown' });
 }
 
 export function recordTokenUsage(model: string, source: string, promptTokens: number, completionTokens: number): void {

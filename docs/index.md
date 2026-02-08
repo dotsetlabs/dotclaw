@@ -27,6 +27,7 @@ DotClaw is a personal OpenRouter-based assistant for Telegram and Discord. It ru
 - Triggers and mentions: `configuration/triggers`
 - Runtime config reference: `configuration/runtime`
 - Operations and maintenance: `operations/`
+- Release checklist: `operations/release-checklist`
 - Deployment guides: `deployment/systemd`, `deployment/launchd`
 - Troubleshooting: `troubleshooting`
 - Development: `development`

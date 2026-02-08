@@ -25,7 +25,7 @@ import type { RoutingRule } from './model-registry.js';
 import { logger } from './logger.js';
 import { generateId } from './id.js';
 import { isValidTimezone, normalizeTaskTimezone, parseScheduledTimestamp } from './timezone.js';
-import { loadRuntimeConfig } from './runtime-config.js';
+import { loadRuntimeConfig, updateRuntimeConfigDocument } from './runtime-config.js';
 import {
   DATA_DIR,
   MAIN_GROUP_FOLDER,
@@ -34,15 +34,13 @@ import {
   IPC_POLL_INTERVAL,
 } from './config.js';
 import {
-  RUNTIME_CONFIG_PATH,
   BEHAVIOR_CONFIG_PATH,
   TOOL_POLICY_PATH,
 } from './paths.js';
 import { runTaskNow } from './task-scheduler.js';
 import { executeAgentRun } from './agent-execution.js';
 import { loadJson, saveJson } from './utils.js';
-
-const runtime = loadRuntimeConfig();
+import { applyMcpConfigAction, normalizeMcpConfig, type McpConfigRecord } from './mcp-config.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -704,7 +702,7 @@ async function processTaskIpc(
         break;
       }
       const action = typeof data.action === 'string' ? data.action : 'set';
-      const defaultModel = runtime.host.defaultModel;
+      const defaultModel = loadRuntimeConfig().host.defaultModel;
       const config = loadModelRegistry(defaultModel);
       const scope = typeof data.scope === 'string' ? data.scope : 'global';
       const targetId = typeof data.target_id === 'string' ? data.target_id : undefined;
@@ -1022,49 +1020,32 @@ async function processRequestIpc(
         if (!isMain) {
           return { id: requestId, ok: false, error: 'Only the main group can modify MCP config.' };
         }
-        const action = typeof payload.action === 'string' ? payload.action : '';
-        const runtimeCfg = loadJson<Record<string, unknown>>(RUNTIME_CONFIG_PATH, {});
-        const agent = (runtimeCfg.agent || {}) as Record<string, unknown>;
-        const mcp = (agent.mcp || { enabled: false, servers: [] }) as {
-          enabled: boolean;
-          servers: Array<{ name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string> }>;
-        };
+        let nextMcp: McpConfigRecord | null = null;
+        let actionError: string | null = null;
 
-        switch (action) {
-          case 'enable':
-            mcp.enabled = true;
-            break;
-          case 'disable':
-            mcp.enabled = false;
-            break;
-          case 'add_server': {
-            const name = typeof payload.name === 'string' ? payload.name.trim() : '';
-            const command = typeof payload.command === 'string' ? payload.command.trim() : '';
-            if (!name || !command) return { id: requestId, ok: false, error: 'name and command required' };
-            if (mcp.servers.some(s => s.name === name)) {
-              return { id: requestId, ok: false, error: `Server "${name}" already exists` };
-            }
-            mcp.servers.push({
-              name,
-              transport: 'stdio',
-              command,
-              args: Array.isArray(payload.args_list) ? payload.args_list as string[] : undefined,
-              env: payload.env && typeof payload.env === 'object' ? payload.env as Record<string, string> : undefined,
-            });
-            break;
+        updateRuntimeConfigDocument((draft) => {
+          const agent = isRecord(draft.agent) ? draft.agent : {};
+          const currentMcp = normalizeMcpConfig(agent.mcp);
+          const result = applyMcpConfigAction(currentMcp, payload);
+          if (!result.ok) {
+            actionError = result.error;
+            return false;
           }
-          case 'remove_server': {
-            const name = typeof payload.name === 'string' ? payload.name.trim() : '';
-            if (!name) return { id: requestId, ok: false, error: 'name required' };
-            mcp.servers = mcp.servers.filter(s => s.name !== name);
-            break;
+          nextMcp = result.mcp;
+          if (!result.changed) {
+            return false;
           }
-          default:
-            return { id: requestId, ok: false, error: `Unknown MCP action: ${action}` };
+          agent.mcp = result.mcp;
+          draft.agent = agent;
+          return true;
+        });
+
+        if (actionError) {
+          return { id: requestId, ok: false, error: actionError };
         }
-        agent.mcp = mcp;
-        runtimeCfg.agent = agent;
-        saveJson(RUNTIME_CONFIG_PATH, runtimeCfg);
+        if (!nextMcp) {
+          return { id: requestId, ok: false, error: 'Failed to update MCP config' };
+        }
 
         // Signal daemon to reload MCP
         const ipcBaseDir = path.join(DATA_DIR, 'ipc');
@@ -1075,7 +1056,7 @@ async function processRequestIpc(
           try { fs.writeFileSync(reloadFile, Date.now().toString()); } catch { /* ignore */ }
         }
 
-        return { id: requestId, ok: true, result: { mcp } };
+        return { id: requestId, ok: true, result: { mcp: nextMcp } };
       }
       case 'spawn_subagent': {
         const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
@@ -1118,6 +1099,7 @@ async function processRequestIpc(
           useGroupLock: false,
           persistSession: false,
           isScheduledTask: true, // avoid sending message directly
+          lane: 'scheduled',
         }).then(({ output }) => {
           const run = subagentRuns.get(subagentId);
           if (run) {

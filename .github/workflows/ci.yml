@@ -30,3 +30,9 @@ jobs:
 
       - name: Test
         run: npm run test
+
+      - name: Regression Gates
+        run: npm run bench:scenarios -- --input test/fixtures/benchmark/scenario-traces.jsonl --enforce
+
+      - name: Release SLO Gate (Fixture)
+        run: npm run release:slo -- --input test/fixtures/benchmark/release-slo-report.json --enforce
